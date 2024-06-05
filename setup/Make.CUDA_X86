@@ -114,7 +114,7 @@ HPCG_INCLUDES = -I$(INCdir) -I$(INCdir)/$(arch) -I$(MPdir)/include  $(CRAY_CUDAT
 HPCG_LIBS     = -L${MPlib} -lmpi
 
 HPCG_INCLUDES += -I$(CUDA_HOME)/include -I$(Mathdir)/include
-HPCG_LIBS += -L$(Mathdir)/lib  -lcuda -lcusparse -lcublas_static -lcublasLt_static  -L$(CUDA_HOME)/lib64
+HPCG_LIBS += -L$(Mathdir)/lib  -lcuda -lcusparse -lcublas -lcublasLt  -L$(CUDA_HOME)/lib64
 
 ifeq ($(USE_NCCL), 1)
     HPCG_INCLUDES += -I$(NCCLdir)/include

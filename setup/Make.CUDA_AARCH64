@@ -115,7 +115,7 @@ HPCG_LIBS     = -L${MPlib} -lmpi
 
 ifeq ($(USE_CUDA), 1)
     HPCG_INCLUDES += -I$(CUDA_HOME)/include -I$(Mathdir)/include
-    HPCG_LIBS += -L$(Mathdir)/lib  -lcuda -lcusparse -lcublas_static -lcublasLt_static  -L$(CUDA_HOME)/lib64
+    HPCG_LIBS += -L$(Mathdir)/lib  -lcuda -lcusparse -lcublas -lcublasLt  -L$(CUDA_HOME)/lib64
 endif
 
 ifeq ($(USE_GRACE), 1)
