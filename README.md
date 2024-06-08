@@ -2,7 +2,7 @@
 # NVIDIA High Performance Conjugate Gradient Benchmark (HPCG)
 
 
-NVIDIA HPCG is based on the [HPCG](https://github.com/NVIDIA/nvidia-hpcg) benchmark and optimized for performance on NVIDIA accelerated HPC systems.
+NVIDIA HPCG is based on the [HPCG](https://github.com/hpcg-benchmark/hpcg) benchmark and optimized for performance on NVIDIA accelerated HPC systems.
 
 NVIDIA's HPCG benchmark accelerates the High Performance Conjugate Gradients (HPCG) Benchmark. HPCG is a software package that performs a fixed number of multigrid preconditioned (using a symmetric Gauss-Seidel smoother) conjugate gradient (PCG) iterations using double precision (64 bit) floating point values.
 

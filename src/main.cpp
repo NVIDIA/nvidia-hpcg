@@ -574,7 +574,6 @@ int main(int argc, char* argv[])
     if (params.rank_type == GPU)
     {
 #ifdef USE_CUDA
-        CHECK_CUDART(cudaDeviceSetSharedMemConfig(cudaSharedMemBankSizeEightByte));
         int dev;
         cudaDeviceProp props;
         CHECK_CUDART(cudaGetDevice(&dev));
