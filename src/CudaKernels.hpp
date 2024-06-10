@@ -43,7 +43,7 @@ void ExtToLocMapCuda(
 void ExtTolocCuda(local_int_t localNumberOfRows, int neighborId, local_int_t ext_nnz, local_int_t* csr_ext_columns,
     double* csr_ext_values, local_int_t* ext2csr_offsets, local_int_t* extToLocMap, local_int_t* csrColumns);
 void PackSendBufferCuda(const SparseMatrix& A, Vector& x, bool cpu_data, cudaStream_t stream1);
-void ExchangeHaloCuda(const SparseMatrix& A, Vector& x, cudaStream_t strem1, int comm_method = 0);
+void ExchangeHaloCuda(const SparseMatrix& A, Vector& x, cudaStream_t stream1, int use_ibarrier = 0);
 
 // Optimize Problem
 void SetVectorAscCuda(local_int_t* arr, local_int_t n);

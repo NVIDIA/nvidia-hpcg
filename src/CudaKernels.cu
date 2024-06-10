@@ -1216,16 +1216,12 @@ void PackSendBufferCuda(const SparseMatrix& A, Vector& x, bool cpu_data, cudaStr
 
 /*
     After the scattred x buffer is received, send and recieve from neighbors
-    Supports different p2p modes based on what communication method is defined
-    in Cuda.hpp:
-        USE_CPU_MPI: CPU MPI
-        USE_NCCL: NCCL
-        USE_MPI_ALLTOALLV: use MPI alltoallv instead of send/receive
-        None is defined: CUDA-aware MPI
-    We do smart trick to improve MPI_Allreduce in DDOT, by calling
-        MPI_Ibarrier once at the last routine call in MG
+    Supports different P2P modes based on the communication method defined by
+    --p2p parameter
+    [Experimental/Deactivated] A smart trick to improve MPI_Allreduce in DDOT, 
+    by calling MPI_Ibarrier once at the last routine call in MG.
 */
-void ExchangeHaloCuda(const SparseMatrix& A, Vector& x, cudaStream_t stream1, int comm_method)
+void ExchangeHaloCuda(const SparseMatrix& A, Vector& x, cudaStream_t stream1, int use_ibarrier)
 {
     local_int_t localNumberOfRows = A.localNumberOfRows;
     int num_neighbors = A.numberOfSendNeighbors;
@@ -1259,8 +1255,11 @@ void ExchangeHaloCuda(const SparseMatrix& A, Vector& x, cudaStream_t stream1, in
 
         MPI_Waitall(num_neighbors, request, MPI_STATUSES_IGNORE);
 
-        if (comm_method == 1)
+        //[Experimental] Can improve MPI_Allreduce performance
+        #if 0
+        if (use_ibarrier == 1)
             MPI_Ibarrier(MPI_COMM_WORLD, request);
+        #endif
 
         cudaMemcpyAsync(x.values_d + A.localNumberOfRows, x.values + A.localNumberOfRows,
             A.numberOfExternalValues * sizeof(double), cudaMemcpyHostToDevice, copy_stream);
@@ -1294,8 +1293,11 @@ void ExchangeHaloCuda(const SparseMatrix& A, Vector& x, cudaStream_t stream1, in
 
         MPI_Waitall(num_neighbors, request, MPI_STATUSES_IGNORE);
 
-        if (comm_method == 1)
+        //[Experimental] Can improve MPI_Allreduce performance 
+        #if 0
+        if (use_ibarrier == 1)
             MPI_Ibarrier(MPI_COMM_WORLD, request);
+        #endif
 
         delete[] request;
     }

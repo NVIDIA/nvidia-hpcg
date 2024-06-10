@@ -98,8 +98,11 @@ void ExchangeHalo(const SparseMatrix& A, Vector& x, int use_ibarrier)
 
         MPI_Waitall(num_neighbors, request, MPI_STATUSES_IGNORE);
 
+        //[Experimental] Can improve MPI_Allreduce performance
+        #if 0
         if (use_ibarrier == 1)
             MPI_Ibarrier(MPI_COMM_WORLD, request);
+        #endif
 
         delete[] request;
     }
