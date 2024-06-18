@@ -84,36 +84,6 @@ void GenerateCoarseProblem(const SparseMatrix& Af)
     assert(localNumberOfRows
         > 0); // Throw an exception of the number of rows is less than zero (can happen if "int" overflows)
 
-// Use a parallel loop to do initial assignment:
-// distributes the physical placement of arrays of pointers across the memory system
-#ifndef HPCG_NO_OPENMP
-#pragma omp parallel for
-#endif
-    for (local_int_t i = 0; i < localNumberOfRows; ++i)
-    {
-        f2cOperator[i] = 0;
-    }
-
-// TODO:  This triply nested loop could be flattened or use nested parallelism
-#ifndef HPCG_NO_OPENMP
-#pragma omp parallel for
-#endif
-    for (local_int_t izc = 0; izc < nzc; ++izc)
-    {
-        local_int_t izf = 2 * izc;
-        for (local_int_t iyc = 0; iyc < nyc; ++iyc)
-        {
-            local_int_t iyf = 2 * iyc;
-            for (local_int_t ixc = 0; ixc < nxc; ++ixc)
-            {
-                local_int_t ixf = 2 * ixc;
-                local_int_t currentCoarseRow = izc * nxc * nyc + iyc * nxc + ixc;
-                local_int_t currentFineRow = izf * nxf * nyf + iyf * nxf + ixf;
-                f2cOperator[currentCoarseRow] = currentFineRow;
-            } // end iy loop
-        } // end even iz if statement
-    } // end iz loop
-
     for (int i = 0; i < 3 * global_total_ranks; i++)
         physical_rank_dims[i] = physical_rank_dims[i] / 2;
 
@@ -151,9 +121,38 @@ void GenerateCoarseProblem(const SparseMatrix& Af)
         InitializeVector(*xc, Ac->localNumberOfColumns, Ac->rankType);
         InitializeVector(*Axf, Af.localNumberOfColumns, Ac->rankType);
         Af.Ac = Ac;
+
+        // Use a parallel loop to do initial assignment:
+        // distributes the physical placement of arrays of pointers across the memory system
+#ifndef HPCG_NO_OPENMP
+#pragma omp parallel for
+#endif
+        for (local_int_t i = 0; i < localNumberOfRows; ++i)
+        {
+            f2cOperator[i] = 0;
+        }
+
+#ifndef HPCG_NO_OPENMP
+#pragma omp parallel for
+#endif
+        for(local_int_t i = 0; i < nzc * nyc * nxc; i++)
+        {
+            local_int_t izc = (i / (nxc * nyc));
+            local_int_t iyc = (i - izc * nxc * nyc) / nxc;
+            local_int_t ixc = i - (izc * nyc + iyc) * nxc;
+
+            local_int_t izf = 2 * izc;
+            local_int_t iyf = 2 * iyc;
+            local_int_t ixf = 2 * ixc;
+
+            local_int_t currentCoarseRow = izc * nxc * nyc + iyc * nxc + ixc;
+            local_int_t currentFineRow = izf * nxf * nyf + iyf * nxf + ixf;
+            f2cOperator[currentCoarseRow] = currentFineRow;
+        }
     }
     InitializeMGData(f2cOperator, rc, xc, Axf, *mgData);
     Af.mgData = mgData;
 
     return;
 }
+

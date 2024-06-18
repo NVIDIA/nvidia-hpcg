@@ -806,20 +806,20 @@ void GenerateProblemCuda(SparseMatrix& A, Vector* b, Vector* x, Vector* xexact)
         A.gpuAux.columns, A.gpuAux.values, bv, xv, ev, A.gpuAux.diagonalIdx, A.diagonal, A.csrExtOffsets,
         A.gpuAux.localToGlobalMap, A.level == 0, ranktoId);
 
-    cudaMemcpy(A.gpuAux.csrUPermOffsets, A.csrExtOffsets, sizeof(local_int_t) * (localNumberOfRows + 1),
-        cudaMemcpyDeviceToDevice);
-    cudaMemsetAsync(&(temp[64 * 128]), 0, sizeof(int), stream);
+    CHECK_CUDART(cudaMemcpy(A.gpuAux.csrUPermOffsets, A.csrExtOffsets, sizeof(local_int_t) * (localNumberOfRows + 1),
+        cudaMemcpyDeviceToDevice));
+    CHECK_CUDART(cudaMemsetAsync(&(temp[64 * 128]), 0, sizeof(int), stream));
     compressCsrOffsets_kernel<128, 64><<<64, 128, 0, stream>>>(localNumberOfRows, A.csrExtOffsets, A.gpuAux.map,
         A.gpuAux.csrLPermOffsets, temp, A.gpuAux.csrUPermOffsets, A.geom->logical_rank);
     cudaMemcpy(&(A.gpuAux.compressNumberOfRows), &(A.gpuAux.map[localNumberOfRows]), sizeof(local_int_t),
         cudaMemcpyDeviceToHost);
 
     A.extNnz = 0;
-    cudaMemcpy(
-        &(A.extNnz), &(A.csrExtOffsets[A.gpuAux.compressNumberOfRows]), sizeof(local_int_t), cudaMemcpyDeviceToHost);
+    CHECK_CUDART(cudaMemcpy(
+        &(A.extNnz), &(A.csrExtOffsets[A.gpuAux.compressNumberOfRows]), sizeof(local_int_t), cudaMemcpyDeviceToHost));
     local_int_t localNumberOfNonzeros = 0;
-    cudaMemcpy(
-        &localNumberOfNonzeros, &(A.gpuAux.nnzPerRow[localNumberOfRows]), sizeof(local_int_t), cudaMemcpyDeviceToHost);
+    CHECK_CUDART(cudaMemcpy(
+        &localNumberOfNonzeros, &(A.gpuAux.nnzPerRow[localNumberOfRows]), sizeof(local_int_t), cudaMemcpyDeviceToHost));
 
     CHECK_CUDART(cudaMalloc((void**) &(A.csrExtColumns), sizeof(local_int_t) * A.extNnz));
     CHECK_CUDART(cudaMalloc((void**) &(A.csrExtValues), sizeof(double) * A.extNnz));
@@ -829,7 +829,7 @@ void GenerateProblemCuda(SparseMatrix& A, Vector* b, Vector* x, Vector* xexact)
         cub::DeviceScan::InclusiveSum(temp, temp_storage_bytes, ranktoId, ranktoId, A.geom->size);
 
     A.localNumberOfNonzeros = localNumberOfNonzeros;
-    cudaFree(temp);
+    CHECK_CUDART(cudaFree(temp));
 }
 
 ///////// Setup Halo //
