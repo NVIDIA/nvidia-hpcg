@@ -30,7 +30,7 @@ NVIDIA's HPCG benchmark accelerates the High Performance Conjugate Gradients (HP
 * cuSPARSE 12.3+, for NVIDIA GPU execution
 * cuBLAS 12.2+, for NVIDIA GPU execution
 * GCC 13.0+ NVIDIA Grace CPU execution
-* NVPL Sparse 0.2+, for NVIDIA Grace CPU execution
+* NVPL 24.03+, for NVIDIA Grace CPU execution
 * NCCL 2.19+, optional for inter-process communication
 
 ## Compile and build
