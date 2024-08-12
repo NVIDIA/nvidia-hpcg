@@ -596,7 +596,7 @@ int main(int argc, char* argv[])
     else
     {
 #ifdef USE_GRACE
-        cpuRefMemory = GetCpuRefMem(A);
+        cpuRefMemory = EstimateCpuRefMem(A);
         if (rank == 0 || (params.exec_mode == GPUCPU && params.cpu_allowed_to_print))
             printf(
                 "CPU Rank Info:\n"

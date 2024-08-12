@@ -251,7 +251,7 @@ void DeleteMatrixCpu(SparseMatrix& A)
 }
 
 ///////// Find the size of CPU reference allocated memory //
-size_t GetCpuRefMem(SparseMatrix& A)
+size_t EstimateCpuRefMem(SparseMatrix& A)
 {
     size_t cpuRefMemory = 0;
     const int numberOfMgLevels = 4; // Number of levels including first
