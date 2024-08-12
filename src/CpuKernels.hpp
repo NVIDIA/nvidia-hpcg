@@ -44,6 +44,9 @@ extern nvpl_sparse_handle_t nvpl_sparse_handle;
 ///////// Deallocate CPU Memory for data structures //
 void DeleteMatrixCpu(SparseMatrix& A);
 
+///////// Find the size of CPU reference allocated memory //
+size_t GetCpuRefMem(SparseMatrix& A);
+
 /*
     Translation of a 3D point in all directions
     27 possibilities

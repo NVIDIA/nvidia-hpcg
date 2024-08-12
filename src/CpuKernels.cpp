@@ -139,12 +139,10 @@ void DeleteMatrixCpu(SparseMatrix& A)
         for (local_int_t i = 0; i < AA->localNumberOfRows; ++i)
         {
             delete[] AA->matrixValues[i];
-            delete[] AA->mtxIndG[i];
             delete[] AA->mtxIndL[i];
         }
 #else
         delete[] AA->matrixValues[0];
-        delete[] AA->mtxIndG[0];
         delete[] AA->mtxIndL[0];
 #endif
         if (AA->title)
@@ -250,6 +248,34 @@ void DeleteMatrixCpu(SparseMatrix& A)
 
         AA = AA->Ac;
     }
+}
+
+///////// Find the size of CPU reference allocated memory //
+size_t GetCpuRefMem(SparseMatrix& A)
+{
+    size_t cpuRefMemory = 0;
+    const int numberOfMgLevels = 4; // Number of levels including first
+    local_int_t nrow = A.localNumberOfRows;
+    local_int_t ncol = A.localNumberOfColumns;
+    
+    /* Vectors b, x, xexact, x_overlap, b_computed */
+    cpuRefMemory += (sizeof(double) * (size_t) nrow) * 4;
+    cpuRefMemory += (sizeof(double) * (size_t) ncol);
+    SparseMatrix* curLevelMatrix = &A;
+    for (int level = 0; level < numberOfMgLevels; ++level)
+    {
+        local_int_t cnr = curLevelMatrix->localNumberOfRows;
+        cpuRefMemory += sizeof(local_int_t)  * cnr;
+        cpuRefMemory += sizeof(global_int_t) * cnr;
+        cpuRefMemory += sizeof(double) * cnr;
+        cpuRefMemory += sizeof(double) * cnr;
+        cpuRefMemory += sizeof(global_int_t) * cnr;
+        cpuRefMemory += ((sizeof(double) + sizeof(local_int_t)) * (size_t) cnr * 27);
+
+        curLevelMatrix = curLevelMatrix->Ac;
+    }
+
+    return cpuRefMemory;
 }
 
 //////////////////////// Generate Problem /////////////////////////////////////

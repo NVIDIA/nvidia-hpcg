@@ -151,7 +151,7 @@ int main(int argc, char* argv[])
 
     if (rank == 0)
     {
-        printf("Build v0.5.3 \n");
+        printf("Build v0.5.4 \n");
 
 #ifdef HPCG_ENG_VERSION
         printf("\n%s%s\n", "========================================", "========================================");
@@ -406,18 +406,10 @@ int main(int argc, char* argv[])
         double setup_time = mytimer();
         GenerateProblem(A, &b, &x, &xexact);
         SetupHalo(A);
-        /* Vectors b, x, xexact*/
-        cpuRefMemory += (sizeof(double) * (size_t) A.localNumberOfRows) * 3;
-        /* Sparse Matrix A*/
-        cpuRefMemory += ((sizeof(double) + sizeof(local_int_t)) * (size_t) A.localNumberOfRows * 27);
-        cpuRefMemory += (sizeof(double) * A.localNumberOfRows);
         for (int level = 1; level < numberOfMgLevels; ++level)
         {
             GenerateCoarseProblem(*curLevelMatrix);
             curLevelMatrix = curLevelMatrix->Ac; // Make the just-constructed coarse grid the next level
-            /*Coarse Level Sparse Matrix A */
-            cpuRefMemory += ((sizeof(double) + sizeof(local_int_t)) * (size_t) curLevelMatrix->localNumberOfRows * 27);
-            cpuRefMemory += (sizeof(double) * curLevelMatrix->localNumberOfRows);
         }
 
         // These global buffers only needed for problem setup
@@ -440,7 +432,11 @@ int main(int argc, char* argv[])
         // Doesn't work for GPU or GPUCPU cases
         // Data need to be transfered between CPU and GPU, which is not feasible
         if (params.exec_mode == CPUONLY)
+        {
             CheckProblem(*curLevelMatrix, curb, curx, curxexact);
+            //Delete mtxIndG since it is not needed anymore
+            delete[] curLevelMatrix->mtxIndG[0];
+        }
         curLevelMatrix = curLevelMatrix->Ac; // Make the nextcoarse grid the next level
         curb = 0;                            // No vectors after the top level
         curx = 0;
@@ -600,6 +596,7 @@ int main(int argc, char* argv[])
     else
     {
 #ifdef USE_GRACE
+        cpuRefMemory = GetCpuRefMem(A);
         if (rank == 0 || (params.exec_mode == GPUCPU && params.cpu_allowed_to_print))
             printf(
                 "CPU Rank Info:\n"
