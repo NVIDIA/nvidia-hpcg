@@ -2305,8 +2305,11 @@ size_t CopyDataToHostCuda(SparseMatrix& A_in, Vector* b, Vector* x, Vector* xexa
     if (xexact != 0)
         cudaMemcpy(xexactv, xexact->values_d, sizeof(double) * A->localNumberOfRows, cudaMemcpyDeviceToHost);
 
-    size_t ref_mem = 0;
-    ref_mem += (sizeof(double) * A->localNumberOfRows) * 3;
+    size_t cpuRefMemory = 0;
+
+    /* Vectors b, x, xexact, x_overlap, b_computed */
+    cpuRefMemory += (sizeof(double) * A->localNumberOfRows) * 4;
+    cpuRefMemory += (sizeof(double) * A->localNumberOfColumns);
 
     local_int_t numberOfMgLevels = 4;
     for (int level = 0; level < numberOfMgLevels; ++level)
@@ -2358,12 +2361,17 @@ size_t CopyDataToHostCuda(SparseMatrix& A_in, Vector* b, Vector* x, Vector* xexa
         A->matrixValues = matrixValues;
         A->matrixDiagonal = matrixDiagonal;
 
-        ref_mem += ((sizeof(double) + sizeof(local_int_t)) * A->localNumberOfRows * numberOfNonzerosPerRow);
-        ref_mem += (sizeof(double) * A->localNumberOfRows);
+        local_int_t cnr = A->localNumberOfRows;
+        cpuRefMemory += sizeof(local_int_t)  * cnr;
+        cpuRefMemory += sizeof(global_int_t) * cnr;
+        cpuRefMemory += sizeof(double) * cnr;
+        cpuRefMemory += sizeof(double) * cnr;
+        cpuRefMemory += sizeof(global_int_t) * cnr;
+        cpuRefMemory += ((sizeof(double) + sizeof(local_int_t)) * (size_t) cnr * 27);
 
         A = A->Ac;
     }
 
-    return ref_mem;
+    return cpuRefMemory;
 }
 #endif
