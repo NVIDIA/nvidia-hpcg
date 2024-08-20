@@ -151,7 +151,7 @@ int main(int argc, char* argv[])
 
     if (rank == 0)
     {
-        printf("Build v0.5.4 \n");
+        printf("Build v0.5.6 \n");
 
 #ifdef HPCG_ENG_VERSION
         printf("\n%s%s\n", "========================================", "========================================");
@@ -435,7 +435,7 @@ int main(int argc, char* argv[])
         {
             CheckProblem(*curLevelMatrix, curb, curx, curxexact);
             //Delete mtxIndG since it is not needed anymore
-            delete[] curLevelMatrix->mtxIndG[0];
+            delete [] curLevelMatrix->mtxIndG[0];
         }
         curLevelMatrix = curLevelMatrix->Ac; // Make the nextcoarse grid the next level
         curb = 0;                            // No vectors after the top level

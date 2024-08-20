@@ -2305,12 +2305,6 @@ size_t CopyDataToHostCuda(SparseMatrix& A_in, Vector* b, Vector* x, Vector* xexa
     if (xexact != 0)
         cudaMemcpy(xexactv, xexact->values_d, sizeof(double) * A->localNumberOfRows, cudaMemcpyDeviceToHost);
 
-    size_t cpuRefMemory = 0;
-
-    /* Vectors b, x, xexact, x_overlap, b_computed */
-    cpuRefMemory += (sizeof(double) * A->localNumberOfRows) * 4;
-    cpuRefMemory += (sizeof(double) * A->localNumberOfColumns);
-
     local_int_t numberOfMgLevels = 4;
     for (int level = 0; level < numberOfMgLevels; ++level)
     {
@@ -2360,18 +2354,74 @@ size_t CopyDataToHostCuda(SparseMatrix& A_in, Vector* b, Vector* x, Vector* xexa
         A->mtxIndL = mtxIndL;
         A->matrixValues = matrixValues;
         A->matrixDiagonal = matrixDiagonal;
-
-        local_int_t cnr = A->localNumberOfRows;
-        cpuRefMemory += sizeof(local_int_t)  * cnr;
-        cpuRefMemory += sizeof(global_int_t) * cnr;
-        cpuRefMemory += sizeof(double) * cnr;
-        cpuRefMemory += sizeof(double) * cnr;
-        cpuRefMemory += sizeof(global_int_t) * cnr;
-        cpuRefMemory += ((sizeof(double) + sizeof(local_int_t)) * (size_t) cnr * 27);
-
         A = A->Ac;
     }
 
-    return cpuRefMemory;
+    // Estimate Reference Cpu Memory
+    // Borrowed from ReportResults.cpp
+    local_int_t fnrow = A_in.localNumberOfRows;
+    const SparseMatrix* Af = &A_in;
+    double numberOfNonzerosPerRow
+        = 27.0; // We are approximating a 27-point finite element/volume/difference 3D stencil
+
+    double fnbytes = ((double) sizeof(Geometry));           // Geometry struct in main.cpp
+    //fnbytes += ((double) sizeof(double) * fNumberOfCgSets); // testnorms_data in main.cpp
+
+    // Model for GenerateProblem_ref.cpp
+    fnbytes += fnrow * sizeof(char);                                             // array nonzerosInRow
+    fnbytes += fnrow * ((double) sizeof(global_int_t*));                         // mtxIndG
+    fnbytes += fnrow * ((double) sizeof(local_int_t*));                          // mtxIndL
+    fnbytes += fnrow * ((double) sizeof(double*));                               // matrixValues
+    fnbytes += fnrow * ((double) sizeof(double*));                               // matrixDiagonal
+    fnbytes += fnrow * numberOfNonzerosPerRow * ((double) sizeof(local_int_t));  // mtxIndL[1..nrows]
+    fnbytes += fnrow * numberOfNonzerosPerRow * ((double) sizeof(double));       // matrixValues[1..nrows]
+    //fnbytes += fnrow * numberOfNonzerosPerRow * ((double) sizeof(global_int_t)); // mtxIndG[1..nrows]
+    fnbytes += fnrow * ((double) 3 * sizeof(double));                            // x, b, xexact
+
+    // Model for CGData.hpp
+    double fncol = ((global_int_t) A_in.localNumberOfColumns);
+    fnbytes += fnrow * ((double) 2 * sizeof(double)); // r, Ap
+    fnbytes += fncol * ((double) 2 * sizeof(double)); // z, p
+
+    std::vector<double> fnbytesPerLevel(numberOfMgLevels); // Count byte usage per level (level 0 is main CG level)
+    fnbytesPerLevel[0] = fnbytes;
+
+    Af = A_in.Ac;
+    for (int i = 1; i < numberOfMgLevels; ++i)
+    {
+        double fnrow_Af = Af->localNumberOfRows;
+        double fncol_Af = ((global_int_t) Af->localNumberOfColumns);
+        double fnbytes_Af = 0.0;
+        // Model for GenerateCoarseProblem.cpp
+        fnbytes_Af += fnrow_Af * ((double) sizeof(local_int_t)); // f2cOperator
+        fnbytes_Af += fnrow_Af * ((double) sizeof(double));      // rc
+        fnbytes_Af += 2.0 * fncol_Af
+            * ((double) sizeof(double)); // xc, Axf are estimated based on the size of these arrays on rank 0
+        fnbytes_Af += ((double) (sizeof(Geometry) + sizeof(SparseMatrix) + 3 * sizeof(Vector)
+            + sizeof(MGData))); // Account for structs geomc, Ac, rc, xc, Axf - (minor)
+
+        // Model for GenerateProblem.cpp (called within GenerateCoarseProblem.cpp)
+        fnbytes_Af += fnrow_Af * sizeof(char);                                             // array nonzerosInRow
+        fnbytes_Af += fnrow_Af * ((double) sizeof(global_int_t*));                         // mtxIndG
+        fnbytes_Af += fnrow_Af * ((double) sizeof(local_int_t*));                          // mtxIndL
+        fnbytes_Af += fnrow_Af * ((double) sizeof(double*));                               // matrixValues
+        fnbytes_Af += fnrow_Af * ((double) sizeof(double*));                               // matrixDiagonal
+        fnbytes_Af += fnrow_Af * numberOfNonzerosPerRow * ((double) sizeof(local_int_t));  // mtxIndL[1..nrows]
+        fnbytes_Af += fnrow_Af * numberOfNonzerosPerRow * ((double) sizeof(double));       // matrixValues[1..nrows]
+        //fnbytes_Af += fnrow_Af * numberOfNonzerosPerRow * ((double) sizeof(global_int_t)); // mtxIndG[1..nrows]
+
+// Model for SetupHalo_ref.cpp
+#ifndef HPCG_NO_MPI
+        fnbytes_Af += ((double) sizeof(double) * Af->totalToBeSent);              // sendBuffer
+        fnbytes_Af += ((double) sizeof(local_int_t) * Af->totalToBeSent);         // elementsToSend
+        fnbytes_Af += ((double) sizeof(int) * Af->numberOfSendNeighbors);         // neighbors
+        fnbytes_Af += ((double) sizeof(local_int_t) * Af->numberOfSendNeighbors); // receiveLength, sendLength
+#endif
+        fnbytesPerLevel[i] = fnbytes_Af;
+        fnbytes += fnbytes_Af; // Running sum
+        Af = Af->Ac;           // Go to next coarse level
+    }
+
+    return fnbytes;
 }
 #endif

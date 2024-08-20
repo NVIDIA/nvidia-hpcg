@@ -133,8 +133,10 @@ struct CPU_AUX_STRUCT
     //  Coloring info as number of colors and where each color starts
     //  Also keep information on how many consecutive rows share the same color
     //  This assumes matrix reordering (rows with same color are packed)
+    local_int_t* color;
     local_int_t* firstRowOfColor;
     local_int_t* nRowsWithColor;
+    local_int_t* tempIndex;
 };
 #endif
 

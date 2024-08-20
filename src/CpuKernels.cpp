@@ -40,6 +40,7 @@ size_t AllocateMemCpu(SparseMatrix& A_in)
         A->opt2ref = new local_int_t[ncol];
         A->f2cPerm = new local_int_t[ncol];
         A->totalColors = 2 * 2 * 2; // two colors per axis
+        A->cpuAux.color = new local_int_t[nrow];
         A->cpuAux.firstRowOfColor = new local_int_t[nrow];
         A->cpuAux.nRowsWithColor = new local_int_t[A->totalColors];
         A->tempBuffer = new double[nrow];
@@ -50,7 +51,7 @@ size_t AllocateMemCpu(SparseMatrix& A_in)
 
         opt_mem += 2 * nrow * sizeof(double);
         opt_mem += 3 * ncol * sizeof(local_int_t);
-        opt_mem += 3 * nrow * sizeof(local_int_t);
+        opt_mem += 4 * nrow * sizeof(local_int_t);
 
         size_t num_slices = (nrow + slice_size - 1) / slice_size;
         size_t padded_nrow = num_slices * slice_size;
@@ -122,9 +123,11 @@ size_t AllocateMemCpu(SparseMatrix& A_in)
             A->bufferSvU = A->bufferSvL;
         }
 
+        // Temporal vectors for permutation
+        opt_mem += 2 * A->localNumberOfRows * sizeof(double);
+
         A = A->Ac;
     }
-
     return opt_mem;
 }
 
@@ -211,6 +214,8 @@ void DeleteMatrixCpu(SparseMatrix& A)
 
         if (AA->f2cPerm)
             delete[] AA->f2cPerm;
+        if (AA->cpuAux.color)
+            delete[] AA->cpuAux.color;
         if (AA->cpuAux.firstRowOfColor)
             delete[] AA->cpuAux.firstRowOfColor;
         if (AA->cpuAux.nRowsWithColor)
@@ -253,31 +258,74 @@ void DeleteMatrixCpu(SparseMatrix& A)
 ///////// Find the size of CPU reference allocated memory //
 size_t EstimateCpuRefMem(SparseMatrix& A)
 {
-    size_t cpuRefMemory = 0;
+    // Borrowed from ReportResults.cpp
     const int numberOfMgLevels = 4; // Number of levels including first
-    local_int_t nrow = A.localNumberOfRows;
-    local_int_t ncol = A.localNumberOfColumns;
-    
-    /* Vectors b, x, xexact, x_overlap, b_computed */
-    cpuRefMemory += (sizeof(double) * (size_t) nrow) * 4;
-    cpuRefMemory += (sizeof(double) * (size_t) ncol);
-    SparseMatrix* curLevelMatrix = &A;
-    for (int level = 0; level < numberOfMgLevels; ++level)
-    {
-        local_int_t cnr = curLevelMatrix->localNumberOfRows;
-        cpuRefMemory += sizeof(local_int_t)  * cnr;
-        cpuRefMemory += sizeof(global_int_t) * cnr;
-        cpuRefMemory += sizeof(double) * cnr;
-        cpuRefMemory += sizeof(double) * cnr;
-        cpuRefMemory += sizeof(global_int_t) * cnr;
-        cpuRefMemory += ((sizeof(double) + sizeof(local_int_t)) * (size_t) cnr * 27);
+    local_int_t fnrow = A.localNumberOfRows;
 
-        curLevelMatrix = curLevelMatrix->Ac;
+    const SparseMatrix* Af = &A;
+    double numberOfNonzerosPerRow
+        = 27.0; // We are approximating a 27-point finite element/volume/difference 3D stencil
+
+    double fnbytes = ((double) sizeof(Geometry));           // Geometry struct in main.cpp
+    //fnbytes += ((double) sizeof(double) * fNumberOfCgSets); // testnorms_data in main.cpp
+
+    // Model for GenerateProblem_ref.cpp
+    fnbytes += fnrow * sizeof(char);                                             // array nonzerosInRow
+    fnbytes += fnrow * ((double) sizeof(global_int_t*));                         // mtxIndG
+    fnbytes += fnrow * ((double) sizeof(local_int_t*));                          // mtxIndL
+    fnbytes += fnrow * ((double) sizeof(double*));                               // matrixValues
+    fnbytes += fnrow * ((double) sizeof(double*));                               // matrixDiagonal
+    fnbytes += fnrow * numberOfNonzerosPerRow * ((double) sizeof(local_int_t));  // mtxIndL[1..nrows]
+    fnbytes += fnrow * numberOfNonzerosPerRow * ((double) sizeof(double));       // matrixValues[1..nrows]
+    //fnbytes += fnrow * numberOfNonzerosPerRow * ((double) sizeof(global_int_t)); // mtxIndG[1..nrows]
+    fnbytes += fnrow * ((double) 3 * sizeof(double));                            // x, b, xexact
+
+    // Model for CGData.hpp
+    double fncol = ((global_int_t) A.localNumberOfColumns);
+    fnbytes += fnrow * ((double) 2 * sizeof(double)); // r, Ap
+    fnbytes += fncol * ((double) 2 * sizeof(double)); // z, p
+
+    std::vector<double> fnbytesPerLevel(numberOfMgLevels); // Count byte usage per level (level 0 is main CG level)
+    fnbytesPerLevel[0] = fnbytes;
+
+    Af = A.Ac;
+    for (int i = 1; i < numberOfMgLevels; ++i)
+    {
+        double fnrow_Af = Af->localNumberOfRows;
+        double fncol_Af = ((global_int_t) Af->localNumberOfColumns);
+        double fnbytes_Af = 0.0;
+        // Model for GenerateCoarseProblem.cpp
+        fnbytes_Af += fnrow_Af * ((double) sizeof(local_int_t)); // f2cOperator
+        fnbytes_Af += fnrow_Af * ((double) sizeof(double));      // rc
+        fnbytes_Af += 2.0 * fncol_Af
+            * ((double) sizeof(double)); // xc, Axf are estimated based on the size of these arrays on rank 0
+        fnbytes_Af += ((double) (sizeof(Geometry) + sizeof(SparseMatrix) + 3 * sizeof(Vector)
+            + sizeof(MGData))); // Account for structs geomc, Ac, rc, xc, Axf - (minor)
+
+        // Model for GenerateProblem.cpp (called within GenerateCoarseProblem.cpp)
+        fnbytes_Af += fnrow_Af * sizeof(char);                                             // array nonzerosInRow
+        fnbytes_Af += fnrow_Af * ((double) sizeof(global_int_t*));                         // mtxIndG
+        fnbytes_Af += fnrow_Af * ((double) sizeof(local_int_t*));                          // mtxIndL
+        fnbytes_Af += fnrow_Af * ((double) sizeof(double*));                               // matrixValues
+        fnbytes_Af += fnrow_Af * ((double) sizeof(double*));                               // matrixDiagonal
+        fnbytes_Af += fnrow_Af * numberOfNonzerosPerRow * ((double) sizeof(local_int_t));  // mtxIndL[1..nrows]
+        fnbytes_Af += fnrow_Af * numberOfNonzerosPerRow * ((double) sizeof(double));       // matrixValues[1..nrows]
+        //fnbytes_Af += fnrow_Af * numberOfNonzerosPerRow * ((double) sizeof(global_int_t)); // mtxIndG[1..nrows]
+
+// Model for SetupHalo_ref.cpp
+#ifndef HPCG_NO_MPI
+        fnbytes_Af += ((double) sizeof(double) * Af->totalToBeSent);              // sendBuffer
+        fnbytes_Af += ((double) sizeof(local_int_t) * Af->totalToBeSent);         // elementsToSend
+        fnbytes_Af += ((double) sizeof(int) * Af->numberOfSendNeighbors);         // neighbors
+        fnbytes_Af += ((double) sizeof(local_int_t) * Af->numberOfSendNeighbors); // receiveLength, sendLength
+#endif
+        fnbytesPerLevel[i] = fnbytes_Af;
+        fnbytes += fnbytes_Af; // Running sum
+        Af = Af->Ac;           // Go to next coarse level
     }
 
-    return cpuRefMemory;
+    return fnbytes;
 }
-
 //////////////////////// Generate Problem /////////////////////////////////////
 /*
     Inclusive Prefix Sum
@@ -328,7 +376,7 @@ void PrefixsumCpu(int* x, int N)
 /*
     //Assumes 8 colors
 */
-void Prefixsum8ColCpu(std::vector<local_int_t> colors, local_int_t* temp, local_int_t N)
+void Prefixsum8ColCpu(local_int_t* colors, local_int_t* temp, local_int_t N)
 {
     local_int_t* sum_acc;
 #pragma omp parallel
@@ -380,6 +428,28 @@ void Prefixsum8ColCpu(std::vector<local_int_t> colors, local_int_t* temp, local_
     delete[] sum_acc;
 }
 
+local_int_t parCount(local_int_t* arr, local_int_t N, local_int_t val)
+{
+    local_int_t count = 0;
+#pragma omp parallel for reduction(+:count)
+    for (local_int_t i  = 0; i < N; i++)
+    {
+        count += (arr[i] == val);
+    }
+    return count;
+}
+
+local_int_t parMaxElement(local_int_t* arr, local_int_t N)
+{
+    local_int_t maxElement = arr[0];
+#pragma omp parallel for reduction(max:maxElement)
+    for (local_int_t i  = 1; i < N; i++)
+    {
+        maxElement = arr[i] > maxElement ? arr[i] : maxElement;
+    }
+    return maxElement;
+}
+
 /*
     CPU Kernel
     Minmax hashing used for graph coloring
@@ -407,7 +477,7 @@ unsigned int hash(unsigned int n)
     Colring is based on Jones-Plassmann Luby algorithm
 */
 void minmaxHashStep(SparseMatrix& A, int next_color, int next_color_p1, local_int_t nrow,
-    std::vector<local_int_t>& color, std::vector<local_int_t>& count_colors)
+    local_int_t* color, std::vector<local_int_t>& count_colors)
 {
 #pragma omp parallel for
     for (local_int_t i = 0; i < nrow; i++)
@@ -459,7 +529,7 @@ void minmaxHashStep(SparseMatrix& A, int next_color, int next_color_p1, local_in
     Colring is based on Jones-Plassmann Luby algorithm
     Create hash by reversing bits
 */
-void testHashStep3(SparseMatrix& A, std::vector<local_int_t>& color, int next_color, unsigned int seed, int check_color)
+void testHashStep3(SparseMatrix& A,local_int_t* color, int next_color, unsigned int seed, int check_color)
 {
     local_int_t nrow = A.localNumberOfRows;
 #pragma omp parallel
@@ -499,9 +569,17 @@ void testHashStep3(SparseMatrix& A, std::vector<local_int_t>& color, int next_co
 /*
     Based on Jones-Plassmann Luby algorithm
 */
-void ColorMatrixCpu(SparseMatrix& A, std::vector<local_int_t>& color, int* num_colors)
+void ColorMatrixCpu(SparseMatrix& A, int* num_colors)
 {
     local_int_t nrow = A.localNumberOfRows;
+    local_int_t* color = A.cpuAux.color;
+
+#pragma omp parallel for
+    for (auto c = 0; c < nrow; c++)
+    {
+        color[c] = -1;
+    }
+
     int color_order[8] = {7, 4, 2, 6, 5, 1, 3, 0};
     int perm_colors[8] = {color_order[0], color_order[7], color_order[4], color_order[3], color_order[2],
         color_order[5], color_order[6], color_order[1]};
@@ -521,9 +599,8 @@ void ColorMatrixCpu(SparseMatrix& A, std::vector<local_int_t>& color, int* num_c
             // minmax hash step
             minmaxHashStep(A, perm_colors[next_color], perm_colors[next_color + 1], nrow, color, count_colors);
             // count how many rows we just colored
-            count_colors[perm_colors[next_color]] = std::count(color.begin(), color.end(), perm_colors[next_color]);
-            count_colors[perm_colors[next_color + 1]]
-                = std::count(color.begin(), color.end(), perm_colors[next_color + 1]);
+            count_colors[perm_colors[next_color]] = parCount(color, nrow, perm_colors[next_color]);//std::count(color, color + nrow, perm_colors[next_color]);
+            count_colors[perm_colors[next_color + 1]] = parCount(color, nrow, perm_colors[next_color + 1]);
             colored += count_colors[perm_colors[next_color]] + count_colors[perm_colors[next_color + 1]];
         }
         else
@@ -531,8 +608,8 @@ void ColorMatrixCpu(SparseMatrix& A, std::vector<local_int_t>& color, int* num_c
             // minmax hash step
             minmaxHashStep(A, next_color, next_color + 1, nrow, color, count_colors);
             // count how many rows we just colored
-            count_colors[next_color] = std::count(color.begin(), color.end(), next_color);
-            count_colors[next_color + 1] = std::count(color.begin(), color.end(), next_color + 1);
+            count_colors[next_color] = parCount(color, nrow, perm_colors[next_color]);
+            count_colors[next_color + 1] = parCount(color, nrow, perm_colors[next_color + 1]);
             colored += count_colors[next_color] + count_colors[next_color + 1];
         }
         // Are we done?
@@ -547,7 +624,7 @@ void ColorMatrixCpu(SparseMatrix& A, std::vector<local_int_t>& color, int* num_c
     int check_color;
     int color_target = 1;
     int recolor_times = 10;
-    int maxx = *(std::max_element(color.begin(), color.end()));
+    int maxx = parMaxElement(color, nrow);
 
     int max_used_color = maxx;
     if (maxx > 15)
@@ -561,8 +638,8 @@ void ColorMatrixCpu(SparseMatrix& A, std::vector<local_int_t>& color, int* num_c
                 {
                     testHashStep3(A, color, it_count, 15, check_color);
                 }
-                maxx = *(std::max_element(color.begin(), color.end()));
-                count_colors[maxx] = std::count(color.begin(), color.end(), maxx);
+                maxx = parMaxElement(color, nrow);
+                count_colors[maxx] = parCount(color, nrow, maxx);
                 it_count++;
             }
         }
@@ -575,7 +652,7 @@ void ColorMatrixCpu(SparseMatrix& A, std::vector<local_int_t>& color, int* num_c
 
     for (check_color = 0; check_color < next_color; check_color++)
     {
-        count_colors[check_color] = std::count(color.begin(), color.end(), check_color);
+        count_colors[check_color] = parCount(color, nrow, check_color);
     }
     max_used_color = 0;
     for (int i = 0; i < max_colors; i++)
@@ -585,26 +662,57 @@ void ColorMatrixCpu(SparseMatrix& A, std::vector<local_int_t>& color, int* num_c
     }
 
     *num_colors = max_used_color + 1;
+    local_int_t nvcolors = *num_colors;
+    local_int_t *counter, nthreads;
+    #pragma omp parallel shared(counter, nthreads)
+    {
+        const int ithread = omp_get_thread_num();
+        nthreads = omp_get_num_threads();
+        #pragma omp single
+        {
+            counter = new local_int_t[nvcolors * omp_get_num_threads()];
+        }
 
-    for (int i = 0; i < *num_colors; i++)
-    {
-        A.cpuAux.nRowsWithColor[i] = 0;
+#pragma omp for
+        for(int i = 0; i < nvcolors * nthreads; i++)
+        {
+            counter[i] = 0;
+        }
+
+#pragma omp for
+        for (local_int_t i = 0; i < nrow; i++)
+        {
+            local_int_t c = color[i];
+            counter[ithread * nvcolors + c]++;
+        }
     }
-    for (local_int_t i = 0; i < nrow; i++)
+
+    // Sequential instead of atomics inside the omp region
+    for (int j = 0; j < nvcolors; j++)
     {
-        A.cpuAux.nRowsWithColor[color[i]]++;
+        local_int_t cc = 0;
+        for(int i = 0; i < nthreads; i++)
+        {
+            cc+= counter[i * nvcolors + j];
+        }
+        
+        A.cpuAux.nRowsWithColor[j] = cc;
     }
+
+    delete [] counter;
 }
 
 /*
     Permute matrix rows and create A, L, and U in Sliced-Ellpack format
 */
-void CreateSellPermCpu(SparseMatrix& A, std::vector<local_int_t>& color)
+void CreateSellPermCpu(SparseMatrix& A)
 {
     local_int_t nrow = A.localNumberOfRows;
     local_int_t slice_size = A.slice_size;
     local_int_t* temp = new local_int_t[nrow + 1];
+    local_int_t* color = A.cpuAux.color;
     Prefixsum8ColCpu(color, temp, nrow);
+
 #pragma omp parallel for
     for (auto i = 0; i < nrow; i++)
     {
@@ -614,6 +722,16 @@ void CreateSellPermCpu(SparseMatrix& A, std::vector<local_int_t>& color)
         A.opt2ref[targetRowIdx] = i;
     }
     delete[] temp;
+
+    A.csrExtOffsets[0] = 0;
+#pragma omp parallel for
+    for (auto i = 0; i < nrow; i++)
+    {
+        local_int_t originalRow = A.opt2ref[i];
+        A.csrExtOffsets[i + 1] = A.cpuAux.tempIndex[originalRow];
+    }
+    delete[] A.cpuAux.tempIndex;
+    PrefixsumCpu(A.csrExtOffsets + 1, nrow);
 
 // Don't translate external rows
 #pragma omp parallel for
@@ -648,6 +766,7 @@ void CreateSellPermCpu(SparseMatrix& A, std::vector<local_int_t>& color)
         local_int_t in_slice_id = i % slice_size;
 
         local_int_t nnz_counter = 0;
+        local_int_t ext_nnz_index = A.csrExtOffsets[i];
         for (local_int_t j = 0; j < A.nonzerosInRow[originalRow]; j++)
         {
             local_int_t col = A.mtxIndL[originalRow][j];
@@ -674,7 +793,14 @@ void CreateSellPermCpu(SparseMatrix& A, std::vector<local_int_t>& color)
                     u_nnz++;
                 }
             }
+            else
+            {
+                A.csrExtColumns[ext_nnz_index] = col;
+                A.csrExtValues[ext_nnz_index] = val;   
+                ext_nnz_index++;
+            }
         }
+
         for (; nnz_counter < HPCG_MAX_ROW_LEN; nnz_counter++)
         {
             auto index = slice_id * slice_size * HPCG_MAX_ROW_LEN + nnz_counter * slice_size + in_slice_id;
@@ -758,30 +884,6 @@ void CreateSellPermCpu(SparseMatrix& A, std::vector<local_int_t>& color)
             A.sellUPermValues[j] = -1;
         }
     }
-
-    // CSR external matrix
-    // Relies on SetupHalo to set external column indices to be greater
-    //  than the number of rows
-    A.csrExtOffsets[0] = 0;
-    local_int_t total_nnzExt = 0;
-    for (local_int_t i = 0; i < nrow; i++)
-    {
-        local_int_t idx = A.opt2ref[i];
-        for (int j = 0; j < A.nonzerosInRow[idx]; j++)
-        {
-            local_int_t col = A.mtxIndL[idx][j];
-            if (col >= nrow)
-            {
-                A.csrExtColumns[total_nnzExt] = col;
-                A.csrExtValues[total_nnzExt] = A.matrixValues[idx][j];
-                total_nnzExt++;
-            }
-        }
-        A.csrExtOffsets[i + 1] = total_nnzExt;
-    }
-
-    assert(total_nnzExt == A.extNnz);
-    A.extNnz = total_nnzExt;
 }
 
 /*
@@ -803,6 +905,7 @@ void PermVectorCpu(local_int_t* perm, Vector& x, local_int_t length)
 */
 void F2cPermCpu(local_int_t nrow_c, local_int_t* f2c, local_int_t* f2cPerm, local_int_t* perm_f, local_int_t* iperm_c)
 {
+#pragma omp parallel for
     for (local_int_t i = 0; i < nrow_c; i++)
     {
         f2cPerm[i] = perm_f[f2c[iperm_c[i]]];

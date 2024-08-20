@@ -63,8 +63,8 @@ void PrefixsumCpu(int* x, int N);
 
 // Optimize Problem
 size_t AllocateMemCpu(SparseMatrix& A_in);
-void ColorMatrixCpu(SparseMatrix& A, std::vector<local_int_t>& color, int* num_colors);
-void CreateSellPermCpu(SparseMatrix& A, std::vector<local_int_t>& color);
+void ColorMatrixCpu(SparseMatrix& A, int* num_colors);
+void CreateSellPermCpu(SparseMatrix& A);
 void F2cPermCpu(local_int_t nrow_c, local_int_t* f2c, local_int_t* f2c_perm, local_int_t* perm_f, local_int_t* iperm_c);
 
 // Permute a vector using coloring buffer

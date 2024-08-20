@@ -295,6 +295,7 @@ void SetupHalo_Cpu(SparseMatrix& A)
     //  We need to receive this value of the x vector during the halo exchange.
     // 2) We record our row ID since we know that the other processor will need this value from us, due to symmetry.
     std::map<local_int_t, std::map<global_int_t, local_int_t>> externalToLocalMap;
+    local_int_t* extTemp = new local_int_t[localNumberOfRows];
 
     // Okay Let us git rid of the map
     local_int_t sendbufld
@@ -529,6 +530,7 @@ void SetupHalo_Cpu(SparseMatrix& A)
 #pragma omp parallel for
         for (local_int_t i = 0; i < localNumberOfRows; i++)
         {
+            int nnz_ext = 0;
             if (has_external[i] == 1)
             {
 
@@ -539,6 +541,7 @@ void SetupHalo_Cpu(SparseMatrix& A)
                 const global_int_t giy = iy + giy0;
                 const global_int_t giz = iz + giz0;
                 int nnz_c = 0;
+                
                 for (int k = 0; k < 27; k++)
                 {
                     long long int cgix = gix + tid2indCpu[k][0];
@@ -629,11 +632,13 @@ void SetupHalo_Cpu(SparseMatrix& A)
                         if (externalToLocalMap.find(row_rank) != externalToLocalMap.end())
                         {
                             mtxIndL[i][nnz_c] = externalToLocalMap[row_rank][lcol];
+                            nnz_ext++;
                         }
                         nnz_c++;
                     }
                 }
             }
+             extTemp[i] = nnz_ext;
         }
     }
 
@@ -685,6 +690,7 @@ void SetupHalo_Cpu(SparseMatrix& A)
     A.receiveLength = receiveLength;
     A.sendLength = sendLength;
     A.sendBuffer = sendBuffer;
+    A.cpuAux.tempIndex = extTemp;
 
 #ifdef HPCG_DETAILED_DEBUG
     HPCG_fout << " For rank " << A.geom->rank << " of " << A.geom->size

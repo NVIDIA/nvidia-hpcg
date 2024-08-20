@@ -244,11 +244,9 @@ size_t OptimizeProblemCpu(SparseMatrix& A_in, CGData& data, Vector& b, Vector& x
     local_int_t slice_size = A->slice_size;
     for (int level = 0; level < numberOfMgLevels; ++level)
     {
-        std::vector<local_int_t> colorOfRow(A->totalNumberOfRows, -1);
-
         // Color the matrix
         int num_colors;
-        ColorMatrixCpu(*A, colorOfRow, &num_colors);
+        ColorMatrixCpu(*A, &num_colors);
         A->totalColors = num_colors;
 
         // Compute when each color starts
@@ -259,10 +257,11 @@ size_t OptimizeProblemCpu(SparseMatrix& A_in, CGData& data, Vector& b, Vector& x
         }
 
         // Reorder the matrix
-        CreateSellPermCpu(*A, colorOfRow);
+        CreateSellPermCpu(*A);
 
 #ifndef HPCG_NO_MPI
         // Translate row IDs that will be send to neighbours
+#pragma omp parallel for
         for (local_int_t i = 0; i < A->totalToBeSent; i++)
         {
             local_int_t orig = A->elementsToSend[i];
