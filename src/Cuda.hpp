@@ -25,7 +25,9 @@
 #ifdef USE_NCCL
 #include "nccl.h"
 #endif
+#ifdef USE_NVTX
 #include <nvToolsExt.h>
+#endif
 #include <unistd.h>
 
 extern cusparseHandle_t cusparsehandle;
