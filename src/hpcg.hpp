@@ -98,6 +98,9 @@ Hitory:
 
 #define HPCG_VERSION (HPCG_VER_MAJOR * 1000 + HPCG_VER_MINOR * 100 + HPCG_VER_PATCH)
 
+#define VER_HEADER \
+    "HPCG-NVIDIA " XSTR(HPCG__VER_MAJOR)"." XSTR(HPCG__VER_MINOR) "." XSTR(HPCG__VER_PATCH) "  -- NVIDIA accelerated HPCG benchmark -- NVIDIA\n"
+
 #define HPCG_LINE_MAX 256
 
 extern std::ofstream HPCG_fout;

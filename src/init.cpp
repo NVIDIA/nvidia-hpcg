@@ -406,8 +406,7 @@ int HPCG_Init(int* argc_p, char*** argv_p, HPCG_Params& params)
 
     if (params.comm_rank == 0)
     {
-        printf("HPCG-NVIDIA %d.%d.%d  -- NVIDIA accelerated HPCG benchmark -- NVIDIA\n", HPCG_VER_MAJOR, HPCG_VER_MINOR,
-            HPCG_VER_PATCH);
+        printf("%s", VER_HEADER);
     }
 
 #ifdef HPCG_NO_OPENMP
