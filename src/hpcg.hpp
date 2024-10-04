@@ -73,9 +73,9 @@ Hitory:
 #endif
 
 #ifndef make_HPCG_VER_MINOR
-#define HPCG_VER_MINOR 4
+#define HPCG_VER_MINOR 09
 #elif CHECK_EMPTY_MACRO(make_HPCG_VER_MINOR) == 1
-#define HPCG_VER_MINOR 4
+#define HPCG_VER_MINOR 09
 #else
 #define HPCG_VER_MINOR make_HPCG_VER_MINOR
 #endif
@@ -99,7 +99,7 @@ Hitory:
 #define HPCG_VERSION (HPCG_VER_MAJOR * 1000 + HPCG_VER_MINOR * 100 + HPCG_VER_PATCH)
 
 #define VER_HEADER \
-    "HPCG-NVIDIA " XSTR(HPCG__VER_MAJOR)"." XSTR(HPCG__VER_MINOR) "." XSTR(HPCG__VER_PATCH) "  -- NVIDIA accelerated HPCG benchmark -- NVIDIA\n"
+    "HPCG-NVIDIA " XSTR(HPCG_VER_MAJOR)"." XSTR(HPCG_VER_MINOR) "." XSTR(HPCG_VER_PATCH) "  -- NVIDIA accelerated HPCG benchmark -- NVIDIA\n"
 
 #define HPCG_LINE_MAX 256
 
