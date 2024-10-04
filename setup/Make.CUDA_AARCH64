@@ -178,6 +178,9 @@ HPCG_DEFS     = $(HPCG_OPTS) $(HPCG_INCLUDES)
 ifeq ($(USE_CUDA), 1)
     CUDA_ARCH = -gencode=arch=compute_80,code=sm_80 -gencode=arch=compute_90,code=sm_90
 endif
+ifeq ($(BUILD_B100), 1)
+CUDA_ARCH += --generate-code arch=compute_100a,code=sm_100a
+endif
 CPU_ARCH ?= native
 
 CXX          = nvcc

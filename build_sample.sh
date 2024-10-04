@@ -79,6 +79,11 @@ else
     ../configure CUDA_X86
 fi
 
+export build_B100=0
+if [[ $8 == "1" ]]; then
+    export build_B100=1
+fi
+
 make -j 16 \
     USE_CUDA=${USE_CUDA} \
     USE_GRACE=${USE_GRACE} \
@@ -92,7 +97,8 @@ make -j 16 \
     HPCG_ENG_VERSION=${is_ENG_VERSION} \
     HPCG_COMMIT_HASH=$2 \
     HPCG_VER_MAJOR=$3 \
-    HPCG_VER_MINOR=$4
+    HPCG_VER_MINOR=$4 \
+    BUILD_B100=${build_B100}
 
 #Move build/bin/xhpcg to bin/xhpcg
 make install
