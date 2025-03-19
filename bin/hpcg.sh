@@ -44,6 +44,9 @@ usage() {
   echo "    --ucx-affinity <string>       colon separated list of UCX devices"
   echo "    --ucx-tls      <string>       UCX transport to use"
   echo "    --exec-name    <string>       HPCG executable file"
+  echo "    --npx          <int>          specifies the process grid X dimension of the problem"
+  echo "    --npy          <int>          specifies the process grid Y dimension of the problem"
+  echo "    --npz          <int>          specifies the process grid Z dimension of the problem"
   echo "    --p2p          <int>          specifies the p2p comm mode: 0 MPI_CPU, 1 MPI_CPU_All2allv, 2 MPI_CUDA_AWARE, 3 MPI_CUDA_AWARE_All2allv, 4 NCCL. Default MPI_CPU"
   echo "    --b            <int>          activates benchmarking mode to bypass CPU reference execution when set to one (--b 1)"
   echo "    --l2cmp        <int>          activates compression in GPU L2 cache when set to one (--l2cmp 1)"
@@ -246,6 +249,33 @@ while [ "$1" != "" ]; do
         exit 1
       fi
       shift
+      ;;
+    --npx )
+      if [ -n "$2" ]; then
+        NPX="--npx=$2"
+      else
+        usage
+        exit 1
+      fi
+      shift
+      ;;
+    --npy )
+      if [ -n "$2" ]; then
+        NPY="--npy=$2"
+      else
+        usage
+        exit 1
+      fi
+      shift
+      ;;
+    --npz )
+      if [ -n "$2" ]; then
+        NPZ="--npz=$2"
+      else
+        usage
+        exit 1
+      fi
+      shift
       ;;  
      --p2p )
        if [ -n "$2" ]; then
@@ -340,7 +370,7 @@ fi
 # fi
 # export CUDA_VISIBLE_DEVICES=${GPU}
 
-HPCG_CONTROL="${B} ${L2CMP} ${P2P} ${OF}"
+HPCG_CONTROL="${B} ${L2CMP} ${P2P} ${OF} ${NPX} ${NPY} ${NPZ}"
 
 if [[ -z "${NX}" || -z "${NY}" || -z "${NZ}" || -z "${RT}" ]]; then
     if [ -z "${DAT}" ]; then
