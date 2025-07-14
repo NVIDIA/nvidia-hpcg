@@ -101,7 +101,7 @@ int ComputeSPMV(const SparseMatrix& A, Vector& x, Vector& y)
 #ifndef HPCG_NO_MPI
         if (A.totalToBeSent > 0)
         {
-            ExchangeHalo(A, x);
+            ExchangeHaloCpu(A, x);
             ExtSpMVCpu(A, A.localNumberOfRows, 1.0, x.values, y.values);
         }
 #endif

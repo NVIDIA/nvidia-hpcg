@@ -234,7 +234,7 @@ int ComputeSYMGS_Cpu(const SparseMatrix& A, const Vector& r, Vector& x, bool ste
                 NVPL_SPARSE_SPMV_ALG_DEFAULT, A.nvplSparseOpt.spmvLDescr);
 
 #ifndef HPCG_NO_MPI
-            ExchangeHalo(A, x);
+            ExchangeHaloCpu(A, x);
             if (A.totalToBeSent > 0)
             {
                 ExtSpMVCpu(A, nrow, 1.0, xv, temp);
@@ -257,7 +257,7 @@ int ComputeSYMGS_Cpu(const SparseMatrix& A, const Vector& r, Vector& x, bool ste
 
 #ifndef HPCG_NO_MPI
         // MPI_Ibarrier --> will help improve MPI_Allreduce in dot product
-        ExchangeHalo(A, x, A.level == 0 ? 1 /*call MPI_Ibarrier*/ : 0);
+        ExchangeHaloCpu(A, x, A.level == 0 ? 1 /*call MPI_Ibarrier*/ : 0);
         if (A.totalToBeSent > 0)
         {
             ExtSpMVCpu(A, nrow, -1.0, xv, temp);
