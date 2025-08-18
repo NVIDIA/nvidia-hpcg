@@ -2124,15 +2124,39 @@ void ComputeProlongationCuda(const SparseMatrix& A, Vector& x)
     GPU Kernel
     Computes WAXPBY
 */
-__global__ void __launch_bounds__(128)
-    computeWAXPBY_kernel(const local_int_t n, double alpha, double* x, double beta, double* y, double* w)
-{
+template<int THREADS_PER_CTA, int ROUNDS>
+ __global__ void __launch_bounds__(THREADS_PER_CTA)
+    computeWAXPBY_kernel(const local_int_t n, double alpha, double* __restrict__ x, double beta, double* __restrict__ y, double* w)
+ {
+    const local_int_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+    const local_int_t stride = blockDim.x * gridDim.x;
+    
+    // Process 2 rounds of double2 elements per thread
+    #pragma unroll
+    for (int round = 0; round < ROUNDS; ++round)
+    {
+        local_int_t base_idx = gid + round * stride;
 
-    const local_int_t i = blockIdx.x * 128 + threadIdx.x;
-    if (i >= n)
-        return;
-    w[i] = alpha * x[i] + beta * y[i];
-}
+         // Use double2 for vectorized loads/stores when possible
+         if ( (base_idx * 2 + 1) < n)
+         {
+             double2 x_vec = *reinterpret_cast<double2*>(&x[base_idx * 2]);
+             double2 y_vec = *reinterpret_cast<double2*>(&y[base_idx * 2]);
+             
+             double2 w_vec;
+             w_vec.x = alpha * x_vec.x + beta * y_vec.x;
+             w_vec.y = alpha * x_vec.y + beta * y_vec.y;
+             
+             *reinterpret_cast<double2*>(&w[base_idx * 2]) = w_vec;
+         }
+         else if ( (base_idx * 2) < n)
+         {
+             // Handle remaining element individually
+             w[base_idx * 2] = alpha * x[base_idx * 2] + beta * y[base_idx * 2];
+         }
+     }
+ }
+ 
 
 /*
     Computes WAXPBY followed by stream synchronization
@@ -2140,9 +2164,11 @@ __global__ void __launch_bounds__(128)
 void ComputeWAXPBYCuda(
     const local_int_t n, const double alpha, const Vector& x, const double beta, const Vector& y, Vector& w)
 {
-
-    const int grid = (n + 128 - 1) / 128;
-    computeWAXPBY_kernel<<<grid, 128, 0, stream>>>(n, alpha, x.values_d, beta, y.values_d, w.values_d);
+    const int ROUNDS = 1;
+    const int THREADS_PER_CTA = 256;
+    const int ELELEMENTS_PER_CTA = THREADS_PER_CTA * ROUNDS * 2; // 2 doubles per thread, # rounds per thread
+    const int grid = (n + ELELEMENTS_PER_CTA - 1) / ELELEMENTS_PER_CTA;
+    computeWAXPBY_kernel<THREADS_PER_CTA, ROUNDS><<<grid, THREADS_PER_CTA, 0, stream>>>(n, alpha, x.values_d, beta, y.values_d, w.values_d);
     cudaStreamSynchronize(stream);
 }
 
