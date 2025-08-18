@@ -1555,30 +1555,53 @@ __global__ void __launch_bounds__(BLOCK_SIZE) ellPermColumnsValues_kernel(local_
     GPU Kernel
     Transpose a block of values, for HPCG using sliced size of A = slice_size x 27
 */
-__global__ void transposeBlock_kernel(
+__device__ void transposeBlock_device_kernel(
     local_int_t n, int stride, double* outd, local_int_t* outi, double* ind, local_int_t* ini, local_int_t block_id)
 {
     __shared__ double scratchd[16][16];
     __shared__ local_int_t scratchi[16][16];
     local_int_t tx = threadIdx.x;
     local_int_t ty = threadIdx.y;
-    local_int_t row_index_in = ty + blockDim.x * blockIdx.x;
-    local_int_t col_index_in = tx + blockDim.y * blockIdx.y;
-    if (row_index_in < stride && col_index_in < HPCG_MAX_ROW_LEN)
-    {
-        local_int_t in_id = col_index_in + HPCG_MAX_ROW_LEN * row_index_in;
-        scratchd[ty][tx] = ind[in_id];
-        scratchi[ty][tx] = ini[in_id];
-    }
-    __syncthreads();
+    
+    for(local_int_t i = 0; i < stride; i += blockDim.x * gridDim.x) {
 
-    local_int_t row_index_out = tx + blockDim.x * blockIdx.x;
-    local_int_t col_index_out = ty + blockDim.y * blockIdx.y;
-    if (row_index_out < stride && col_index_out < HPCG_MAX_ROW_LEN)
+        local_int_t row_index_in = ty + blockDim.x * blockIdx.x + i;
+        local_int_t col_index_in = tx + blockDim.y * blockIdx.y;
+        if (row_index_in < stride && col_index_in < HPCG_MAX_ROW_LEN)
+        {
+            local_int_t in_id = col_index_in + HPCG_MAX_ROW_LEN * row_index_in;
+            scratchd[ty][tx] = ind[in_id];
+            scratchi[ty][tx] = ini[in_id];
+        }
+        __syncthreads();
+
+        local_int_t row_index_out = tx + blockDim.x * blockIdx.x + i;
+        local_int_t col_index_out = ty + blockDim.y * blockIdx.y;
+        if (row_index_out < stride && col_index_out < HPCG_MAX_ROW_LEN)
+        {
+            local_int_t out_id = row_index_out + stride * col_index_out;
+            outd[out_id] = scratchd[tx][ty];
+            outi[out_id] = scratchi[tx][ty];
+        }
+    }
+}
+
+
+__global__ void transpose_kernel(local_int_t n, local_int_t *sellCollIndex, double *sellValues, local_int_t slice_size)
+{
+    using namespace cooperative_groups;
+    cooperative_groups::grid_group grid = cooperative_groups::this_grid();
+    
+    for(local_int_t i = 0; i < n; i += slice_size)
     {
-        local_int_t out_id = row_index_out + stride * col_index_out;
-        outd[out_id] = scratchd[tx][ty];
-        outi[out_id] = scratchi[tx][ty];
+        transposeBlock_device_kernel(n, slice_size, 
+             sellValues + i * HPCG_MAX_ROW_LEN,
+             sellCollIndex + i * HPCG_MAX_ROW_LEN,
+             sellValues + (i + slice_size) * HPCG_MAX_ROW_LEN,
+             sellCollIndex + (i + slice_size) * HPCG_MAX_ROW_LEN,
+             i/slice_size);
+    
+        grid.sync();
     }
 }
 
@@ -1664,13 +1687,23 @@ __global__ void createAMatrixSliceOffsets_kernel(local_int_t nrow, local_int_t s
     GPU Kernel
     Fills the lower and upper values with minus one
 */
-__global__ void __launch_bounds__(128) setLUValues_kernel(local_int_t nnz, double* l_values, double* u_values)
+template<int THREADS_PER_CTA, int ELEMENTS_PER_THREAD>
+__global__ void __launch_bounds__(THREADS_PER_CTA)
+    setLUValues_kernel(local_int_t nnz, double* __restrict__ l_values, double* __restrict__ u_values)
 {
-    const local_int_t i = blockIdx.x * 128 + threadIdx.x;
-    if (i < nnz)
+    const local_int_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+    const local_int_t stride = blockDim.x * gridDim.x;
+    
+    // Process multiple elements per thread with unrolling
+    #pragma unroll
+    for (int i = 0; i < ELEMENTS_PER_THREAD; ++i)
     {
-        l_values[i] = -1.0;
-        u_values[i] = -1.0;
+        local_int_t idx = gid + i * stride;
+        if (idx < nnz)
+        {
+            l_values[idx] = -1.0;
+            u_values[idx] = -1.0;
+        }
     }
 }
 
@@ -1918,12 +1951,29 @@ void EllPermColumnsValuesCuda(local_int_t localNumberOfRows, local_int_t* nnzPer
 /*
     Transpose a slice of (sliced-)ELLPACK matrix
 */
-void TransposeBlockCuda(local_int_t n, int stride, double* outd, local_int_t* outi, double* ind, local_int_t* ini,
-    local_int_t* dia_in_out, local_int_t block_id)
+void TransposeCuda(local_int_t n, int slice_size, local_int_t* sellCollIndex, double* sellValues)
 {
+    int dev;
+    cudaDeviceProp deviceProp;
+    int numBlocksPerSm = 0;
     dim3 block(16, 16, 1);
-    dim3 grid((stride + block.x - 1) / block.x, (HPCG_MAX_ROW_LEN + block.y - 1) / block.y, 1);
-    transposeBlock_kernel<<<grid, block, 0, stream>>>(n, stride, outd, outi, ind, ini, block_id);
+    int numThreadsPerBlock = block.x * block.y;
+
+    cudaGetDevice(&dev);
+    cudaGetDeviceProperties(&deviceProp, dev);
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&numBlocksPerSm, transpose_kernel, numThreadsPerBlock, 0);
+
+    size_t blocksInY = (HPCG_MAX_ROW_LEN + block.y - 1) / block.y;
+    size_t blocksInX = deviceProp.multiProcessorCount * numBlocksPerSm / blocksInY; //In x direction
+    size_t blocksInXNeeded =(slice_size + block.x - 1) / block.x;
+    blocksInXNeeded = blocksInXNeeded > blocksInX ? blocksInX : blocksInXNeeded;
+    
+    dim3 grid(blocksInXNeeded, blocksInY, 1);
+    void*         args[]     = {(void*) &n,
+                                (void*) &sellCollIndex,
+                                (void*) &sellValues,
+                                (void*) &slice_size};
+    cudaLaunchCooperativeKernel((void*)transpose_kernel, grid, block, args, 0, stream);  
 }
 
 /*
@@ -1985,9 +2035,11 @@ void CreateSellLUColumnsValuesCuda(const local_int_t n, const int slice_size, lo
     local_int_t estimated_size = EstimateLUmem(n, paddedRowLen, level);
 
     const int BlockSize = 128;
+    const int ELEMENTS_PER_THREAD = 8;
+    const int ELEMENTS_PER_CTA = BlockSize * ELEMENTS_PER_THREAD;
+    const local_int_t grid_nnz = (estimated_size + ELEMENTS_PER_CTA - 1) / ELEMENTS_PER_CTA;
     local_int_t grid = (n + BlockSize - 1) / BlockSize;
-    const local_int_t grid_nnz = (estimated_size + BlockSize - 1) / BlockSize;
-    setLUValues_kernel<<<grid_nnz, BlockSize, 0, stream>>>(estimated_size, ell_u_values, ell_l_values);
+    setLUValues_kernel<BlockSize, ELEMENTS_PER_THREAD><<<grid_nnz, BlockSize, 0, stream>>>(estimated_size, ell_u_values, ell_l_values);
     createSellLUColumnsValues_kernel<<<grid, BlockSize, 0, stream>>>(n, slice_size, ell_columns, ell_values,
         ell_l_slice_offset, ell_l_columns, ell_l_values, ell_u_slice_offset, ell_u_columns, ell_u_values);
 }

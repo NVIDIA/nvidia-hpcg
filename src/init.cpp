@@ -399,7 +399,7 @@ int HPCG_Init(int* argc_p, char*** argv_p, HPCG_Params& params)
     }
     
     // --gss
-    params.gpu_slice_size = iparams[16] > 0 ? iparams[16] : 2048;
+    params.gpu_slice_size = iparams[16] > 0 ? iparams[16] : 4096;
 
     // --css
     params.cpu_slice_size = iparams[17] > 0 ? iparams[17] : 8;

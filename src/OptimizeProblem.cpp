@@ -94,14 +94,7 @@ size_t OptimizeProblemGpu(SparseMatrix& A_in, CGData& data, Vector& b, Vector& x
             A->gpuAux.sellADiagonalIdx, A->gpuAux.csrLPermOffsets, A->gpuAux.csrUPermOffsets, false);
 
         // Coloumn mojor blocked/sliced ellpack
-        for (local_int_t i = 0; i < nrow; i += slice_size)
-        {
-            TransposeBlockCuda(nrow, slice_size, A->sellAPermValues + i * HPCG_MAX_ROW_LEN,
-                A->sellAPermColumns + i * HPCG_MAX_ROW_LEN, /* Outputs */
-                A->sellAPermValues + (i + slice_size) * HPCG_MAX_ROW_LEN,
-                A->sellAPermColumns + (i + slice_size) * HPCG_MAX_ROW_LEN, /* Inputs  */
-                A->gpuAux.sellADiagonalIdx, i / slice_size /* InOuts  */);
-        }
+        TransposeCuda(nrow, slice_size, A->sellAPermColumns, A->sellAPermValues);
 
         // Per block max row len
         local_int_t num_slices = (nrow + slice_size - 1) / slice_size;
