@@ -124,13 +124,14 @@ endif
 #
 # - Compile time options -----------------------------------------------
 #
-# -DHPCG_NO_MPI	            Define to disable MPI
-# -DHPCG_NO_OPENMP	        Define to disable OPENMP
-# -DHPCG_CONTIGUOUS_ARRAYS  Define to have sparse matrix arrays long and contiguous
-# -DHPCG_DEBUG       	    Define to enable debugging output
-# -DHPCG_DETAILED_DEBUG     Define to enable very detailed debugging output
+# -DHPCG_NO_MPI	             Define to disable MPI
+# -DHPCG_NO_OPENMP	         Define to disable OPENMP
+# -DHPCG_CONTIGUOUS_ARRAYS   Define to have sparse matrix arrays long and contiguous
+# -DHPCG_DEBUG       	     Define to enable debugging output
+# -DHPCG_DETAILED_DEBUG      Define to enable very detailed debugging output
 # -DUSE_CUDA                 Define to enable GPU execution
 # -DUSE_NCCL                 Define to enabele NCCL P2P communication. Use --p2p=4 for NCCL
+# -DUSE_INT64                Define to enable INT64 indexing
 
 # By default HPCG will:
 #    *) Build with MPI enabled.
@@ -146,6 +147,10 @@ endif
 
 ifeq ($(HPCG_ENG_VERSION), 1)
     HPCG_OPTS += -DHPCG_ENG_VERSION
+endif
+
+ifeq ($(USE_INT64), 1)
+    HPCG_OPTS += -DINDEX_64
 endif
 
 #If not set, the defualt values in src/hpcg.hpp will be used

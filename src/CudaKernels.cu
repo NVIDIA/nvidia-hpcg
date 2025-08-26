@@ -743,15 +743,18 @@ __global__ void __launch_bounds__(128) generateProblem_kernel(int rank, int part
     if (lrow >= ntot)
         return;
 
-    diagonalIdx[lrow] = shd[lid] + lrow * HPCG_MAX_ROW_LEN;
-    ;
+    local_int_t in_id = (local_int_t)shd[lid] + (local_int_t)lrow * HPCG_MAX_ROW_LEN;
+    
+    diagonalIdx[lrow] = in_id;
+    
     localToGlobalMap[lrow] = currentGlobalRow;
     diagonal[lrow] = 26.0;
     csr_offsets[lrow] = nnz;
     csrExtOffsets[lrow + 1] = nnz_ext;
     atomic_add(&csr_offsets[ntot], nnz);
 
-    values[shd[lid] + lrow * HPCG_MAX_ROW_LEN] = 26.0;
+    
+    values[in_id] = 26.0;
     if (bv != NULL)
         bv[lrow] = 26.0 - ((double) (nnz - 1));
     if (xv != NULL)
@@ -1951,7 +1954,7 @@ void EllPermColumnsValuesCuda(local_int_t localNumberOfRows, local_int_t* nnzPer
 /*
     Transpose a slice of (sliced-)ELLPACK matrix
 */
-void TransposeCuda(local_int_t n, int slice_size, local_int_t* sellCollIndex, double* sellValues)
+void TransposeCuda(local_int_t n, local_int_t slice_size, local_int_t* sellCollIndex, double* sellValues)
 {
     int dev;
     cudaDeviceProp deviceProp;

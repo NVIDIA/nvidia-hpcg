@@ -176,6 +176,9 @@ int main(int argc, char* argv[])
                 printf(
                     " | L2 compression is activated !!!! Currently, it is not legal to submit HPCG results with L2 "
                     "compression\n");
+        #ifdef INDEX_64
+            printf(" | Using INT64 Indexing \n");
+        #endif
     }
 
     // Check P2P comm mode
@@ -546,8 +549,8 @@ int main(int argc, char* argv[])
             // Test for the most course matrix
             if(A.localNumberOfRows/(8 * 8 * 8) < A.slice_size) {
                 if (rank == 0)
-                    printf("cuSPARSE version must be 12.5 or higher (found v%d.%d) to allow a GPU slice size (%d) larger than the matrix number of rows (%d). Use --gss to set GPU slice size \n", 
-                    cusparseMajor, cusparseMinor, A.slice_size, A.localNumberOfRows/(8*8*8));
+                    printf("cuSPARSE version must be 12.5 or higher (found v%d.%d) to allow a GPU slice size (%lld) larger than the matrix number of rows (%lld). Use --gss to set GPU slice size \n", 
+                    cusparseMajor, cusparseMinor, (long long)A.slice_size, (long long)(A.localNumberOfRows/(8*8*8)));
 #ifndef HPCG_NO_MPI
                 MPI_Finalize();
 #endif
@@ -586,10 +589,10 @@ int main(int argc, char* argv[])
                 " | Process Grid: %dx%dx%d\n"
                 " | Local Domain: %dx%dx%d\n"
                 " | Number of CPU Threads: %d\n"
-                " | Slice Size: %d\n",
+                " | Slice Size: %lld\n",
                 cusparseMajor, cusparseMinor, Use_Compression ? " | L2 compression is activated\n" : "",
                 cpuRefMemory / 1024.0 / 1024.0, props.name, (total_bytes - free_bytes) >> 20, total_bytes >> 20,
-                A.geom->npx, A.geom->npy, A.geom->npz, A.geom->nx, A.geom->ny, A.geom->nz, params.numThreads, A.slice_size);
+                A.geom->npx, A.geom->npy, A.geom->npz, (int)A.geom->nx, (int)A.geom->ny, (int)A.geom->nz, params.numThreads, (long long)A.slice_size);
         CHECK_CUDART(cudaDeviceSynchronize());
 #endif
     }

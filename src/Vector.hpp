@@ -109,7 +109,7 @@ inline void ZeroVector(Vector& v)
 #ifndef HPCG_NO_OPENMP
 #pragma omp parallel for
 #endif
-    for (int i = 0; i < localLength; ++i)
+    for (local_int_t i = 0; i < localLength; ++i)
         vv[i] = 0.0;
 #ifdef USE_CUDA
     if (v.rt == GPU)
@@ -145,7 +145,7 @@ inline void FillRandomVector(Vector& v)
 #ifndef HPCG_NO_OPENMP
 #pragma omp parallel for
 #endif
-    for (int i = 0; i < localLength; ++i)
+    for (local_int_t i = 0; i < localLength; ++i)
         vv[i] = rand() / (double) (RAND_MAX) + 1.0;
     return;
 }
@@ -165,7 +165,7 @@ inline void CopyVector(const Vector& v, Vector& w)
 #ifndef HPCG_NO_OPENMP
 #pragma omp parallel for
 #endif
-    for (int i = 0; i < len; ++i)
+    for (local_int_t i = 0; i < len; ++i)
         wv[i] = vv[i];
 #ifdef USE_CUDA
     if (v.rt == GPU && w.rt == GPU)
@@ -205,7 +205,7 @@ inline void CopyAndReorderVector(const Vector& v, Vector& w, local_int_t* perm)
     assert(w.localLength >= localLength);
     double* vv = v.values;
     double* wv = w.values;
-    int i;
+    local_int_t i;
 #ifndef HPCG_NO_OPENMP
 #pragma omp parallel for
 #endif

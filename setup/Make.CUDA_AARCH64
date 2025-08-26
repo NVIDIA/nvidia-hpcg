@@ -138,7 +138,8 @@ endif
 # -DHPCG_DETAILED_DEBUG     Define to enable very detailed debugging output
 # -DUSE_CUDA                Define to enable GPU execution
 # -DUSE_GRACE               Define to enable Grace CPU execution
-# -DUSE_NCCL                Define to enabele NCCL P2P communication. Use --p2p=4 for NCCL
+# -DUSE_NCCL                Define to enable NCCL P2P communication. Use --p2p=4 for NCCL
+# -DUSE_INT64               Define to enable INT64 indexing
 
 # By default HPCG will:
 #    *) Build with MPI enabled.
@@ -160,6 +161,10 @@ endif
 
 ifeq ($(HPCG_ENG_VERSION), 1)
     HPCG_OPTS += -DHPCG_ENG_VERSION
+endif
+
+ifeq ($(USE_INT64), 1)
+    HPCG_OPTS += -DINDEX_64
 endif
 
 #If not set, the defualt values in src/hpcg.hpp will be used
