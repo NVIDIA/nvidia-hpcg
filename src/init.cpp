@@ -267,7 +267,6 @@ int HPCG_Init(int* argc_p, char*** argv_p, HPCG_Params& params)
     {
         use_output_file = atoi(value);
     }
-
     iparams = (int*) malloc(sizeof(int) * nparams);
 
     // Initialize iparams
@@ -413,6 +412,7 @@ int HPCG_Init(int* argc_p, char*** argv_p, HPCG_Params& params)
     params.numThreads = 1;
 #else
 #pragma omp parallel
+    #pragma omp single
     params.numThreads = omp_get_num_threads();
 #endif
 
