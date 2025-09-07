@@ -143,9 +143,9 @@ cudaError_t cudaFreeCompressible(void* ptr, size_t size)
     This functions estimates the neede memory for SELL L and U matrices
     Helps reduce memory footprint
 */
-local_int_t EstimateLUmem(local_int_t n, local_int_t padded_n, local_int_t level) {
+local_int_t EstimateLUmem(local_int_t n, local_int_t padded_n, local_int_t level, int slice_size) {
     bool power_two = (n & (n - 1)) == 0;
-    float divisor = n < 8192 ? 1.0 : (power_two? 1.85 : 1.60);
+    float divisor = n <= slice_size * 4 ? 1.0 : (power_two? 1.85 : 1.60);
     local_int_t estimated_size = (padded_n * HPCG_MAX_ROW_LEN * 1.0f) / divisor;
     local_int_t v288x512x512[] = {1057190464, 132276512, 16615072, 2074384};
     local_int_t v296x512x512[] = {1095636608, 136618560, 16967616, 2883872};
@@ -216,7 +216,7 @@ void AllocateMemCuda(SparseMatrix& A_in)
         */
 
         /*Memory Estimation for lower and upper parts*/
-        local_int_t estimated_size = EstimateLUmem(localNumberOfRows, paddedRowLen, level);
+        local_int_t estimated_size = EstimateLUmem(localNumberOfRows, paddedRowLen, level, slice_size);
 
         CHECK_CUDART(cudaMalloc((void**) &(A->gpuAux.columns), sizeof(local_int_t) * estimated_size * 2));
 
@@ -271,7 +271,7 @@ void AllocateMemOptCuda(SparseMatrix& A_in)
         A->sellAPermValues = A->gpuAux.values; // Use the same space as values
 
         /*Memory Estimation for lower and upper parts*/
-        local_int_t estimated_size = EstimateLUmem(localNumberOfRows, paddedRowLen, level);
+        local_int_t estimated_size = EstimateLUmem(localNumberOfRows, paddedRowLen, level, slice_size);
 
         // Reuse columns arrays, not used after we create SELL
         A->sellLPermColumns = A->gpuAux.columns;
@@ -441,7 +441,7 @@ void DeleteMatrixGpu(SparseMatrix& A)
         }
         else
         {
-            local_int_t estimated_size = EstimateLUmem(AA->localNumberOfRows, paddedRowLen, level);
+            local_int_t estimated_size = EstimateLUmem(AA->localNumberOfRows, paddedRowLen, level, slice_size);
             if (Use_Hpcg_Mem_Reduction)
             {
                 CHECK_CUDART(cudaFreeCompressible(AA->sellLPermValues, sizeof(double) * estimated_size));
@@ -2035,7 +2035,7 @@ void CreateSellLUColumnsValuesCuda(const local_int_t n, const int slice_size, lo
     local_int_t paddedRowLen = num_blocks * slice_size;
 
     /*Memory Estimation for lower and upper parts*/
-    local_int_t estimated_size = EstimateLUmem(n, paddedRowLen, level);
+    local_int_t estimated_size = EstimateLUmem(n, paddedRowLen, level, slice_size);
 
     const int BlockSize = 128;
     const int ELEMENTS_PER_THREAD = 8;

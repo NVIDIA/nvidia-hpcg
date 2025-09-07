@@ -151,7 +151,7 @@ int main(int argc, char* argv[])
 
     if (rank == 0)
     {
-        printf("Build v0.5.9 \n");
+        printf("Build v0.6.0 \n");
 
 #ifdef HPCG_ENG_VERSION
         printf("\n%s%s\n", "========================================", "========================================");
