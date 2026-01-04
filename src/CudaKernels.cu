@@ -145,7 +145,8 @@ cudaError_t cudaFreeCompressible(void* ptr, size_t size)
 */
 local_int_t EstimateLUmem(local_int_t n, local_int_t padded_n, local_int_t level, int slice_size) {
     bool power_two = (n & (n - 1)) == 0;
-    float divisor = n <= slice_size * 4 ? 1.0 : (power_two? 1.85 : 1.60);
+    // Avoid underestimation on small grids: when only a few slices, allocate full padded_n * row_len
+    float divisor = n <= slice_size * 8 ? 1.0f : (power_two ? 1.85f : 1.60f);
     local_int_t estimated_size = (padded_n * HPCG_MAX_ROW_LEN * 1.0f) / divisor;
     local_int_t v288x512x512[] = {1057190464, 132276512, 16615072, 2074384};
     local_int_t v296x512x512[] = {1095636608, 136618560, 16967616, 2883872};
