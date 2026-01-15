@@ -580,18 +580,23 @@ int main(int argc, char* argv[])
         size_t free_bytes, total_bytes;
         CHECK_CUDART(cudaMemGetInfo(&free_bytes, &total_bytes));
 
+        //Find the number of SMS
+        int numSMS = props.multiProcessorCount;
+
         if (rank == 0)
             printf(
                 "GPU Rank Info:\n"
                 " | cuSPARSE version %d.%d\n%s"
                 " | Reference CPU memory = %.2f MB\n"
-                " | GPU Name: '%s' \n | GPU Memory Use: %ld MB / %ld MB\n"
+                " | GPU Name: '%s'\n"
+                " | Number of SMs: %d\n"
+                " | GPU Memory Use: %ld MB / %ld MB\n"
                 " | Process Grid: %dx%dx%d\n"
                 " | Local Domain: %dx%dx%d\n"
                 " | Number of CPU Threads: %d\n"
                 " | Slice Size: %lld\n",
                 cusparseMajor, cusparseMinor, Use_Compression ? " | L2 compression is activated\n" : "",
-                cpuRefMemory / 1024.0 / 1024.0, props.name, (total_bytes - free_bytes) >> 20, total_bytes >> 20,
+                cpuRefMemory / 1024.0 / 1024.0, props.name, numSMS, (total_bytes - free_bytes) >> 20, total_bytes >> 20,
                 A.geom->npx, A.geom->npy, A.geom->npz, (int)A.geom->nx, (int)A.geom->ny, (int)A.geom->nz, params.numThreads, (long long)A.slice_size);
         CHECK_CUDART(cudaDeviceSynchronize());
 #endif
