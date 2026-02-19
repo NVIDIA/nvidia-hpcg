@@ -172,12 +172,20 @@ CUDA_ARCH += --generate-code arch=compute_100,code=sm_100
 endif
 CPU_ARCH ?= native
 
+# STRIP_SYMBOLS=1 : reduce symbols visible to nm/strings (-g0, -fvisibility=hidden, -s, strip --strip-all)
 CXX          = nvcc
 CXXFLAGS     = $(HPCG_DEFS) -O3 -Xcompiler --std=c++17 -Xcompiler -Ofast,-fopenmp,-mcpu=$(CPU_ARCH),-mtune=$(CPU_ARCH),-ftree-vectorize,-funroll-loops $(CUDA_ARCH)
+ifeq ($(STRIP_SYMBOLS), 1)
+    CXXFLAGS     += -Xcompiler=-g0 -Xcompiler=-fvisibility=hidden
+    LINKFLAGS_STRIP = -s
+else
+    LINKFLAGS_STRIP =
+endif
 
 #
 LINKER       = $(CXX)
-LINKFLAGS    = $(CXXFLAGS) $(HPCG_LIBS)
+LINKFLAGS    = $(CXXFLAGS) $(HPCG_LIBS) $(LINKFLAGS_STRIP)
+STRIP        = strip
 #
 ARCHIVER     = ar
 ARFLAGS      = r

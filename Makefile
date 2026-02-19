@@ -43,6 +43,7 @@ HPCG_DEPS = src/CG.o src/CG_ref.o src/TestCG.o src/ComputeResidual.o \
 
 $(bin_name): src/main.o $(HPCG_DEPS)
 	$(LINKER) $(LINKFLAGS) src/main.o $(HPCG_DEPS) -o $(bin_name) $(HPCG_LIBS)
+	@[ "$(STRIP_SYMBOLS)" != "1" ] || $(STRIP) --strip-all $(bin_name)
 
 install:
 	cp build/bin/xhpcg* bin/
