@@ -177,7 +177,7 @@ CXX          = nvcc
 CXXFLAGS     = $(HPCG_DEFS) -O3 -Xcompiler --std=c++17 -Xcompiler -Ofast,-fopenmp,-mcpu=$(CPU_ARCH),-mtune=$(CPU_ARCH),-ftree-vectorize,-funroll-loops $(CUDA_ARCH)
 ifeq ($(STRIP_SYMBOLS), 1)
     CXXFLAGS     += -Xcompiler=-g0 -Xcompiler=-fvisibility=hidden
-    LINKFLAGS_STRIP = -s
+    LINKFLAGS_STRIP = -Xcompiler=-s
 else
     LINKFLAGS_STRIP =
 endif
