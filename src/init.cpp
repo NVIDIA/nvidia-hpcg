@@ -254,7 +254,7 @@ int HPCG_Init(int* argc_p, char*** argv_p, HPCG_Params& params)
     char fname[80];
     int i, j, *iparams;
     char cparams[][9] = {"--nx=", "--ny=", "--nz=", "--rt=", "--npx=", "--npy=", "--npz=", "--b=", "--l2cmp=", "--mr=",
-        "--exm=", "--g2c=", "--ddm=", "--lpm=", "--p2p=", "--of=", "--gss=", "--css="};
+        "--exm=", "--g2c=", "--ddm=", "--lpm=", "--p2p=", "--of=", "--gss=", "--css=", "--wt="};
     time_t rawtime;
     tm* ptm;
     const int nparams = (sizeof cparams) / (sizeof cparams[0]);
@@ -345,6 +345,7 @@ int HPCG_Init(int* argc_p, char*** argv_p, HPCG_Params& params)
     params.nz = iparams[2];
 
     params.runningTime = iparams[3];
+    params.warmupTime = iparams[18];
 
     params.npx = iparams[4];
     params.npy = iparams[5];

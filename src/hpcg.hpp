@@ -115,6 +115,7 @@ struct HPCG_Params_STRUCT
     local_int_t ny;                  //!< Number of processes in y-direction of 3D process grid
     local_int_t nz;                  //!< Number of processes in z-direction of 3D process grid
     int runningTime;                 //!< Number of seconds to run the timed portion of the benchmark
+    int warmupTime;                  //!< Number of seconds to run the warmup portion of the benchmark
     int npx;                         //!< Number of x-direction grid points for each local subdomain
     int npy;                         //!< Number of y-direction grid points for each local subdomain
     int npz;                         //!< Number of z-direction grid points for each local subdomain

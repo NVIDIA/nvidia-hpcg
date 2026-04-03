@@ -60,6 +60,7 @@ usage() {
   echo "    --of    <int> activates generating the log into textfiles instead of stdout (--of 1)"
   echo "    --gss   <int> GPU slice size for sliced-ELLPACK format"
   echo "    --css   <int> CPU slice size for sliced-ELLPACK format"
+  echo "    --wt    <int> specifies the number of seconds for the warmup phase before the timed benchmark"
   echo ""
 }
 
@@ -327,6 +328,15 @@ while [ "$1" != "" ]; do
       fi
       shift
       ;;
+    --wt )
+      if [ -n "$2" ]; then
+        WT="--wt=$2"
+      else
+        usage
+        exit 1
+      fi
+      shift
+      ;;
   * )
     usage
     exit 1
@@ -410,7 +420,7 @@ if [ -n "${MEMBIND}" ] || [ -n "${CPUBIND}" ]; then
   NUMCMD="numactl "
 fi
 
-HPCG_CONTROL="${B} ${L2CMP} ${OF}"
+HPCG_CONTROL="${B} ${L2CMP} ${OF} ${WT}"
 
 if [[ -z "${NX}" || -z "${NY}" || -z "${NZ}" || -z "${RT}" ]]; then
     if [ -z "${DAT}" ]; then

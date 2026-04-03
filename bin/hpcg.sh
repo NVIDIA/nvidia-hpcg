@@ -52,6 +52,7 @@ usage() {
   echo "    --l2cmp        <int>          activates compression in GPU L2 cache when set to one (--l2cmp 1)"
   echo "    --of           <int>          activates generating the log into textfiles, instead of stdout (--of 1)"
   echo "    --gss          <int>          GPU slice size for sliced-ELLPACK format"
+  echo "    --wt           <int>          specifies the number of seconds for the warmup phase before the timed benchmark"
   echo ""
 }
 
@@ -295,6 +296,15 @@ while [ "$1" != "" ]; do
       fi
       shift
       ;;
+     --wt )
+      if [ -n "$2" ]; then
+        WT="--wt=$2"
+      else
+        usage
+        exit 1
+      fi
+      shift
+      ;;
   * )
     usage
     exit 1
@@ -370,7 +380,7 @@ fi
 # fi
 # export CUDA_VISIBLE_DEVICES=${GPU}
 
-HPCG_CONTROL="${B} ${L2CMP} ${P2P} ${OF} ${NPX} ${NPY} ${NPZ}"
+HPCG_CONTROL="${B} ${L2CMP} ${P2P} ${OF} ${NPX} ${NPY} ${NPZ} ${WT}"
 
 if [[ -z "${NX}" || -z "${NY}" || -z "${NZ}" || -z "${RT}" ]]; then
     if [ -z "${DAT}" ]; then
