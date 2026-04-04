@@ -38,6 +38,8 @@
 #ifndef HPCG_NO_MPI
 #include "mytimer.hpp"
 #include <mpi.h>
+#include "Geometry.hpp"
+extern p2p_comm_mode_t P2P_Mode;
 #endif
 #include "ComputeDotProduct.hpp"
 #include "ComputeDotProduct_ref.hpp"
@@ -53,6 +55,11 @@
             exit(1);                                                                                                   \
         }                                                                                                              \
     } while (0)
+#ifdef USE_NCCL
+extern ncclComm_t Nccl_Comm;
+extern double* d_dot_nccl_allreduce_local;
+extern double* d_dot_nccl_allreduce_global;
+#endif
 #endif
 
 #ifdef USE_GRACE
@@ -81,12 +88,22 @@
 int ComputeDotProduct(const local_int_t n, const Vector& x, const Vector& y, double& result, double& time_allreduce,
     bool& isOptimized, rank_type_t rt)
 {
-
     double local_result = 0.0;
+
+    // Step 1: Local dot product
     if (rt == GPU)
     {
 #ifdef USE_CUDA
-        cublasStatus_t t = cublasDdot(cublashandle, n, x.values_d, 1, y.values_d, 1, &local_result);
+#ifdef USE_NCCL
+        if (P2P_Mode == NCCL)
+        {
+            cublasDdot(cublashandle, n, x.values_d, 1, y.values_d, 1, d_dot_nccl_allreduce_local);
+        }
+        else
+#endif
+        {
+            cublasDdot(cublashandle, n, x.values_d, 1, y.values_d, 1, &local_result);
+        }
 #endif
     }
     else
@@ -97,16 +114,25 @@ int ComputeDotProduct(const local_int_t n, const Vector& x, const Vector& y, dou
 #endif
     }
 
+    // Step 2: Allreduce
 #ifndef HPCG_NO_MPI
-    // Use MPI's reduce function to collect all partial sums
     double t0 = mytimer();
-    double global_result = 0.0;
-    MPI_Allreduce(&local_result, &global_result, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
-    result = global_result;
-    t0 = mytimer() - t0;
-    time_allreduce += t0;
+#ifdef USE_NCCL
+    if (rt == GPU && P2P_Mode == NCCL)
+    {
+        ncclAllReduce(d_dot_nccl_allreduce_local, d_dot_nccl_allreduce_global, 1, ncclDouble, ncclSum, Nccl_Comm, stream);
+        CHECK_CUDART(cudaMemcpyAsync(&result, d_dot_nccl_allreduce_global, sizeof(double), cudaMemcpyDeviceToHost, stream));
+        CHECK_CUDART(cudaStreamSynchronize(stream));
+    }
+    else
+#endif
+    {
+        double global_result = 0.0;
+        MPI_Allreduce(&local_result, &global_result, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+        result = global_result;
+    }
+    time_allreduce += mytimer() - t0;
 #else
-    time_allreduce += 0.0;
     result = local_result;
 #endif
 

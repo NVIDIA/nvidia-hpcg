@@ -96,6 +96,10 @@ cudaStream_t stream;
 cudaEvent_t copy_done;
 cudaStream_t copy_stream;
 int* ranktoId;
+#ifdef USE_NCCL
+double* d_dot_nccl_allreduce_local;
+double* d_dot_nccl_allreduce_global;
+#endif
 #endif
 
 #ifdef USE_GRACE
@@ -373,8 +377,17 @@ int main(int argc, char* argv[])
         cusparseSetStream(cusparsehandle, stream);
         cublasSetStream(cublashandle, stream);
         cusparseSetPointerMode(cusparsehandle, CUSPARSE_POINTER_MODE_HOST);
-        cublasSetPointerMode(cublashandle, CUBLAS_POINTER_MODE_HOST);
         cudaEventCreate(&copy_done);
+#ifdef USE_NCCL
+        if (params.p2_mode == NCCL)
+            cublasSetPointerMode(cublashandle, CUBLAS_POINTER_MODE_DEVICE);
+        else
+#endif
+            cublasSetPointerMode(cublashandle, CUBLAS_POINTER_MODE_HOST);
+#ifdef USE_NCCL
+        CHECK_CUDART(cudaMalloc(&d_dot_nccl_allreduce_local, sizeof(double)));
+        CHECK_CUDART(cudaMalloc(&d_dot_nccl_allreduce_global, sizeof(double)));
+#endif
 
         // Allocate GPU related data
         AllocateMemCuda(A);
@@ -906,6 +919,10 @@ int main(int argc, char* argv[])
         cudaStreamDestroy(stream);
         cudaStreamDestroy(copy_stream);
         cudaEventDestroy(copy_done);
+#ifdef USE_NCCL
+        cudaFree(d_dot_nccl_allreduce_local);
+        cudaFree(d_dot_nccl_allreduce_global);
+#endif
 #endif
     }
 
