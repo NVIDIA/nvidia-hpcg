@@ -688,6 +688,10 @@ int main(int argc, char* argv[])
     {
         double warmup_runtime = params.warmupTime;
         double rough_time_per_set = bleh_times[0];
+#ifndef HPCG_NO_MPI
+        double local_rough_time = rough_time_per_set;
+        MPI_Allreduce(&local_rough_time, &rough_time_per_set, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+#endif
         int numberOfWarmupCgSets = (rough_time_per_set > 0.0) ? int(warmup_runtime / rough_time_per_set) + 1 : 1;
         if (rank == 0)
             printf("\n========== Warmup Phase2 ==========\n"
