@@ -678,6 +678,49 @@ int main(int argc, char* argv[])
     std::vector<double> bleh_times(9, 0.0);
     ZeroVector(x); // start x at all zeros
     ierr = CG(A, data, b, x, optMaxIters, refTolerance, niters, normr, normr0, &bleh_times[0], true, 1);
+    int warmupNiters = niters;
+
+    /////////////////////
+    // Warmup CG Phase //
+    /////////////////////
+
+    if (params.warmupTime > 0)
+    {
+        double warmup_runtime = params.warmupTime;
+        double rough_time_per_set = bleh_times[0];
+        int numberOfWarmupCgSets = (rough_time_per_set > 0.0) ? int(warmup_runtime / rough_time_per_set) + 1 : 1;
+        if (rank == 0)
+            printf("\n========== Warmup Phase2 ==========\n"
+                   " | Target time:  %.0fs\n",
+                   warmup_runtime);
+
+        std::vector<double> warmup_times(10, 0.0);
+        double warmup_start = mytimer();
+        for (int i = 0; i < numberOfWarmupCgSets; ++i)
+        {
+            ZeroVector(x);
+            ierr = CG(A, data, b, x, warmupNiters, 0.0, niters, normr, normr0, &warmup_times[0], true, 0);
+            if (ierr)
+                if (use_output_file)
+                {
+                    HPCG_fout << "Error in call to CG (warmup): " << ierr << ".\n" << endl;
+                }
+                else
+                {
+                    std::cout << "Error in call to CG (warmup): " << ierr << ".\n" << endl;
+                }
+        }
+        double warmup_elapsed = mytimer() - warmup_start;
+
+        if (rank == 0)
+            printf(" | Elapsed time: %.2fs\n"
+                   "========== Warmup Complete =======\n\n", warmup_elapsed);
+    }
+
+    //////////////////////////////////////
+    // Optimized CG Calibration Phase   //
+    //////////////////////////////////////
+
     std::vector<double> opt_times(9, 0.0);
     numberOfCalls = 1;
 
@@ -731,42 +774,6 @@ int main(int argc, char* argv[])
             {
                 std::cout << "Failed to reduce the residual " << tolerance_failures << " times." << endl;
             }
-    }
-
-    /////////////////////
-    // Warmup CG Phase //
-    /////////////////////
-
-    if (params.warmupTime > 0)
-    {
-        double warmup_runtime = params.warmupTime;
-        int numberOfWarmupCgSets = int(warmup_runtime / opt_worst_time) + 1;
-        if (rank == 0)
-            printf("\n========== Warmup Phase ==========\n"
-                   " | Target time:  %.0fs\n",
-                   warmup_runtime);
-
-        std::vector<double> warmup_times(10, 0.0);
-        double warmup_start = mytimer();
-        for (int i = 0; i < numberOfWarmupCgSets; ++i)
-        {
-            ZeroVector(x);
-            ierr = CG(A, data, b, x, optNiters, 0.0, niters, normr, normr0, &warmup_times[0], true, 0);
-            if (ierr)
-                if (use_output_file)
-                {
-                    HPCG_fout << "Error in call to CG (warmup): " << ierr << ".\n" << endl;
-                }
-                else
-                {
-                    std::cout << "Error in call to CG (warmup): " << ierr << ".\n" << endl;
-                }
-        }
-        double warmup_elapsed = mytimer() - warmup_start;
-
-        if (rank == 0)
-            printf(" | Elapsed time: %.2fs\n"
-                   "========== Warmup Complete =======\n\n", warmup_elapsed);
     }
 
     ///////////////////////////////
