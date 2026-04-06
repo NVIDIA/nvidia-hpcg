@@ -694,7 +694,7 @@ int main(int argc, char* argv[])
 #endif
         int numberOfWarmupCgSets = (rough_time_per_set > 0.0) ? int(warmup_runtime / rough_time_per_set) + 1 : 1;
         if (rank == 0)
-            printf("\n========== Warmup Phase2 ==========\n"
+            printf("\n========== Warmup Phase ==========\n"
                    " | Target time:  %.0fs\n",
                    warmup_runtime);
 
