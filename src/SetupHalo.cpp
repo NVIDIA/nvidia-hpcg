@@ -153,7 +153,6 @@ void SetupHalo_Gpu(SparseMatrix& A)
         // P2P=NCCL is rejected in main unless --exm=0 (GPUONLY); Nccl_Comm is never created otherwise.
         if (P2P_Mode == NCCL)
         {
-            printf("NCCL is used\n");
 #ifndef INDEX_64
             const ncclDataType_t ncclIdx = ncclInt32;
 #else
