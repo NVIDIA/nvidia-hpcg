@@ -124,10 +124,13 @@ void SetupHalo_Gpu(SparseMatrix& A)
         &elementsToSendGpu);
 
     // Host copy is only needed for MPI index exchange; GPU runtime uses gpuAux.elementsToSend.
-    local_int_t* elementsToSend = nullptr;
+    local_int_t* elementsToSend = new local_int_t[totalToBeSent];
     double* sendBuffer = nullptr;
     if (totalToBeSent > 0)
     {
+        cudaMemcpyAsync(
+            elementsToSend, elementsToSendGpu, sizeof(local_int_t) * totalToBeSent, cudaMemcpyDeviceToHost, stream);
+
         local_int_t* sendcounts = (local_int_t*) malloc(sizeof(local_int_t) * (A.geom->size + 1));
         memset(sendcounts, 0, sizeof(local_int_t) * (A.geom->size + 1));
 
@@ -177,7 +180,6 @@ void SetupHalo_Gpu(SparseMatrix& A)
         else
 #endif
         {
-            elementsToSend = new local_int_t[totalToBeSent];
             local_int_t* eltsToRecv = new local_int_t[totalToBeSent];
 
             // Exchange elements to send with neighbors
@@ -189,10 +191,6 @@ void SetupHalo_Gpu(SparseMatrix& A)
             MPI_Status status;
             int MPI_MY_TAG = 93;
             MPI_Request* request = new MPI_Request[neiCount];
-
-            CHECK_CUDART(cudaMemcpyAsync(elementsToSend, elementsToSendGpu,
-                sizeof(local_int_t) * totalToBeSent, cudaMemcpyDeviceToHost, stream));
-            CHECK_CUDART(cudaStreamSynchronize(stream));
 
             local_int_t* recv_ptr = eltsToRecv;
             for (int i = 0; i < neiCount; i++)
