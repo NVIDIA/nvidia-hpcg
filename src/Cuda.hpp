@@ -79,6 +79,18 @@ extern bool Use_Hpcg_Mem_Reduction; /*USE HPCG aggresive memory reduction*/
         }                                                                                                              \
     } while (0)
 
+#define CHECK_CUSPARSE(x)                                                                                              \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        cusparseStatus_t cusparseStatus = (x);                                                                         \
+        if (cusparseStatus != CUSPARSE_STATUS_SUCCESS)                                                                 \
+        {                                                                                                              \
+            fprintf(stderr, "CUSPARSE: %s = %d (%s) at (%s:%d)\n", #x, (int)cusparseStatus,                             \
+                cusparseGetErrorString(cusparseStatus), __FILE__, __LINE__);                                           \
+            exit(1);                                                                                                   \
+        }                                                                                                              \
+    } while (0)
+
 // IF NVTX is needed for profiling, please define USE_NVTX
 // Then, add PUSH_RANGE and POP_RANGE around the target code block
 // See, https://developer.nvidia.com/blog/cuda-pro-tip-generate-custom-application-profile-timelines-nvtx/

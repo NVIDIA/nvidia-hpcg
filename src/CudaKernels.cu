@@ -458,13 +458,13 @@ void DeleteMatrixGpu(SparseMatrix& A)
         CHECK_CUDART(cudaFree(AA->sellASliceMrl));
 
         if (AA->cusparseOpt.vecX)
-            cusparseDestroyDnVec(AA->cusparseOpt.vecX);
+            CHECK_CUSPARSE(cusparseDestroyDnVec(AA->cusparseOpt.vecX));
         if (AA->cusparseOpt.vecY)
-            cusparseDestroyDnVec(AA->cusparseOpt.vecY);
+            CHECK_CUSPARSE(cusparseDestroyDnVec(AA->cusparseOpt.vecY));
 
-        cusparseDestroySpMat(AA->cusparseOpt.matA);
-        cusparseDestroySpMat(AA->cusparseOpt.matL);
-        cusparseDestroySpMat(AA->cusparseOpt.matU);
+        CHECK_CUSPARSE(cusparseDestroySpMat(AA->cusparseOpt.matA));
+        CHECK_CUSPARSE(cusparseDestroySpMat(AA->cusparseOpt.matL));
+        CHECK_CUSPARSE(cusparseDestroySpMat(AA->cusparseOpt.matU));
 
         CHECK_CUDART(cudaFree(AA->csrExtOffsets));
         CHECK_CUDART(cudaFree(AA->csrExtColumns));

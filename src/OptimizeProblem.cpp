@@ -130,37 +130,37 @@ size_t OptimizeProblemGpu(SparseMatrix& A_in, CGData& data, Vector& b, Vector& x
 #ifdef INDEX_64 // In src/Geometry
         INDEX_TYPE = CUSPARSE_INDEX_64I;
 #endif
-        cusparseCreateSlicedEll(&(A->cusparseOpt.matL), nrow, nrow, half_nnz, sell_l_nnz, slice_size,
+        CHECK_CUSPARSE(cusparseCreateSlicedEll(&(A->cusparseOpt.matL), nrow, nrow, half_nnz, sell_l_nnz, slice_size,
             A->sellLSliceMrl, A->sellLPermColumns, A->sellLPermValues, INDEX_TYPE, INDEX_TYPE, CUSPARSE_INDEX_BASE_ZERO,
-            CUDA_R_64F);
+            CUDA_R_64F));
 
-        cusparseCreateSlicedEll(&(A->cusparseOpt.matU), nrow, nrow, half_nnz, sell_u_nnz, slice_size,
+        CHECK_CUSPARSE(cusparseCreateSlicedEll(&(A->cusparseOpt.matU), nrow, nrow, half_nnz, sell_u_nnz, slice_size,
             A->sellUSliceMrl, A->sellUPermColumns, A->sellUPermValues, INDEX_TYPE, INDEX_TYPE, CUSPARSE_INDEX_BASE_ZERO,
-            CUDA_R_64F);
+            CUDA_R_64F));
 
         local_int_t sell_nnz = sell_slices * slice_size * HPCG_MAX_ROW_LEN;
-        cusparseCreateSlicedEll(&(A->cusparseOpt.matA), nrow, nrow, A->localNumberOfNonzeros, sell_nnz, slice_size,
-            A->sellASliceMrl, A->sellAPermColumns, A->sellAPermValues, INDEX_TYPE, INDEX_TYPE, CUSPARSE_INDEX_BASE_ZERO,
-            CUDA_R_64F);
+        CHECK_CUSPARSE(cusparseCreateSlicedEll(&(A->cusparseOpt.matA), nrow, nrow, A->localNumberOfNonzeros, sell_nnz,
+            slice_size, A->sellASliceMrl, A->sellAPermColumns, A->sellAPermValues, INDEX_TYPE, INDEX_TYPE,
+            CUSPARSE_INDEX_BASE_ZERO, CUDA_R_64F));
 
         double alpha = 1.0, beta = 0.0;
         size_t e_buf_size = 0;
         size_t l_buf_size = 0, u_buf_size = 0, i_buf_size = 0, max_buf_size = 0;
         cusparseDnVecDescr_t dummy1, dummy2;
-        cusparseCreateDnVec(&dummy1, nrow, x.values_d, CUDA_R_64F);
-        cusparseCreateDnVec(&dummy2, nrow, b.values_d, CUDA_R_64F);
-        cusparseCreateDnVec(&(A->cusparseOpt.vecX), nrow, x.values_d, CUDA_R_64F);
-        cusparseCreateDnVec(&(A->cusparseOpt.vecY), nrow, b.values_d, CUDA_R_64F);
+        CHECK_CUSPARSE(cusparseCreateDnVec(&dummy1, nrow, x.values_d, CUDA_R_64F));
+        CHECK_CUSPARSE(cusparseCreateDnVec(&dummy2, nrow, b.values_d, CUDA_R_64F));
+        CHECK_CUSPARSE(cusparseCreateDnVec(&(A->cusparseOpt.vecX), nrow, x.values_d, CUDA_R_64F));
+        CHECK_CUSPARSE(cusparseCreateDnVec(&(A->cusparseOpt.vecY), nrow, b.values_d, CUDA_R_64F));
         max_buf_size = e_buf_size;
 
         // MV
         // Lower
-        cusparseSpMV_bufferSize(cusparsehandle, CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha, A->cusparseOpt.matL, dummy1,
-            &beta, dummy2, CUDA_R_64F, CUSPARSE_SPMV_ALG_DEFAULT, &l_buf_size);
-        cusparseSpMV_bufferSize(cusparsehandle, CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha, A->cusparseOpt.matU, dummy1,
-            &beta, dummy2, CUDA_R_64F, CUSPARSE_SPMV_ALG_DEFAULT, &u_buf_size);
-        cusparseSpMV_bufferSize(cusparsehandle, CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha, A->cusparseOpt.matA, dummy1,
-            &beta, dummy2, CUDA_R_64F, CUSPARSE_SPMV_ALG_DEFAULT, &i_buf_size);
+        CHECK_CUSPARSE(cusparseSpMV_bufferSize(cusparsehandle, CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha,
+            A->cusparseOpt.matL, dummy1, &beta, dummy2, CUDA_R_64F, CUSPARSE_SPMV_ALG_DEFAULT, &l_buf_size));
+        CHECK_CUSPARSE(cusparseSpMV_bufferSize(cusparsehandle, CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha,
+            A->cusparseOpt.matU, dummy1, &beta, dummy2, CUDA_R_64F, CUSPARSE_SPMV_ALG_DEFAULT, &u_buf_size));
+        CHECK_CUSPARSE(cusparseSpMV_bufferSize(cusparsehandle, CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha,
+            A->cusparseOpt.matA, dummy1, &beta, dummy2, CUDA_R_64F, CUSPARSE_SPMV_ALG_DEFAULT, &i_buf_size));
 
         max_buf_size = std::max(std::max(i_buf_size, e_buf_size), std::max(u_buf_size, l_buf_size));
 
@@ -171,44 +171,47 @@ size_t OptimizeProblemGpu(SparseMatrix& A_in, CGData& data, Vector& b, Vector& x
         cusparseFillMode_t fillmode_u = CUSPARSE_FILL_MODE_UPPER;
         cusparseDiagType_t diagtype = CUSPARSE_DIAG_TYPE_NON_UNIT;
 
-        cusparseSpSV_createDescr(&A->cusparseOpt.spsvDescrL);
-        cusparseSpSV_createDescr(&A->cusparseOpt.spsvDescrU);
-        cusparseSpMatSetAttribute(A->cusparseOpt.matL, CUSPARSE_SPMAT_DIAG_TYPE, &(diagtype), sizeof(diagtype));
-        cusparseSpMatSetAttribute(A->cusparseOpt.matL, CUSPARSE_SPMAT_FILL_MODE, &(fillmode_l), sizeof(fillmode_l));
+        CHECK_CUSPARSE(cusparseSpSV_createDescr(&A->cusparseOpt.spsvDescrL));
+        CHECK_CUSPARSE(cusparseSpSV_createDescr(&A->cusparseOpt.spsvDescrU));
+        CHECK_CUSPARSE(
+            cusparseSpMatSetAttribute(A->cusparseOpt.matL, CUSPARSE_SPMAT_DIAG_TYPE, &(diagtype), sizeof(diagtype)));
+        CHECK_CUSPARSE(cusparseSpMatSetAttribute(
+            A->cusparseOpt.matL, CUSPARSE_SPMAT_FILL_MODE, &(fillmode_l), sizeof(fillmode_l)));
 
         if (!Use_Hpcg_Mem_Reduction || (nrow % 8 != 0))
         {
-            cusparseSpSV_bufferSize(cusparsehandle, CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha, A->cusparseOpt.matL,
-                A->cusparseOpt.vecX, A->cusparseOpt.vecY, CUDA_R_64F, CUSPARSE_SPSV_ALG_DEFAULT,
-                A->cusparseOpt.spsvDescrL, &buffer_size_sv_l);
+            CHECK_CUSPARSE(cusparseSpSV_bufferSize(cusparsehandle, CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha,
+                A->cusparseOpt.matL, A->cusparseOpt.vecX, A->cusparseOpt.vecY, CUDA_R_64F, CUSPARSE_SPSV_ALG_DEFAULT,
+                A->cusparseOpt.spsvDescrL, &buffer_size_sv_l));
             CHECK_CUDART(cudaMalloc(&A->bufferSvL, buffer_size_sv_l));
         }
-        cusparseSpSV_analysis(cusparsehandle, CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha, A->cusparseOpt.matL,
-            A->cusparseOpt.vecX, A->cusparseOpt.vecY, CUDA_R_64F, CUSPARSE_SPSV_ALG_DEFAULT, A->cusparseOpt.spsvDescrL,
-            A->bufferSvL);
-        cusparseSpSV_updateMatrix(
-            cusparsehandle, A->cusparseOpt.spsvDescrL, A->diagonal, CUSPARSE_SPSV_UPDATE_DIAGONAL);
+        CHECK_CUSPARSE(cusparseSpSV_analysis(cusparsehandle, CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha,
+            A->cusparseOpt.matL, A->cusparseOpt.vecX, A->cusparseOpt.vecY, CUDA_R_64F, CUSPARSE_SPSV_ALG_DEFAULT,
+            A->cusparseOpt.spsvDescrL, A->bufferSvL));
+        CHECK_CUSPARSE(cusparseSpSV_updateMatrix(
+            cusparsehandle, A->cusparseOpt.spsvDescrL, A->diagonal, CUSPARSE_SPSV_UPDATE_DIAGONAL));
 
-        cusparseSpMatSetAttribute(A->cusparseOpt.matU, CUSPARSE_SPMAT_FILL_MODE, &(fillmode_u), sizeof(fillmode_u));
+        CHECK_CUSPARSE(
+            cusparseSpMatSetAttribute(A->cusparseOpt.matU, CUSPARSE_SPMAT_FILL_MODE, &(fillmode_u), sizeof(fillmode_u)));
 
         if (!Use_Hpcg_Mem_Reduction || (nrow % 8 != 0))
         {
-            cusparseSpSV_bufferSize(cusparsehandle, CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha, A->cusparseOpt.matU,
-                A->cusparseOpt.vecX, A->cusparseOpt.vecY, CUDA_R_64F, CUSPARSE_SPSV_ALG_DEFAULT,
-                A->cusparseOpt.spsvDescrU, &buffer_size_sv_u);
+            CHECK_CUSPARSE(cusparseSpSV_bufferSize(cusparsehandle, CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha,
+                A->cusparseOpt.matU, A->cusparseOpt.vecX, A->cusparseOpt.vecY, CUDA_R_64F, CUSPARSE_SPSV_ALG_DEFAULT,
+                A->cusparseOpt.spsvDescrU, &buffer_size_sv_u));
             CHECK_CUDART(cudaMalloc(&A->bufferSvU, buffer_size_sv_u));
         }
-        cusparseSpSV_analysis(cusparsehandle, CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha, A->cusparseOpt.matU,
-            A->cusparseOpt.vecX, A->cusparseOpt.vecY, CUDA_R_64F, CUSPARSE_SPSV_ALG_DEFAULT, A->cusparseOpt.spsvDescrU,
-            A->bufferSvU);
-        cusparseSpSV_updateMatrix(
-            cusparsehandle, A->cusparseOpt.spsvDescrU, A->diagonal, CUSPARSE_SPSV_UPDATE_DIAGONAL);
+        CHECK_CUSPARSE(cusparseSpSV_analysis(cusparsehandle, CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha,
+            A->cusparseOpt.matU, A->cusparseOpt.vecX, A->cusparseOpt.vecY, CUDA_R_64F, CUSPARSE_SPSV_ALG_DEFAULT,
+            A->cusparseOpt.spsvDescrU, A->bufferSvU));
+        CHECK_CUSPARSE(cusparseSpSV_updateMatrix(
+            cusparsehandle, A->cusparseOpt.spsvDescrU, A->diagonal, CUSPARSE_SPSV_UPDATE_DIAGONAL));
 
         if (max_buf_size > 0)
             CHECK_CUDART(cudaMalloc(&(A->bufferMvA), max_buf_size));
 
-        cusparseDestroyDnVec(dummy1);
-        cusparseDestroyDnVec(dummy2);
+        CHECK_CUSPARSE(cusparseDestroyDnVec(dummy1));
+        CHECK_CUSPARSE(cusparseDestroyDnVec(dummy2));
         // //////////////////////////////////////////////////////////////////////////
         A = A->Ac;
     }

@@ -94,21 +94,23 @@ int ComputeSYMGS_Gpu(const SparseMatrix& A, const Vector& r, Vector& x, bool ste
     if (step == 1)
     {
         // TRSV(D+L, r, t)
-        cusparseDnVecSetValues(A.cusparseOpt.vecX, r.values_d);
-        cusparseDnVecSetValues(A.cusparseOpt.vecY, tmp_d);
-        cusparseSpMatSetAttribute(A.cusparseOpt.matA, CUSPARSE_SPMAT_FILL_MODE, &(fillmode_l), sizeof(fillmode_l));
-        cusparseSpSV_solve(cusparsehandle, CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha, A.cusparseOpt.matA,
-            A.cusparseOpt.vecX, A.cusparseOpt.vecY, CUDA_R_64F, CUSPARSE_SPSV_ALG_DEFAULT, A.cusparseOpt.spsvDescrL);
+        CHECK_CUSPARSE(cusparseDnVecSetValues(A.cusparseOpt.vecX, r.values_d));
+        CHECK_CUSPARSE(cusparseDnVecSetValues(A.cusparseOpt.vecY, tmp_d));
+        CHECK_CUSPARSE(cusparseSpMatSetAttribute(
+            A.cusparseOpt.matA, CUSPARSE_SPMAT_FILL_MODE, &(fillmode_l), sizeof(fillmode_l)));
+        CHECK_CUSPARSE(cusparseSpSV_solve(cusparsehandle, CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha, A.cusparseOpt.matA,
+            A.cusparseOpt.vecX, A.cusparseOpt.vecY, CUDA_R_64F, CUSPARSE_SPSV_ALG_DEFAULT, A.cusparseOpt.spsvDescrL));
 
         // SPMV(D, t, t)
         SpmvDiagCuda(nrow, tmp_d, A.diagonal);
 
         // TRSV(D+U, t, x)
-        cusparseDnVecSetValues(A.cusparseOpt.vecX, tmp_d);
-        cusparseDnVecSetValues(A.cusparseOpt.vecY, x.values_d);
-        cusparseSpMatSetAttribute(A.cusparseOpt.matA, CUSPARSE_SPMAT_FILL_MODE, &(fillmode_u), sizeof(fillmode_u));
-        cusparseSpSV_solve(cusparsehandle, CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha, A.cusparseOpt.matA,
-            A.cusparseOpt.vecX, A.cusparseOpt.vecY, CUDA_R_64F, CUSPARSE_SPSV_ALG_DEFAULT, A.cusparseOpt.spsvDescrU);
+        CHECK_CUSPARSE(cusparseDnVecSetValues(A.cusparseOpt.vecX, tmp_d));
+        CHECK_CUSPARSE(cusparseDnVecSetValues(A.cusparseOpt.vecY, x.values_d));
+        CHECK_CUSPARSE(cusparseSpMatSetAttribute(
+            A.cusparseOpt.matA, CUSPARSE_SPMAT_FILL_MODE, &(fillmode_u), sizeof(fillmode_u)));
+        CHECK_CUSPARSE(cusparseSpSV_solve(cusparsehandle, CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha, A.cusparseOpt.matA,
+            A.cusparseOpt.vecX, A.cusparseOpt.vecY, CUDA_R_64F, CUSPARSE_SPSV_ALG_DEFAULT, A.cusparseOpt.spsvDescrU));
 
         if (A.mgData != 0)
         {
@@ -119,10 +121,10 @@ int ComputeSYMGS_Gpu(const SparseMatrix& A, const Vector& r, Vector& x, bool ste
 
             // SPMV(L, x, t): t = t + L * x
             double alpha = 1.0;
-            cusparseDnVecSetValues(A.cusparseOpt.vecX, x.values_d);
-            cusparseDnVecSetValues(A.cusparseOpt.vecY, (*A.mgData->Axf).values_d);
-            cusparseSpMV(cusparsehandle, CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha, A.cusparseOpt.matL,
-                A.cusparseOpt.vecX, &alpha, A.cusparseOpt.vecY, CUDA_R_64F, CUSPARSE_SPMV_ALG_DEFAULT, A.bufferMvA);
+            CHECK_CUSPARSE(cusparseDnVecSetValues(A.cusparseOpt.vecX, x.values_d));
+            CHECK_CUSPARSE(cusparseDnVecSetValues(A.cusparseOpt.vecY, (*A.mgData->Axf).values_d));
+            CHECK_CUSPARSE(cusparseSpMV(cusparsehandle, CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha, A.cusparseOpt.matL,
+                A.cusparseOpt.vecX, &alpha, A.cusparseOpt.vecY, CUDA_R_64F, CUSPARSE_SPMV_ALG_DEFAULT, A.bufferMvA));
 
 #ifndef HPCG_NO_MPI
             if (A.totalToBeSent > 0)
@@ -143,10 +145,10 @@ int ComputeSYMGS_Gpu(const SparseMatrix& A, const Vector& r, Vector& x, bool ste
 
         // SPMV(U, x, t): t = U * x
         double alpha = 1.0, beta = 0.0;
-        cusparseDnVecSetValues(A.cusparseOpt.vecX, x.values_d);
-        cusparseDnVecSetValues(A.cusparseOpt.vecY, (*A.mgData->Axf).values_d);
-        cusparseSpMV(cusparsehandle, CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha, A.cusparseOpt.matU, A.cusparseOpt.vecX,
-            &beta, A.cusparseOpt.vecY, CUDA_R_64F, CUSPARSE_SPMV_ALG_DEFAULT, A.bufferMvA);
+        CHECK_CUSPARSE(cusparseDnVecSetValues(A.cusparseOpt.vecX, x.values_d));
+        CHECK_CUSPARSE(cusparseDnVecSetValues(A.cusparseOpt.vecY, (*A.mgData->Axf).values_d));
+        CHECK_CUSPARSE(cusparseSpMV(cusparsehandle, CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha, A.cusparseOpt.matU,
+            A.cusparseOpt.vecX, &beta, A.cusparseOpt.vecY, CUDA_R_64F, CUSPARSE_SPMV_ALG_DEFAULT, A.bufferMvA));
 
         // tmp = rv - t
         AxpbyCuda(nrow, r.values_d, (*A.mgData->Axf).values_d, tmp_d);
@@ -162,21 +164,23 @@ int ComputeSYMGS_Gpu(const SparseMatrix& A, const Vector& r, Vector& x, bool ste
 #endif
 
         // TRSV(D+L, r-t, x)
-        cusparseDnVecSetValues(A.cusparseOpt.vecX, tmp_d);
-        cusparseDnVecSetValues(A.cusparseOpt.vecY, x.values_d);
-        cusparseSpMatSetAttribute(A.cusparseOpt.matA, CUSPARSE_SPMAT_FILL_MODE, &(fillmode_l), sizeof(fillmode_l));
-        cusparseSpSV_solve(cusparsehandle, CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha, A.cusparseOpt.matA,
-            A.cusparseOpt.vecX, A.cusparseOpt.vecY, CUDA_R_64F, CUSPARSE_SPSV_ALG_DEFAULT, A.cusparseOpt.spsvDescrL);
+        CHECK_CUSPARSE(cusparseDnVecSetValues(A.cusparseOpt.vecX, tmp_d));
+        CHECK_CUSPARSE(cusparseDnVecSetValues(A.cusparseOpt.vecY, x.values_d));
+        CHECK_CUSPARSE(cusparseSpMatSetAttribute(
+            A.cusparseOpt.matA, CUSPARSE_SPMAT_FILL_MODE, &(fillmode_l), sizeof(fillmode_l)));
+        CHECK_CUSPARSE(cusparseSpSV_solve(cusparsehandle, CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha, A.cusparseOpt.matA,
+            A.cusparseOpt.vecX, A.cusparseOpt.vecY, CUDA_R_64F, CUSPARSE_SPSV_ALG_DEFAULT, A.cusparseOpt.spsvDescrL));
 
         // SPMV(D, x, t) t += D*x
         SpFmaCuda(nrow, x.values_d, A.diagonal, (*A.mgData->Axf).values_d);
 
         // TRSV(D+U, x, x)
-        cusparseDnVecSetValues(A.cusparseOpt.vecX, (*A.mgData->Axf).values_d);
-        cusparseDnVecSetValues(A.cusparseOpt.vecY, x.values_d);
-        cusparseSpMatSetAttribute(A.cusparseOpt.matA, CUSPARSE_SPMAT_FILL_MODE, &(fillmode_u), sizeof(fillmode_u));
-        cusparseSpSV_solve(cusparsehandle, CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha, A.cusparseOpt.matA,
-            A.cusparseOpt.vecX, A.cusparseOpt.vecY, CUDA_R_64F, CUSPARSE_SPSV_ALG_DEFAULT, A.cusparseOpt.spsvDescrU);
+        CHECK_CUSPARSE(cusparseDnVecSetValues(A.cusparseOpt.vecX, (*A.mgData->Axf).values_d));
+        CHECK_CUSPARSE(cusparseDnVecSetValues(A.cusparseOpt.vecY, x.values_d));
+        CHECK_CUSPARSE(cusparseSpMatSetAttribute(
+            A.cusparseOpt.matA, CUSPARSE_SPMAT_FILL_MODE, &(fillmode_u), sizeof(fillmode_u)));
+        CHECK_CUSPARSE(cusparseSpSV_solve(cusparsehandle, CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha, A.cusparseOpt.matA,
+            A.cusparseOpt.vecX, A.cusparseOpt.vecY, CUDA_R_64F, CUSPARSE_SPSV_ALG_DEFAULT, A.cusparseOpt.spsvDescrU));
     }
     return 0;
 }

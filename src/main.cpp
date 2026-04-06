@@ -319,8 +319,8 @@ int main(int argc, char* argv[])
     {
 #ifdef USE_CUDA
         // Cusparse Version
-        cusparseGetProperty(MAJOR_VERSION, &cusparseMajor);
-        cusparseGetProperty(MINOR_VERSION, &cusparseMinor);
+        CHECK_CUSPARSE(cusparseGetProperty(MAJOR_VERSION, &cusparseMajor));
+        CHECK_CUSPARSE(cusparseGetProperty(MINOR_VERSION, &cusparseMinor));
 
         if (cusparseMajor < 12 || (cusparseMajor == 12 && cusparseMinor < 2))
         {
@@ -371,12 +371,12 @@ int main(int argc, char* argv[])
         A.rankType = GPU;
         A.slice_size = params.gpu_slice_size;
         cublasCreate(&(cublashandle));
-        cusparseCreate(&(cusparsehandle));
+        CHECK_CUSPARSE(cusparseCreate(&(cusparsehandle)));
         CHECK_CUDART(cudaStreamCreate(&(stream)));
         CHECK_CUDART(cudaStreamCreate(&(copy_stream)));
-        cusparseSetStream(cusparsehandle, stream);
+        CHECK_CUSPARSE(cusparseSetStream(cusparsehandle, stream));
         cublasSetStream(cublashandle, stream);
-        cusparseSetPointerMode(cusparsehandle, CUSPARSE_POINTER_MODE_HOST);
+        CHECK_CUSPARSE(cusparseSetPointerMode(cusparsehandle, CUSPARSE_POINTER_MODE_HOST));
         CHECK_CUDART(cudaEventCreate(&copy_done));
 #ifdef USE_NCCL
         if (params.p2_mode == NCCL)
@@ -915,7 +915,7 @@ int main(int argc, char* argv[])
     {
 #ifdef USE_CUDA
         cublasDestroy(cublashandle);
-        cusparseDestroy(cusparsehandle);
+        CHECK_CUSPARSE(cusparseDestroy(cusparsehandle));
         CHECK_CUDART(cudaStreamDestroy(stream));
         CHECK_CUDART(cudaStreamDestroy(copy_stream));
         CHECK_CUDART(cudaEventDestroy(copy_done));
