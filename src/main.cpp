@@ -200,10 +200,21 @@ int main(int argc, char* argv[])
 #endif // USE_GRACE
 
         bool invalid = false;
+        // NCCL requires every rank in the communicator to use GPU buffers; CPU ranks cannot send/recv through NCCL.
+        // GPUONLY uses one rank per GPU; CPUONLY/GPUCPU include ranks with no NCCL participation path here.
         if (P2P_Mode == NCCL)
         {
             if (rank == 0)
-                printf("Invalid P2P communication mode (NCCL) for CPUs, Exiting ...\n");
+            {
+                if (params.exec_mode == GPUCPU)
+                    printf(
+                        "Error: P2P mode NCCL is not supported in GPU+CPU hybrid execution (--exm=2): CPU ranks cannot "
+                        "participate in NCCL. Use another --p2p value (e.g. 0 MPI_CPU). Exiting ...\n");
+                else
+                    printf(
+                        "Invalid P2P communication mode (NCCL) for CPU-only execution (no GPU NCCL endpoints). "
+                        "Exiting ...\n");
+            }
             invalid = true;
         }
         if (P2P_Mode == MPI_GPU_All2allv)
