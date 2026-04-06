@@ -200,8 +200,7 @@ int main(int argc, char* argv[])
 #endif // USE_GRACE
 
         bool invalid = false;
-        // NCCL requires every rank in the communicator to use GPU buffers; CPU ranks cannot send/recv through NCCL.
-        // GPUONLY uses one rank per GPU; CPUONLY/GPUCPU include ranks with no NCCL participation path here.
+        // P2P=NCCL is only valid with --exm=0 (GPUONLY). CPU-only and GPU+CPU runs exit here; Nccl_Comm is never built for them.
         if (P2P_Mode == NCCL)
         {
             if (rank == 0)

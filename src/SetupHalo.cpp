@@ -53,6 +53,9 @@
 #ifdef USE_CUDA
 #include "Cuda.hpp"
 #include "CudaKernels.hpp"
+#ifdef USE_NCCL
+extern ncclComm_t Nccl_Comm;
+#endif
 #endif
 
 #ifdef USE_GRACE
@@ -120,13 +123,11 @@ void SetupHalo_Gpu(SparseMatrix& A)
     SetupHaloCuda(A, sendbufld, sendcounts_d, send_buffer_d, &totalToBeSent, &neiCount, neighbors, sendLength,
         &elementsToSendGpu);
 
-    local_int_t* elementsToSend = new local_int_t[totalToBeSent];
+    // Host copy is only needed for MPI index exchange; GPU runtime uses gpuAux.elementsToSend.
+    local_int_t* elementsToSend = nullptr;
     double* sendBuffer = nullptr;
     if (totalToBeSent > 0)
     {
-        CHECK_CUDART(cudaMemcpyAsync(
-            elementsToSend, elementsToSendGpu, sizeof(local_int_t) * totalToBeSent, cudaMemcpyDeviceToHost, stream));
-
         local_int_t* sendcounts = (local_int_t*) malloc(sizeof(local_int_t) * (A.geom->size + 1));
         memset(sendcounts, 0, sizeof(local_int_t) * (A.geom->size + 1));
 
@@ -146,42 +147,79 @@ void SetupHalo_Gpu(SparseMatrix& A)
         CHECK_CUDART(cudaMallocHost(&(sendBuffer), sizeof(double) * totalToBeSent));
         CHECK_CUDART(cudaMalloc(&(A.gpuAux.sendBuffer), sizeof(double) * totalToBeSent));
 
-        local_int_t* eltsToRecv = new local_int_t[totalToBeSent];
-
-        // Exchange elements to send with neighbors
-        auto INDEX_TYPE = MPI_INT;
-#ifdef INDEX_64 // In src/Geometry
-        INDEX_TYPE = MPI_LONG;
-#endif
-
-        MPI_Status status;
-        int MPI_MY_TAG = 93;
-        MPI_Request* request = new MPI_Request[neiCount];
         CHECK_CUDART(cudaStreamSynchronize(stream));
 
-        local_int_t* recv_ptr = eltsToRecv;
-        for (int i = 0; i < neiCount; i++)
+#if defined(USE_NCCL) && !defined(HPCG_NO_MPI)
+        // P2P=NCCL is rejected in main unless --exm=0 (GPUONLY); Nccl_Comm is never created otherwise.
+        if (P2P_Mode == NCCL)
         {
-            auto n_recv = sendLength[i];
-            MPI_Irecv(recv_ptr, n_recv, INDEX_TYPE, neighborsPhysical[i], MPI_MY_TAG, MPI_COMM_WORLD, request + i);
-            recv_ptr += n_recv;
+            printf("NCCL is used\n");
+#ifndef INDEX_64
+            const ncclDataType_t ncclIdx = ncclInt32;
+#else
+            const ncclDataType_t ncclIdx = ncclInt64;
+#endif
+            CHECK_NCCL(ncclGroupStart());
+            local_int_t* send_d = elementsToSendGpu;
+            local_int_t* recv_d = eltsToRecv_d;
+            for (int i = 0; i < neiCount; i++)
+            {
+                const int peer = neighborsPhysical[i];
+                const local_int_t n_send = sendLength[i];
+                CHECK_NCCL(ncclSend(send_d, n_send, ncclIdx, peer, Nccl_Comm, stream));
+                send_d += n_send;
+                const local_int_t n_recv = receiveLength[i];
+                CHECK_NCCL(ncclRecv(recv_d, n_recv, ncclIdx, peer, Nccl_Comm, stream));
+                recv_d += n_recv;
+            }
+            CHECK_NCCL(ncclGroupEnd());
+            CHECK_CUDART(cudaStreamSynchronize(stream));
         }
+        else
+#endif
+        {
+            elementsToSend = new local_int_t[totalToBeSent];
+            local_int_t* eltsToRecv = new local_int_t[totalToBeSent];
 
-        local_int_t* elts_ptr = elementsToSend;
-        for (int i = 0; i < neiCount; i++)
-        {
-            auto n_send = sendLength[i];
-            MPI_Send(elts_ptr, n_send, INDEX_TYPE, neighborsPhysical[i], MPI_MY_TAG, MPI_COMM_WORLD);
-            elts_ptr += n_send;
-        }
-        for (int i = 0; i < neiCount; i++)
-        {
-            MPI_Wait(request + i, &status);
-        }
-        delete[] request;
+            // Exchange elements to send with neighbors
+            auto INDEX_TYPE = MPI_INT;
+#ifdef INDEX_64 // In src/Geometry
+            INDEX_TYPE = MPI_LONG;
+#endif
 
-        CHECK_CUDART(cudaMemcpyAsync(
-            eltsToRecv_d, eltsToRecv, sizeof(local_int_t) * (totalToBeSent), cudaMemcpyHostToDevice, stream));
+            MPI_Status status;
+            int MPI_MY_TAG = 93;
+            MPI_Request* request = new MPI_Request[neiCount];
+
+            CHECK_CUDART(cudaMemcpyAsync(elementsToSend, elementsToSendGpu,
+                sizeof(local_int_t) * totalToBeSent, cudaMemcpyDeviceToHost, stream));
+            CHECK_CUDART(cudaStreamSynchronize(stream));
+
+            local_int_t* recv_ptr = eltsToRecv;
+            for (int i = 0; i < neiCount; i++)
+            {
+                auto n_recv = sendLength[i];
+                MPI_Irecv(recv_ptr, n_recv, INDEX_TYPE, neighborsPhysical[i], MPI_MY_TAG, MPI_COMM_WORLD, request + i);
+                recv_ptr += n_recv;
+            }
+
+            local_int_t* elts_ptr = elementsToSend;
+            for (int i = 0; i < neiCount; i++)
+            {
+                auto n_send = sendLength[i];
+                MPI_Send(elts_ptr, n_send, INDEX_TYPE, neighborsPhysical[i], MPI_MY_TAG, MPI_COMM_WORLD);
+                elts_ptr += n_send;
+            }
+            for (int i = 0; i < neiCount; i++)
+            {
+                MPI_Wait(request + i, &status);
+            }
+            delete[] request;
+
+            CHECK_CUDART(cudaMemcpyAsync(
+                eltsToRecv_d, eltsToRecv, sizeof(local_int_t) * (totalToBeSent), cudaMemcpyHostToDevice, stream));
+            delete[] eltsToRecv;
+        }
 
         // Add the sorted indices from neighbors. For each neighbor, add its indices sequentially
         //  before the next neighbor's indices. Tje indices will be adjusted to be
