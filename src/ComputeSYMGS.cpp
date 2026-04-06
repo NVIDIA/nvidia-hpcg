@@ -113,7 +113,7 @@ int ComputeSYMGS_Gpu(const SparseMatrix& A, const Vector& r, Vector& x, bool ste
         if (A.mgData != 0)
         {
 #ifndef HPCG_NO_MPI
-            cudaStreamSynchronize(stream);
+            CHECK_CUDART(cudaStreamSynchronize(stream));
             PackSendBufferCuda(A, x, false, copy_stream);
 #endif
 
@@ -137,7 +137,7 @@ int ComputeSYMGS_Gpu(const SparseMatrix& A, const Vector& r, Vector& x, bool ste
     else
     { // step == 0
 #ifndef HPCG_NO_MPI
-        cudaStreamSynchronize(stream);
+        CHECK_CUDART(cudaStreamSynchronize(stream));
         PackSendBufferCuda(A, x, false, copy_stream);
 #endif
 

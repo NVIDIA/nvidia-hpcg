@@ -45,16 +45,6 @@ extern p2p_comm_mode_t P2P_Mode;
 #include "ComputeDotProduct_ref.hpp"
 #ifdef USE_CUDA
 #include "Cuda.hpp"
-#define CHECK_CUBLAS(x)                                                                                                \
-    do                                                                                                                 \
-    {                                                                                                                  \
-        cublasStatus_t cublasStatus = (x);                                                                             \
-        if (cublasStatus != CUBLAS_STATUS_SUCCESS)                                                                     \
-        {                                                                                                              \
-            fprintf(stderr, "CUBLAS: %s = %d at (%s:%d)\n", #x, cublasStatus, __FILE__, __LINE__);                     \
-            exit(1);                                                                                                   \
-        }                                                                                                              \
-    } while (0)
 #ifdef USE_NCCL
 extern ncclComm_t Nccl_Comm;
 extern double* d_dot_nccl_allreduce_local;
@@ -97,12 +87,12 @@ int ComputeDotProduct(const local_int_t n, const Vector& x, const Vector& y, dou
 #ifdef USE_NCCL
         if (P2P_Mode == NCCL)
         {
-            cublasDdot(cublashandle, n, x.values_d, 1, y.values_d, 1, d_dot_nccl_allreduce_local);
+            CHECK_CUBLAS(cublasDdot(cublashandle, n, x.values_d, 1, y.values_d, 1, d_dot_nccl_allreduce_local));
         }
         else
 #endif
         {
-            cublasDdot(cublashandle, n, x.values_d, 1, y.values_d, 1, &local_result);
+            CHECK_CUBLAS(cublasDdot(cublashandle, n, x.values_d, 1, y.values_d, 1, &local_result));
         }
 #endif
     }
@@ -120,7 +110,7 @@ int ComputeDotProduct(const local_int_t n, const Vector& x, const Vector& y, dou
 #ifdef USE_NCCL
     if (rt == GPU && P2P_Mode == NCCL)
     {
-        ncclAllReduce(d_dot_nccl_allreduce_local, d_dot_nccl_allreduce_global, 1, ncclDouble, ncclSum, Nccl_Comm, stream);
+        CHECK_NCCL(ncclAllReduce(d_dot_nccl_allreduce_local, d_dot_nccl_allreduce_global, 1, ncclDouble, ncclSum, Nccl_Comm, stream));
         CHECK_CUDART(cudaMemcpyAsync(&result, d_dot_nccl_allreduce_global, sizeof(double), cudaMemcpyDeviceToHost, stream));
         CHECK_CUDART(cudaStreamSynchronize(stream));
     }

@@ -44,6 +44,9 @@
 #include "GenerateProblem.hpp"
 #include "SetupHalo.hpp"
 #include <cassert>
+#ifdef USE_CUDA
+#include "Cuda.hpp"
+#endif
 
 #ifndef HPCG_NO_MPI
 // Used to find ranks for CPU and GPU programs
@@ -106,7 +109,7 @@ void GenerateCoarseProblem(const SparseMatrix& Af)
         InitializeVector(*xc, Ac->localNumberOfColumns, Ac->rankType);
         InitializeVector(*Axf, Af.localNumberOfColumns, Ac->rankType);
 #ifdef USE_CUDA
-        cudaMemcpy(f2cOperator, Af.gpuAux.f2c, sizeof(local_int_t) * localNumberOfRows, cudaMemcpyDeviceToHost);
+        CHECK_CUDART(cudaMemcpy(f2cOperator, Af.gpuAux.f2c, sizeof(local_int_t) * localNumberOfRows, cudaMemcpyDeviceToHost));
 #endif
     }
     else

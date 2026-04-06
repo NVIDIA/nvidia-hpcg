@@ -372,12 +372,12 @@ int main(int argc, char* argv[])
         A.slice_size = params.gpu_slice_size;
         cublasCreate(&(cublashandle));
         cusparseCreate(&(cusparsehandle));
-        cudaStreamCreate(&(stream));
-        cudaStreamCreate(&(copy_stream));
+        CHECK_CUDART(cudaStreamCreate(&(stream)));
+        CHECK_CUDART(cudaStreamCreate(&(copy_stream)));
         cusparseSetStream(cusparsehandle, stream);
         cublasSetStream(cublashandle, stream);
         cusparseSetPointerMode(cusparsehandle, CUSPARSE_POINTER_MODE_HOST);
-        cudaEventCreate(&copy_done);
+        CHECK_CUDART(cudaEventCreate(&copy_done));
 #ifdef USE_NCCL
         if (params.p2_mode == NCCL)
             cublasSetPointerMode(cublashandle, CUBLAS_POINTER_MODE_DEVICE);
@@ -707,7 +707,7 @@ int main(int argc, char* argv[])
 #endif
         int numberOfWarmupCgSets = (rough_time_per_set > 0.0) ? int(warmup_runtime / rough_time_per_set) + 1 : 1;
         if (rank == 0)
-            printf("\n========== Warmup Phase2 ==========\n"
+            printf("\n========== Warmup Phase ==========\n"
                    " | Target time:  %.0fs\n",
                    warmup_runtime);
 
@@ -916,12 +916,12 @@ int main(int argc, char* argv[])
 #ifdef USE_CUDA
         cublasDestroy(cublashandle);
         cusparseDestroy(cusparsehandle);
-        cudaStreamDestroy(stream);
-        cudaStreamDestroy(copy_stream);
-        cudaEventDestroy(copy_done);
+        CHECK_CUDART(cudaStreamDestroy(stream));
+        CHECK_CUDART(cudaStreamDestroy(copy_stream));
+        CHECK_CUDART(cudaEventDestroy(copy_done));
 #ifdef USE_NCCL
-        cudaFree(d_dot_nccl_allreduce_local);
-        cudaFree(d_dot_nccl_allreduce_global);
+        CHECK_CUDART(cudaFree(d_dot_nccl_allreduce_local));
+        CHECK_CUDART(cudaFree(d_dot_nccl_allreduce_global));
 #endif
 #endif
     }

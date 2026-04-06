@@ -24,6 +24,17 @@
 #include <cuda.h>
 #ifdef USE_NCCL
 #include "nccl.h"
+#define CHECK_NCCL(x)                                                                                                  \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        ncclResult_t ncclStatus = (x);                                                                                 \
+        if (ncclStatus != ncclSuccess)                                                                                 \
+        {                                                                                                              \
+            fprintf(stderr, "NCCL: %s = %d (%s) at (%s:%d)\n", #x, ncclStatus, ncclGetErrorString(ncclStatus),         \
+                __FILE__, __LINE__);                                                                                   \
+            exit(1);                                                                                                   \
+        }                                                                                                              \
+    } while (0)
 #endif
 #ifdef USE_NVTX
 #include <nvToolsExt.h>
@@ -53,6 +64,17 @@ extern bool Use_Hpcg_Mem_Reduction; /*USE HPCG aggresive memory reduction*/
             gethostname(rank_name, 1024);                                                                              \
             fprintf(stderr, "CUDART: %s = %d (%s) on %s at (%s:%d)\n", #x, res, cudaGetErrorString(res), rank_name,    \
                 __FILE__, __LINE__);                                                                                   \
+            exit(1);                                                                                                   \
+        }                                                                                                              \
+    } while (0)
+
+#define CHECK_CUBLAS(x)                                                                                                \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        cublasStatus_t cublasStatus = (x);                                                                             \
+        if (cublasStatus != CUBLAS_STATUS_SUCCESS)                                                                     \
+        {                                                                                                              \
+            fprintf(stderr, "CUBLAS: %s = %d at (%s:%d)\n", #x, cublasStatus, __FILE__, __LINE__);                     \
             exit(1);                                                                                                   \
         }                                                                                                              \
     } while (0)

@@ -178,7 +178,7 @@ void InitializeRanks(HPCG_Params& params)
 
     free(host_names);
 #ifdef USE_CUDA
-    cudaGetDeviceCount(&deviceCount);
+    CHECK_CUDART(cudaGetDeviceCount(&deviceCount));
 #endif
 
     // Figure out the rank type, based on execution mode (params.exec_mode)
@@ -190,22 +190,22 @@ void InitializeRanks(HPCG_Params& params)
     {
         params.rank_type = GPU;
 #ifdef USE_CUDA
-        cudaGetDeviceCount(&deviceCount);
-        cudaSetDevice(local_rank % deviceCount);
+        CHECK_CUDART(cudaGetDeviceCount(&deviceCount));
+        CHECK_CUDART(cudaSetDevice(local_rank % deviceCount));
 
         // Touch Pinned Memory
         double* t;
-        cudaMallocHost((void**) (&(t)), sizeof(double));
-        cudaFreeHost(t);
+        CHECK_CUDART(cudaMallocHost((void**) (&(t)), sizeof(double)));
+        CHECK_CUDART(cudaFreeHost(t));
 
         if (params.p2_mode == NCCL)
         {
 #ifdef USE_NCCL
             ncclUniqueId id;
             if (global_rank == 0)
-                ncclGetUniqueId(&id);
+                CHECK_NCCL(ncclGetUniqueId(&id));
             MPI_Bcast(&id, sizeof(id), MPI_BYTE, 0, MPI_COMM_WORLD);
-            ncclCommInitRank(&Nccl_Comm, global_total_ranks, id, global_rank);
+            CHECK_NCCL(ncclCommInitRank(&Nccl_Comm, global_total_ranks, id, global_rank));
 #endif // USE_NCCL
         }
 
@@ -227,11 +227,11 @@ void InitializeRanks(HPCG_Params& params)
         {
             params.rank_type = GPU;
 #ifdef USE_CUDA
-            cudaSetDevice(local_rank / ranks_for_numa);
+            CHECK_CUDART(cudaSetDevice(local_rank / ranks_for_numa));
             // Touch Pinned Memory
             double* t;
-            cudaMallocHost((void**) (&(t)), sizeof(double));
-            cudaFreeHost(t);
+            CHECK_CUDART(cudaMallocHost((void**) (&(t)), sizeof(double)));
+            CHECK_CUDART(cudaFreeHost(t));
 #endif
         }
         else

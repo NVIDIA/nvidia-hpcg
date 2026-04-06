@@ -157,7 +157,7 @@ int CG(const SparseMatrix& A, CGData& data, const Vector& b, Vector& x, const in
             if (A.rankType == GPU)
             {
 #ifdef USE_CUDA
-                cudaStreamSynchronize(stream);
+                CHECK_CUDART(cudaStreamSynchronize(stream));
 #endif
             }
         }

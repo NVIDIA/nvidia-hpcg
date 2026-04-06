@@ -86,7 +86,7 @@ int ComputeSPMV(const SparseMatrix& A, Vector& x, Vector& y)
         }
 #endif
 
-        cudaStreamSynchronize(stream);
+        CHECK_CUDART(cudaStreamSynchronize(stream));
 #endif
     }
     else

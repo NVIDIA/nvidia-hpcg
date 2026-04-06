@@ -113,8 +113,8 @@ void SetupHalo_Gpu(SparseMatrix& A)
     local_int_t* sendcounts_d = NULL;
     local_int_t* elementsToSendGpu;
 
-    cudaMalloc(&sendcounts_d, sizeof(local_int_t) * (27));
-    cudaMemsetAsync(sendcounts_d, 0, sizeof(local_int_t) * (27), stream);
+    CHECK_CUDART(cudaMalloc(&sendcounts_d, sizeof(local_int_t) * (27)));
+    CHECK_CUDART(cudaMemsetAsync(sendcounts_d, 0, sizeof(local_int_t) * (27), stream));
 
     // Finds elements to send and neighbors
     SetupHaloCuda(A, sendbufld, sendcounts_d, send_buffer_d, &totalToBeSent, &neiCount, neighbors, sendLength,
@@ -124,8 +124,8 @@ void SetupHalo_Gpu(SparseMatrix& A)
     double* sendBuffer = nullptr;
     if (totalToBeSent > 0)
     {
-        cudaMemcpyAsync(
-            elementsToSend, elementsToSendGpu, sizeof(local_int_t) * totalToBeSent, cudaMemcpyDeviceToHost, stream);
+        CHECK_CUDART(cudaMemcpyAsync(
+            elementsToSend, elementsToSendGpu, sizeof(local_int_t) * totalToBeSent, cudaMemcpyDeviceToHost, stream));
 
         local_int_t* sendcounts = (local_int_t*) malloc(sizeof(local_int_t) * (A.geom->size + 1));
         memset(sendcounts, 0, sizeof(local_int_t) * (A.geom->size + 1));
@@ -157,7 +157,7 @@ void SetupHalo_Gpu(SparseMatrix& A)
         MPI_Status status;
         int MPI_MY_TAG = 93;
         MPI_Request* request = new MPI_Request[neiCount];
-        cudaStreamSynchronize(stream);
+        CHECK_CUDART(cudaStreamSynchronize(stream));
 
         local_int_t* recv_ptr = eltsToRecv;
         for (int i = 0; i < neiCount; i++)
@@ -180,8 +180,8 @@ void SetupHalo_Gpu(SparseMatrix& A)
         }
         delete[] request;
 
-        cudaMemcpyAsync(
-            eltsToRecv_d, eltsToRecv, sizeof(local_int_t) * (totalToBeSent), cudaMemcpyHostToDevice, stream);
+        CHECK_CUDART(cudaMemcpyAsync(
+            eltsToRecv_d, eltsToRecv, sizeof(local_int_t) * (totalToBeSent), cudaMemcpyHostToDevice, stream));
 
         // Add the sorted indices from neighbors. For each neighbor, add its indices sequentially
         //  before the next neighbor's indices. Tje indices will be adjusted to be
@@ -189,7 +189,7 @@ void SetupHalo_Gpu(SparseMatrix& A)
         for (int neighborCount = 0; neighborCount < neiCount; ++neighborCount)
         {
             int neighborId = neighbors[neighborCount];
-            cudaMemsetAsync(extToLocMap, 0, sizeof(local_int_t) * localNumberOfRows, stream);
+            CHECK_CUDART(cudaMemsetAsync(extToLocMap, 0, sizeof(local_int_t) * localNumberOfRows, stream));
             local_int_t str = sendcounts[neighborCount];
             local_int_t end = sendcounts[neighborCount + 1];
             ExtToLocMapCuda(localNumberOfRows, str, end, extToLocMap, eltsToRecv_d);

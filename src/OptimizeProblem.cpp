@@ -119,12 +119,12 @@ size_t OptimizeProblemGpu(SparseMatrix& A_in, CGData& data, Vector& b, Vector& x
         const local_int_t half_nnz = (A->localNumberOfNonzeros - nrow - A->extNnz) / 2;
 
         local_int_t sell_l_nnz = 0;
-        cudaMemcpyAsync(
-            &sell_l_nnz, &(A->sellLSliceMrl[sell_slices]), sizeof(local_int_t), cudaMemcpyDeviceToHost, stream);
+        CHECK_CUDART(cudaMemcpyAsync(
+            &sell_l_nnz, &(A->sellLSliceMrl[sell_slices]), sizeof(local_int_t), cudaMemcpyDeviceToHost, stream));
 
         local_int_t sell_u_nnz = 0;
-        cudaMemcpyAsync(
-            &sell_u_nnz, &(A->sellUSliceMrl[sell_slices]), sizeof(local_int_t), cudaMemcpyDeviceToHost, stream);
+        CHECK_CUDART(cudaMemcpyAsync(
+            &sell_u_nnz, &(A->sellUSliceMrl[sell_slices]), sizeof(local_int_t), cudaMemcpyDeviceToHost, stream));
 
         auto INDEX_TYPE = CUSPARSE_INDEX_32I;
 #ifdef INDEX_64 // In src/Geometry
@@ -181,7 +181,7 @@ size_t OptimizeProblemGpu(SparseMatrix& A_in, CGData& data, Vector& b, Vector& x
             cusparseSpSV_bufferSize(cusparsehandle, CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha, A->cusparseOpt.matL,
                 A->cusparseOpt.vecX, A->cusparseOpt.vecY, CUDA_R_64F, CUSPARSE_SPSV_ALG_DEFAULT,
                 A->cusparseOpt.spsvDescrL, &buffer_size_sv_l);
-            cudaMalloc(&A->bufferSvL, buffer_size_sv_l);
+            CHECK_CUDART(cudaMalloc(&A->bufferSvL, buffer_size_sv_l));
         }
         cusparseSpSV_analysis(cusparsehandle, CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha, A->cusparseOpt.matL,
             A->cusparseOpt.vecX, A->cusparseOpt.vecY, CUDA_R_64F, CUSPARSE_SPSV_ALG_DEFAULT, A->cusparseOpt.spsvDescrL,
@@ -196,7 +196,7 @@ size_t OptimizeProblemGpu(SparseMatrix& A_in, CGData& data, Vector& b, Vector& x
             cusparseSpSV_bufferSize(cusparsehandle, CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha, A->cusparseOpt.matU,
                 A->cusparseOpt.vecX, A->cusparseOpt.vecY, CUDA_R_64F, CUSPARSE_SPSV_ALG_DEFAULT,
                 A->cusparseOpt.spsvDescrU, &buffer_size_sv_u);
-            cudaMalloc(&A->bufferSvU, buffer_size_sv_u);
+            CHECK_CUDART(cudaMalloc(&A->bufferSvU, buffer_size_sv_u));
         }
         cusparseSpSV_analysis(cusparsehandle, CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha, A->cusparseOpt.matU,
             A->cusparseOpt.vecX, A->cusparseOpt.vecY, CUDA_R_64F, CUSPARSE_SPSV_ALG_DEFAULT, A->cusparseOpt.spsvDescrU,
@@ -205,7 +205,7 @@ size_t OptimizeProblemGpu(SparseMatrix& A_in, CGData& data, Vector& b, Vector& x
             cusparsehandle, A->cusparseOpt.spsvDescrU, A->diagonal, CUSPARSE_SPSV_UPDATE_DIAGONAL);
 
         if (max_buf_size > 0)
-            cudaMalloc(&(A->bufferMvA), max_buf_size);
+            CHECK_CUDART(cudaMalloc(&(A->bufferMvA), max_buf_size));
 
         cusparseDestroyDnVec(dummy1);
         cusparseDestroyDnVec(dummy2);

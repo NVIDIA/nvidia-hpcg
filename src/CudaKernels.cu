@@ -384,7 +384,7 @@ void DeleteMatrixGpu(SparseMatrix& A)
         if (AA->sendLength)
             delete[] AA->sendLength;
         if (AA->sendBuffer)
-            cudaFreeHost(AA->sendBuffer);
+            CHECK_CUDART(cudaFreeHost(AA->sendBuffer));
 #endif
 
         if (AA->geom != 0)
@@ -801,7 +801,7 @@ void GenerateProblemCuda(SparseMatrix& A, Vector* b, Vector* x, Vector* xexact)
     double* ev = xexact != 0 ? xexact->values_d : NULL;
 
     // Generete nnzPerRow
-    cudaMemsetAsync(&(A.gpuAux.nnzPerRow[localNumberOfRows]), 0, sizeof(local_int_t), stream);
+    CHECK_CUDART(cudaMemsetAsync(&(A.gpuAux.nnzPerRow[localNumberOfRows]), 0, sizeof(local_int_t), stream));
     const local_int_t grid_nnz = (localNumberOfRows * HPCG_MAX_ROW_LEN + 128 - 1) / 128;
     setMinusOne_kernel<<<grid_nnz, 128, 0, stream>>>(localNumberOfRows * HPCG_MAX_ROW_LEN, A.gpuAux.values);
     generateProblem_kernel<<<grid2, block2, block2.x * sizeof(int), stream>>>(A.geom->logical_rank,
@@ -814,8 +814,8 @@ void GenerateProblemCuda(SparseMatrix& A, Vector* b, Vector* x, Vector* xexact)
     CHECK_CUDART(cudaMemsetAsync(&(temp[64 * 128]), 0, sizeof(int), stream));
     compressCsrOffsets_kernel<128, 64><<<64, 128, 0, stream>>>(localNumberOfRows, A.csrExtOffsets, A.gpuAux.map,
         A.gpuAux.csrLPermOffsets, temp, A.gpuAux.csrUPermOffsets, A.geom->logical_rank);
-    cudaMemcpy(&(A.gpuAux.compressNumberOfRows), &(A.gpuAux.map[localNumberOfRows]), sizeof(local_int_t),
-        cudaMemcpyDeviceToHost);
+    CHECK_CUDART(cudaMemcpy(&(A.gpuAux.compressNumberOfRows), &(A.gpuAux.map[localNumberOfRows]), sizeof(local_int_t),
+        cudaMemcpyDeviceToHost));
 
     A.extNnz = 0;
     CHECK_CUDART(cudaMemcpy(
@@ -1102,7 +1102,7 @@ void SetupHaloCuda(SparseMatrix& A, local_int_t sendbufld, local_int_t* sendlen,
     dim3 grid2((n + block2.x - 1) / block2.x, 1, 1);
 
     // USE csrLPermOffsets as temporal array only!
-    cudaMemsetAsync(A.gpuAux.f2c, 0, sizeof(local_int_t) * localNumberOfRows, stream);
+    CHECK_CUDART(cudaMemsetAsync(A.gpuAux.f2c, 0, sizeof(local_int_t) * localNumberOfRows, stream));
 
     setupHalo_kernel<<<grid2, block2, 0, stream>>>(A.geom->logical_rank, A.geom->different_dim,
         A.geom->previous_neighbor_dim, A.geom->next_neighbor_dim, npx, npy, nx, ny, nz, gnx, gny, gnz, gix0, giy0, giz0,
@@ -1210,9 +1210,9 @@ void PackSendBufferCuda(const SparseMatrix& A, Vector& x, bool cpu_data, cudaStr
 
         if (P2P_Mode == MPI_CPU || P2P_Mode == MPI_CPU_All2allv)
         {
-            cudaMemcpyAsync(
-                A.sendBuffer, A.gpuAux.sendBuffer, A.totalToBeSent * sizeof(double), cudaMemcpyDeviceToHost, stream1);
-            cudaEventRecord(copy_done, stream1);
+            CHECK_CUDART(cudaMemcpyAsync(
+                A.sendBuffer, A.gpuAux.sendBuffer, A.totalToBeSent * sizeof(double), cudaMemcpyDeviceToHost, stream1));
+            CHECK_CUDART(cudaEventRecord(copy_done, stream1));
         }
     }
 }
@@ -1248,7 +1248,7 @@ void ExchangeHaloCuda(const SparseMatrix& A, Vector& x, cudaStream_t stream1, in
             x_external += n_recv;
         }
 
-        cudaEventSynchronize(copy_done);
+        CHECK_CUDART(cudaEventSynchronize(copy_done));
         for (int i = 0; i < num_neighbors; i++)
         {
             local_int_t n_send = sendLength[i];
@@ -1264,10 +1264,10 @@ void ExchangeHaloCuda(const SparseMatrix& A, Vector& x, cudaStream_t stream1, in
             MPI_Ibarrier(MPI_COMM_WORLD, request);
         #endif
 
-        cudaMemcpyAsync(x.values_d + A.localNumberOfRows, x.values + A.localNumberOfRows,
-            A.numberOfExternalValues * sizeof(double), cudaMemcpyHostToDevice, copy_stream);
-        cudaEventRecord(copy_done, copy_stream);
-        cudaStreamWaitEvent(0, copy_done, 0);
+        CHECK_CUDART(cudaMemcpyAsync(x.values_d + A.localNumberOfRows, x.values + A.localNumberOfRows,
+            A.numberOfExternalValues * sizeof(double), cudaMemcpyHostToDevice, copy_stream));
+        CHECK_CUDART(cudaEventRecord(copy_done, copy_stream));
+        CHECK_CUDART(cudaStreamWaitEvent(0, copy_done, 0));
         delete[] request;
     }
     else if (P2P_Mode == MPI_CUDA_AWARE)
@@ -1286,7 +1286,7 @@ void ExchangeHaloCuda(const SparseMatrix& A, Vector& x, cudaStream_t stream1, in
             x_external += n_recv;
         }
 
-        cudaStreamSynchronize(stream1);
+        CHECK_CUDART(cudaStreamSynchronize(stream1));
         for (int i = 0; i < num_neighbors; i++)
         {
             local_int_t n_send = sendLength[i];
@@ -1309,7 +1309,7 @@ void ExchangeHaloCuda(const SparseMatrix& A, Vector& x, cudaStream_t stream1, in
         double* const xv = x.values_d;
         double* sendBuffer = A.gpuAux.sendBuffer;
         double* x_external = (double*) xv + localNumberOfRows;
-        cudaStreamSynchronize(stream1);
+        CHECK_CUDART(cudaStreamSynchronize(stream1));
         MPI_Alltoallv(
             sendBuffer, A.scounts, A.sdispls, MPI_DOUBLE, x_external, A.rcounts, A.rdispls, MPI_DOUBLE, MPI_COMM_WORLD);
     }
@@ -1318,13 +1318,13 @@ void ExchangeHaloCuda(const SparseMatrix& A, Vector& x, cudaStream_t stream1, in
         double* const xv = x.values;
         double* sendBuffer = A.sendBuffer;
         double* x_external = (double*) xv + localNumberOfRows;
-        cudaEventSynchronize(copy_done);
+        CHECK_CUDART(cudaEventSynchronize(copy_done));
         MPI_Alltoallv(
             sendBuffer, A.scounts, A.sdispls, MPI_DOUBLE, x_external, A.rcounts, A.rdispls, MPI_DOUBLE, MPI_COMM_WORLD);
-        cudaMemcpyAsync(x.values_d + A.localNumberOfRows, x.values + A.localNumberOfRows,
-            A.numberOfExternalValues * sizeof(double), cudaMemcpyHostToDevice, copy_stream);
-        cudaEventRecord(copy_done, copy_stream);
-        cudaStreamWaitEvent(0, copy_done, 0);
+        CHECK_CUDART(cudaMemcpyAsync(x.values_d + A.localNumberOfRows, x.values + A.localNumberOfRows,
+            A.numberOfExternalValues * sizeof(double), cudaMemcpyHostToDevice, copy_stream));
+        CHECK_CUDART(cudaEventRecord(copy_done, copy_stream));
+        CHECK_CUDART(cudaStreamWaitEvent(0, copy_done, 0));
     }
     else if (P2P_Mode == NCCL)
     {
@@ -1332,20 +1332,20 @@ void ExchangeHaloCuda(const SparseMatrix& A, Vector& x, cudaStream_t stream1, in
         double* const xv = x.values_d;
         double* sendBuffer = A.gpuAux.sendBuffer;
         double* x_external = (double*) xv + localNumberOfRows;
-        ncclGroupStart();
+        CHECK_NCCL(ncclGroupStart());
         for (int d = 0; d < num_neighbors; d++)
         {
             local_int_t n_send = sendLength[d];
-            ncclSend(sendBuffer, n_send, ncclDouble, neighbors[d], Nccl_Comm, stream1);
+            CHECK_NCCL(ncclSend(sendBuffer, n_send, ncclDouble, neighbors[d], Nccl_Comm, stream1));
             sendBuffer += n_send;
 
             local_int_t n_recv = receiveLength[d];
-            ncclRecv(x_external, n_recv, ncclDouble, neighbors[d], Nccl_Comm, stream1);
+            CHECK_NCCL(ncclRecv(x_external, n_recv, ncclDouble, neighbors[d], Nccl_Comm, stream1));
             x_external += n_recv;
         }
-        ncclGroupEnd();
+        CHECK_NCCL(ncclGroupEnd());
 #endif
-        cudaStreamSynchronize(stream1);
+        CHECK_CUDART(cudaStreamSynchronize(stream1));
     }
     return;
 }
@@ -1962,9 +1962,9 @@ void TransposeCuda(local_int_t n, local_int_t slice_size, local_int_t* sellCollI
     dim3 block(16, 16, 1);
     int numThreadsPerBlock = block.x * block.y;
 
-    cudaGetDevice(&dev);
-    cudaGetDeviceProperties(&deviceProp, dev);
-    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&numBlocksPerSm, transpose_kernel, numThreadsPerBlock, 0);
+    CHECK_CUDART(cudaGetDevice(&dev));
+    CHECK_CUDART(cudaGetDeviceProperties(&deviceProp, dev));
+    CHECK_CUDART(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&numBlocksPerSm, transpose_kernel, numThreadsPerBlock, 0));
 
     size_t blocksInY = (HPCG_MAX_ROW_LEN + block.y - 1) / block.y;
     size_t blocksInX = deviceProp.multiProcessorCount * numBlocksPerSm / blocksInY; //In x direction
@@ -1976,7 +1976,7 @@ void TransposeCuda(local_int_t n, local_int_t slice_size, local_int_t* sellCollI
                                 (void*) &sellCollIndex,
                                 (void*) &sellValues,
                                 (void*) &slice_size};
-    cudaLaunchCooperativeKernel((void*)transpose_kernel, grid, block, args, 0, stream);  
+    CHECK_CUDART(cudaLaunchCooperativeKernel((void*)transpose_kernel, grid, block, args, 0, stream));
 }
 
 /*
@@ -1998,7 +1998,7 @@ void PrefixsumCuda(local_int_t localNumberOfRows, local_int_t* arr)
 {
     void* d_temp_storage = NULL;
     size_t temp_storage_bytes = 0;
-    cudaMemsetAsync(arr, 0, sizeof(local_int_t), stream);
+    CHECK_CUDART(cudaMemsetAsync(arr, 0, sizeof(local_int_t), stream));
     cub::DeviceScan::InclusiveSum(d_temp_storage, temp_storage_bytes, arr + 1, arr + 1, localNumberOfRows);
     CHECK_CUDART(cudaMalloc(&d_temp_storage, temp_storage_bytes));
     cub::DeviceScan::InclusiveSum(d_temp_storage, temp_storage_bytes, arr + 1, arr + 1, localNumberOfRows);
@@ -2113,8 +2113,8 @@ void ReplaceMatrixDiagonalCuda(SparseMatrix& A, Vector& diagonal)
 */
 void CopyMatrixDiagonalCuda(SparseMatrix& A, Vector& diagonal)
 {
-    cudaMemcpyAsync(
-        diagonal.values_d, A.diagonal, sizeof(double) * A.localNumberOfRows, cudaMemcpyDeviceToDevice, stream);
+    CHECK_CUDART(cudaMemcpyAsync(
+        diagonal.values_d, A.diagonal, sizeof(double) * A.localNumberOfRows, cudaMemcpyDeviceToDevice, stream));
 }
 
 //////////////////////// CG Support Kernels ///////////////////////////////////
@@ -2246,7 +2246,7 @@ void ComputeWAXPBYCuda(
     const int ELELEMENTS_PER_CTA = THREADS_PER_CTA * ROUNDS * 2; // 2 doubles per thread, # rounds per thread
     const int grid = (n + ELELEMENTS_PER_CTA - 1) / ELELEMENTS_PER_CTA;
     computeWAXPBY_kernel<THREADS_PER_CTA, ROUNDS><<<grid, THREADS_PER_CTA, 0, stream>>>(n, alpha, x.values_d, beta, y.values_d, w.values_d);
-    cudaStreamSynchronize(stream);
+    CHECK_CUDART(cudaStreamSynchronize(stream));
 }
 
 //////////////////////// CG Support Kernels: SYMG /////////////////////////////
@@ -2485,11 +2485,11 @@ size_t CopyDataToHostCuda(SparseMatrix& A_in, Vector* b, Vector* x, Vector* xexa
         xexactv = xexact->values;
 
     if (b != 0)
-        cudaMemcpy(bv, b->values_d, sizeof(double) * A->localNumberOfRows, cudaMemcpyDeviceToHost);
+        CHECK_CUDART(cudaMemcpy(bv, b->values_d, sizeof(double) * A->localNumberOfRows, cudaMemcpyDeviceToHost));
     if (x != 0)
-        cudaMemcpy(xv, x->values_d, sizeof(double) * A->localNumberOfRows, cudaMemcpyDeviceToHost);
+        CHECK_CUDART(cudaMemcpy(xv, x->values_d, sizeof(double) * A->localNumberOfRows, cudaMemcpyDeviceToHost));
     if (xexact != 0)
-        cudaMemcpy(xexactv, xexact->values_d, sizeof(double) * A->localNumberOfRows, cudaMemcpyDeviceToHost);
+        CHECK_CUDART(cudaMemcpy(xexactv, xexact->values_d, sizeof(double) * A->localNumberOfRows, cudaMemcpyDeviceToHost));
 
     local_int_t numberOfMgLevels = 4;
     for (int level = 0; level < numberOfMgLevels; ++level)
@@ -2510,20 +2510,20 @@ size_t CopyDataToHostCuda(SparseMatrix& A_in, Vector* b, Vector* x, Vector* xexa
         memset(mtxIndL[0], 0x00, sizeof(local_int_t) * (localNumberOfRows * numberOfNonzerosPerRow));
         memset(matrixValues[0], 0x00, sizeof(double) * (localNumberOfRows * numberOfNonzerosPerRow));
 
-        cudaMemcpy(mtxIndL[0], A->gpuAux.columns, sizeof(local_int_t) * A->localNumberOfRows * HPCG_MAX_ROW_LEN,
-            cudaMemcpyDeviceToHost);
-        cudaMemcpy(matrixValues[0], A->gpuAux.values, sizeof(double) * A->localNumberOfRows * HPCG_MAX_ROW_LEN,
-            cudaMemcpyDeviceToHost);
-        cudaMemcpy(
-            nonzerosInRow, A->gpuAux.nnzPerRow, sizeof(local_int_t) * A->localNumberOfRows, cudaMemcpyDeviceToHost);
+        CHECK_CUDART(cudaMemcpy(mtxIndL[0], A->gpuAux.columns, sizeof(local_int_t) * A->localNumberOfRows * HPCG_MAX_ROW_LEN,
+            cudaMemcpyDeviceToHost));
+        CHECK_CUDART(cudaMemcpy(matrixValues[0], A->gpuAux.values, sizeof(double) * A->localNumberOfRows * HPCG_MAX_ROW_LEN,
+            cudaMemcpyDeviceToHost));
+        CHECK_CUDART(cudaMemcpy(
+            nonzerosInRow, A->gpuAux.nnzPerRow, sizeof(local_int_t) * A->localNumberOfRows, cudaMemcpyDeviceToHost));
 
         local_int_t* diagonalIdx = new local_int_t[localNumberOfRows];
         memset(diagonalIdx, 0x00, sizeof(local_int_t) * (localNumberOfRows));
-        cudaMemcpy(diagonalIdx, A->gpuAux.diagonalIdx, sizeof(local_int_t) * localNumberOfRows, cudaMemcpyDeviceToHost);
+        CHECK_CUDART(cudaMemcpy(diagonalIdx, A->gpuAux.diagonalIdx, sizeof(local_int_t) * localNumberOfRows, cudaMemcpyDeviceToHost));
 
         memset(&(A->localToGlobalMap[0]), 0x00, sizeof(global_int_t) * (localNumberOfRows));
-        cudaMemcpy(&(A->localToGlobalMap[0]), A->gpuAux.localToGlobalMap, sizeof(global_int_t) * localNumberOfRows,
-            cudaMemcpyDeviceToHost);
+        CHECK_CUDART(cudaMemcpy(&(A->localToGlobalMap[0]), A->gpuAux.localToGlobalMap, sizeof(global_int_t) * localNumberOfRows,
+            cudaMemcpyDeviceToHost));
 
 #ifndef HPCG_NO_OPENMP
 #pragma omp parallel for
