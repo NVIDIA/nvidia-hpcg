@@ -215,6 +215,7 @@ void SetupHalo_Gpu(SparseMatrix& A)
 
             CHECK_CUDART(cudaMemcpyAsync(
                 eltsToRecv_d, eltsToRecv, sizeof(local_int_t) * (totalToBeSent), cudaMemcpyHostToDevice, stream));
+            CHECK_CUDART(cudaStreamSynchronize(stream));
             delete[] eltsToRecv;
         }
 
