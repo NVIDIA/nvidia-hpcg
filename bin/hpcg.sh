@@ -53,7 +53,7 @@ usage() {
   echo "    --l2cmp        <int>          activates compression in GPU L2 cache when set to one (--l2cmp 1)"
   echo "    --of           <int>          activates generating the log into textfiles, instead of stdout (--of 1)"
   echo "    --gss          <int>          GPU slice size for sliced-ELLPACK format"
-  echo "    --wt           <int>          specifies the number of seconds for the warmup phase before the timed benchmark"
+  echo "    --wt           <int>          number of seconds to run the warmup phase before the timed benchmark"
   echo ""
 }
 

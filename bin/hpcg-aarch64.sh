@@ -61,7 +61,7 @@ usage() {
   echo "    --of    <int> activates generating the log into textfiles instead of stdout (--of 1)"
   echo "    --gss   <int> GPU slice size for sliced-ELLPACK format"
   echo "    --css   <int> CPU slice size for sliced-ELLPACK format"
-  echo "    --wt    <int> specifies the number of seconds for the warmup phase before the timed benchmark"
+  echo "    --wt    <int> number of seconds to run the warmup phase before the timed benchmark"
   echo ""
 }
 

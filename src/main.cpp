@@ -727,12 +727,6 @@ int main(int argc, char* argv[])
     if (params.warmupTime > 0)
     {
         double warmup_runtime = params.warmupTime;
-        double rough_time_per_set = bleh_times[0];
-#ifndef HPCG_NO_MPI
-        double local_rough_time = rough_time_per_set;
-        MPI_Allreduce(&local_rough_time, &rough_time_per_set, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
-#endif
-        int numberOfWarmupCgSets = (rough_time_per_set > 0.0) ? int(warmup_runtime / rough_time_per_set) + 1 : 1;
         if (rank == 0)
             printf("\n========== Warmup Phase ==========\n"
                    " | Target time:  %.0fs\n",
@@ -740,7 +734,11 @@ int main(int argc, char* argv[])
 
         std::vector<double> warmup_times(10, 0.0);
         double warmup_start = mytimer();
-        for (int i = 0; i < numberOfWarmupCgSets; ++i)
+        int numberOfWarmupCgSets = 0;
+        double warmup_elapsed = 0.0;
+        // Run CG sets until global elapsed time reaches --wt; no upfront estimate of
+        // how many sets are needed. The loop always executes at least once.
+        do
         {
             ZeroVector(x);
             ierr = CG(A, data, b, x, warmupNiters, 0.0, niters, normr, normr0, &warmup_times[0], true, 0);
@@ -753,12 +751,20 @@ int main(int argc, char* argv[])
                 {
                     std::cout << "Error in call to CG (warmup): " << ierr << ".\n" << endl;
                 }
-        }
-        double warmup_elapsed = mytimer() - warmup_start;
+            ++numberOfWarmupCgSets;
+            warmup_elapsed = mytimer() - warmup_start;
+#ifndef HPCG_NO_MPI
+            double global_elapsed = warmup_elapsed;
+            MPI_Allreduce(&warmup_elapsed, &global_elapsed, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+            warmup_elapsed = global_elapsed;
+#endif
+        } while (warmup_elapsed < warmup_runtime);
 
         if (rank == 0)
-            printf(" | Elapsed time: %.2fs\n"
-                   "========== Warmup Complete =======\n\n", warmup_elapsed);
+            printf(" | CG sets:      %d\n"
+                   " | Elapsed time: %.2fs\n"
+                   "========== Warmup Complete =======\n\n",
+                numberOfWarmupCgSets, warmup_elapsed);
     }
 
     //////////////////////////////////////
