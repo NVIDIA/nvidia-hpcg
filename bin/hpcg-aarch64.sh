@@ -56,6 +56,7 @@ usage() {
   echo "                  - 3 assumes the sum of different dims of GPU and Grace is part of nx, ny, or nz (depend on --ddm) and --g2c is absolute. e.g., --ddm 1, --nx 1024, and --g2c 96 then GPU nx is 928 and Grace nx is 96"
   echo "    --g2c   <int> specifies the differnt dimensions of the GPU and Grace ranks. Depends on --lpm value"
   echo "    --b     <int> activates benchmarking mode to bypass CPU reference execution when set to one (--b 1)"
+  echo "    --bi    <int> benchmarking-mode overhead iterations added on top of refMaxIters (50); optimized CG runs 50 + value iterations (default 0)"
   echo "    --l2cmp <int> activates compression in GPU L2 cache when set to one (--l2cmp 1)"
   echo "    --of    <int> activates generating the log into textfiles instead of stdout (--of 1)"
   echo "    --gss   <int> GPU slice size for sliced-ELLPACK format"
@@ -214,6 +215,15 @@ while [ "$1" != "" ]; do
      --b )
        if [ -n "$2" ]; then
          B="--b=$2"
+        else
+          usage
+          exit 1
+        fi
+        shift
+        ;;
+     --bi )
+       if [ -n "$2" ]; then
+         BI="--bi=$2"
         else
           usage
           exit 1
@@ -420,7 +430,7 @@ if [ -n "${MEMBIND}" ] || [ -n "${CPUBIND}" ]; then
   NUMCMD="numactl "
 fi
 
-HPCG_CONTROL="${B} ${L2CMP} ${OF} ${WT}"
+HPCG_CONTROL="${B} ${BI} ${L2CMP} ${OF} ${WT}"
 
 if [[ -z "${NX}" || -z "${NY}" || -z "${NZ}" || -z "${RT}" ]]; then
     if [ -z "${DAT}" ]; then

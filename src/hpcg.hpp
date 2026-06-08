@@ -123,6 +123,7 @@ struct HPCG_Params_STRUCT
     local_int_t zl;                  //!< nz for processors in the z dimension with value less than pz
     local_int_t zu;                  //!< nz for processors in the z dimension with value greater than pz
     bool benchmark_mode;             // !< Skips running reference code
+    int benchmark_overhead_iters;    // !< Benchmark mode: extra optimized-CG iterations beyond refMaxIters (--bi)
     bool use_l2compression;          // !< Activates GPU L2 Compression
     bool use_hpcg_mem_reduction;     // !< Not passed as parameter. Set in main to true. Activates aggressive memory
                                      // reduction optimizations

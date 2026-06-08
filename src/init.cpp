@@ -254,7 +254,7 @@ int HPCG_Init(int* argc_p, char*** argv_p, HPCG_Params& params)
     char fname[80];
     int i, j, *iparams;
     char cparams[][9] = {"--nx=", "--ny=", "--nz=", "--rt=", "--npx=", "--npy=", "--npz=", "--b=", "--l2cmp=", "--mr=",
-        "--exm=", "--g2c=", "--ddm=", "--lpm=", "--p2p=", "--of=", "--gss=", "--css=", "--wt="};
+        "--exm=", "--g2c=", "--ddm=", "--lpm=", "--p2p=", "--of=", "--gss=", "--css=", "--wt=", "--bi="};
     time_t rawtime;
     tm* ptm;
     const int nparams = (sizeof cparams) / (sizeof cparams[0]);
@@ -403,6 +403,10 @@ int HPCG_Init(int* argc_p, char*** argv_p, HPCG_Params& params)
 
     // --css
     params.cpu_slice_size = iparams[17] > 0 ? iparams[17] : 8;
+
+    // --bi: benchmark-mode overhead iterations added on top of refMaxIters. Defaults to 0
+    // (i.e. refMaxIters iterations) when the flag is absent or set to 0.
+    params.benchmark_overhead_iters = iparams[19] > 0 ? iparams[19] : 0;
 
     if (params.comm_rank == 0)
     {

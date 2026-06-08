@@ -49,6 +49,7 @@ usage() {
   echo "    --npz          <int>          specifies the process grid Z dimension of the problem"
   echo "    --p2p          <int>          specifies the p2p comm mode: 0 MPI_CPU, 1 MPI_CPU_All2allv, 2 MPI_CUDA_AWARE, 3 MPI_CUDA_AWARE_All2allv, 4 NCCL. Default MPI_CPU"
   echo "    --b            <int>          activates benchmarking mode to bypass CPU reference execution when set to one (--b 1)"
+  echo "    --bi           <int>          benchmarking-mode overhead iterations added on top of refMaxIters (50); optimized CG runs 50 + value iterations (default 0)"
   echo "    --l2cmp        <int>          activates compression in GPU L2 cache when set to one (--l2cmp 1)"
   echo "    --of           <int>          activates generating the log into textfiles, instead of stdout (--of 1)"
   echo "    --gss          <int>          GPU slice size for sliced-ELLPACK format"
@@ -233,6 +234,15 @@ while [ "$1" != "" ]; do
         fi
         shift
         ;;
+     --bi )
+       if [ -n "$2" ]; then
+         BI="--bi=$2"
+        else
+          usage
+          exit 1
+        fi
+        shift
+        ;;
      --l2cmp )
        if [ -n "$2" ]; then
          L2CMP="--l2cmp=$2"
@@ -380,7 +390,7 @@ fi
 # fi
 # export CUDA_VISIBLE_DEVICES=${GPU}
 
-HPCG_CONTROL="${B} ${L2CMP} ${P2P} ${OF} ${NPX} ${NPY} ${NPZ} ${WT}"
+HPCG_CONTROL="${B} ${BI} ${L2CMP} ${P2P} ${OF} ${NPX} ${NPY} ${NPZ} ${WT}"
 
 if [[ -z "${NX}" || -z "${NY}" || -z "${NZ}" || -z "${RT}" ]]; then
     if [ -z "${DAT}" ]; then

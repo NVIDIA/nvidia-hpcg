@@ -40,6 +40,9 @@ Alternatively to input file accepts the following parameters:
            benchmark should run
 --b        activates benchmarking mode to bypass CPU reference execution when 
            set to one (--b=1)
+--bi       in benchmarking mode, the number of overhead optimized-CG iterations
+           added on top of refMaxIters (50). The optimized solver runs
+           50 + --bi iterations per CG set (default 0, i.e. 50 iterations)
 --l2cmp    activates compression in GPU L2 cache when set to one (--l2cmp=1)
 --of       activates generating the log into textfiles, instead of 
            console (--of=1)

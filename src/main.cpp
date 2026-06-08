@@ -153,6 +153,9 @@ int main(int argc, char* argv[])
     Use_Hpcg_Mem_Reduction = true; // params.use_hpcg_mem_reduction;
     P2P_Mode = params.p2_mode;
 
+    // Number of iterations performed by the reference CG, fixed by the HPCG specification.
+    constexpr int refMaxIters = 50;
+
     if (rank == 0)
     {
         printf("Build v0.6.1 \n");
@@ -173,7 +176,11 @@ int main(int argc, char* argv[])
                                               : "GPU+Grace");
 
         if (benchmark_mode)
-            printf(" | Benchmark Mode !!!! CPU reference code is not performed \n");
+            printf(" | Benchmark Mode !!!! CPU reference code is not performed \n"
+                   " | Optimized CG total iterations (--bi overhead %d): %d\n",
+                params.benchmark_overhead_iters, refMaxIters + params.benchmark_overhead_iters);
+        else if (params.benchmark_overhead_iters > 0)
+            printf(" | Warning: --bi is only used in benchmark mode (--b=1); ignoring\n");
 
         if (params.exec_mode == GPUONLY || params.exec_mode == GPUCPU)
             if (Use_Compression)
@@ -533,14 +540,19 @@ int main(int argc, char* argv[])
     int totalNiters_ref = 0;
     double normr = 1.0;
     double normr0 = 1.0;
-    int refMaxIters = 50;
     numberOfCalls = 1; // Only need to run the residual reduction analysis once
 
     // Compute the residual reduction for the natural ordering and reference kernels
     std::vector<double> ref_times(9, 0.0);
     double tolerance = 0.0; // Set tolerance to zero to make all runs do maxIters iterations
     int err_count = 0;
-    double refTolerance = 0.0055;
+    // In benchmark mode the reference CG is skipped, so there is no measured residual
+    // reduction to calibrate against. Rather than relying on a fake tolerance, the
+    // optimized solver runs a fixed iteration count: refMaxIters plus a user-tunable
+    // overhead (--bi), mimicking the extra iterations the optimized (reordered) solver
+    // needs to converge. In normal mode refTolerance is overwritten by the reference run.
+    double refTolerance = 0.0;
+    int benchmarkNiters = refMaxIters + params.benchmark_overhead_iters;
     if (!benchmark_mode)
     {
         for (int i = 0; i < numberOfCalls; ++i)
@@ -698,9 +710,14 @@ int main(int argc, char* argv[])
     double opt_worst_time = 0.0;
     double opt_best_time = 9999999.0;
 
+    // The calibration / warmup-sizing CG converges to refTolerance in normal mode,
+    // but runs a fixed iteration count (benchmarkNiters) in benchmark mode.
+    int calibMaxIters = benchmark_mode ? benchmarkNiters : optMaxIters;
+    double calibTolerance = benchmark_mode ? 0.0 : refTolerance;
+
     std::vector<double> bleh_times(9, 0.0);
     ZeroVector(x); // start x at all zeros
-    ierr = CG(A, data, b, x, optMaxIters, refTolerance, niters, normr, normr0, &bleh_times[0], true, 1);
+    ierr = CG(A, data, b, x, calibMaxIters, calibTolerance, niters, normr, normr0, &bleh_times[0], true, 1);
     int warmupNiters = niters;
 
     /////////////////////
@@ -756,11 +773,12 @@ int main(int argc, char* argv[])
     {
         ZeroVector(x); // start x at all zeros
         double last_cummulative_time = opt_times[0];
-        ierr = CG(A, data, b, x, optMaxIters, refTolerance, niters, normr, normr0, &opt_times[0], true, 0); // TODO:
-                                                                                                            // TRUE
+        ierr = CG(A, data, b, x, calibMaxIters, calibTolerance, niters, normr, normr0, &opt_times[0], true, 0); // TODO:
+                                                                                                                // TRUE
         if (ierr)
             ++err_count; // count the number of errors in CG
-        if (normr / normr0 > refTolerance)
+        // In benchmark mode there is no real tolerance to satisfy (fixed iteration count).
+        if (!benchmark_mode && normr / normr0 > refTolerance)
             ++tolerance_failures; // the number of failures to reduce residual
 
         // pick the largest number of iterations to guarantee convergence
