@@ -60,12 +60,17 @@ extern bool Use_Hpcg_Mem_Reduction; /*USE HPCG aggresive memory reduction*/
   @see GenerateProblem
 */
 
+static size_t s_optimizeProblemMemoryBytes = 0;
+
 #ifdef USE_CUDA
 size_t OptimizeProblemGpu(SparseMatrix& A_in, CGData& data, Vector& b, Vector& x, Vector& xexact)
 {
     // This function can be used to completely transform any part of the data structures.
     // Right now it does nothing, so compiling with a check for unused variables results in complaints
     SparseMatrix* A = &A_in;
+    // Start with AllocateMemOptCuda-retained device memory; add cuSPARSE workspace
+    // buffers (bufferMvA, bufferSvL/U) allocated below as they are queried.
+    size_t mem = EstimateGpuOptMem(A_in);
     local_int_t numberOfMgLevels = 4;
     local_int_t slice_size = A->slice_size;
     for (int level = 0; level < numberOfMgLevels; ++level)
@@ -184,6 +189,7 @@ size_t OptimizeProblemGpu(SparseMatrix& A_in, CGData& data, Vector& b, Vector& x
                 A->cusparseOpt.matL, A->cusparseOpt.vecX, A->cusparseOpt.vecY, CUDA_R_64F, CUSPARSE_SPSV_ALG_DEFAULT,
                 A->cusparseOpt.spsvDescrL, &buffer_size_sv_l));
             CHECK_CUDART(cudaMalloc(&A->bufferSvL, buffer_size_sv_l));
+            mem += buffer_size_sv_l;
         }
         CHECK_CUSPARSE(cusparseSpSV_analysis(cusparsehandle, CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha,
             A->cusparseOpt.matL, A->cusparseOpt.vecX, A->cusparseOpt.vecY, CUDA_R_64F, CUSPARSE_SPSV_ALG_DEFAULT,
@@ -200,6 +206,7 @@ size_t OptimizeProblemGpu(SparseMatrix& A_in, CGData& data, Vector& b, Vector& x
                 A->cusparseOpt.matU, A->cusparseOpt.vecX, A->cusparseOpt.vecY, CUDA_R_64F, CUSPARSE_SPSV_ALG_DEFAULT,
                 A->cusparseOpt.spsvDescrU, &buffer_size_sv_u));
             CHECK_CUDART(cudaMalloc(&A->bufferSvU, buffer_size_sv_u));
+            mem += buffer_size_sv_u;
         }
         CHECK_CUSPARSE(cusparseSpSV_analysis(cusparsehandle, CUSPARSE_OPERATION_NON_TRANSPOSE, &alpha,
             A->cusparseOpt.matU, A->cusparseOpt.vecX, A->cusparseOpt.vecY, CUDA_R_64F, CUSPARSE_SPSV_ALG_DEFAULT,
@@ -208,7 +215,10 @@ size_t OptimizeProblemGpu(SparseMatrix& A_in, CGData& data, Vector& b, Vector& x
             cusparsehandle, A->cusparseOpt.spsvDescrU, A->diagonal, CUSPARSE_SPSV_UPDATE_DIAGONAL));
 
         if (max_buf_size > 0)
+        {
             CHECK_CUDART(cudaMalloc(&(A->bufferMvA), max_buf_size));
+            mem += max_buf_size;
+        }
 
         CHECK_CUSPARSE(cusparseDestroyDnVec(dummy1));
         CHECK_CUSPARSE(cusparseDestroyDnVec(dummy2));
@@ -225,7 +235,7 @@ size_t OptimizeProblemGpu(SparseMatrix& A_in, CGData& data, Vector& b, Vector& x
         A = A->Ac;
     }
 
-    return 0;
+    return mem;
 }
 #endif
 
@@ -419,12 +429,21 @@ size_t OptimizeProblem(SparseMatrix& A_in, CGData& data, Vector& b, Vector& x, V
 #endif
     }
 
+    s_optimizeProblemMemoryBytes = result;
     return result;
 }
 
 // Helper function (see OptimizeProblem.hpp for details)
 double OptimizeProblemMemoryUse(const SparseMatrix& A)
 {
+    if (s_optimizeProblemMemoryBytes > 0)
+        return (double) s_optimizeProblemMemoryBytes;
+
+    // Fallback estimate if called before OptimizeProblem (e.g. quick validation paths).
+#ifdef USE_CUDA
+    if (A.rankType == GPU)
+        return (double) EstimateGpuOptMem(A);
+#endif
 
     return 0.0;
 }

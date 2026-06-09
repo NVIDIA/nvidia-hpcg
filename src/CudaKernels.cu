@@ -242,6 +242,55 @@ void AllocateMemCuda(SparseMatrix& A_in)
     }
 }
 
+// Bytes allocated by one AllocateMemOptCuda multigrid level. Keep in sync with
+// AllocateMemOptCuda below (sellAPermValues and sell{L,U}PermColumns alias
+// gpuAux buffers from AllocateMemCuda and are not counted here).
+static void AccumulateGpuOptMemOptCudaLevel(size_t& opt_mem, local_int_t localNumberOfRows, int slice_size, int level)
+{
+    local_int_t num_blocks = (localNumberOfRows + slice_size - 1) / slice_size;
+    local_int_t paddedRowLen = num_blocks * slice_size;
+    local_int_t estimated_size = EstimateLUmem(localNumberOfRows, paddedRowLen, level, slice_size);
+
+    opt_mem += sizeof(local_int_t) * (paddedRowLen * HPCG_MAX_ROW_LEN + slice_size * HPCG_MAX_ROW_LEN);
+    if (Use_Hpcg_Mem_Reduction)
+        opt_mem += sizeof(double) * estimated_size;
+    else
+        opt_mem += 2 * sizeof(double) * estimated_size;
+
+    opt_mem += 3 * sizeof(local_int_t) * (num_blocks + 1);
+    opt_mem += localNumberOfRows * sizeof(local_int_t);
+    opt_mem += 64 * sizeof(int);
+
+    if (Use_Hpcg_Mem_Reduction && (localNumberOfRows % 8 == 0))
+        opt_mem += 2048 + (8 * sizeof(local_int_t) * size_t(localNumberOfRows));
+}
+
+/*
+    Estimate GPU device memory retained after AllocateMemOptCuda.
+*/
+size_t EstimateGpuOptMem(const SparseMatrix& A_in)
+{
+    const SparseMatrix* A = &A_in;
+    global_int_t nx = A->geom->nx;
+    global_int_t ny = A->geom->ny;
+    global_int_t nz = A->geom->nz;
+
+    local_int_t numberOfMgLevels = 4;
+    size_t opt_mem = 0;
+    for (int level = 0; level < numberOfMgLevels; ++level)
+    {
+        local_int_t localNumberOfRows = nx * ny * nz;
+        AccumulateGpuOptMemOptCudaLevel(opt_mem, localNumberOfRows, A->slice_size, level);
+
+        nx /= 2;
+        ny /= 2;
+        nz /= 2;
+        if (level != numberOfMgLevels - 1)
+            A = A->Ac;
+    }
+    return opt_mem;
+}
+
 /*
     This function allocates GPU device memory needed to optimize the problem
     It creates sliced ellpack data structures for the general, lower, and upper

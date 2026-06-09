@@ -25,7 +25,8 @@ cudaError_t cudaMallocCompressible(void** adr, size_t size);
 cudaError_t cudaFreeCompressible(void* ptr, size_t size);
 
 ///////// Allocate CUDA Memory for data structures //
-local_int_t EstimateLUmem(local_int_t n, local_int_t padded_n, local_int_t level);
+local_int_t EstimateLUmem(local_int_t n, local_int_t padded_n, local_int_t level, int slice_size);
+size_t EstimateGpuOptMem(const SparseMatrix& A_in);
 void AllocateMemCuda(SparseMatrix& A_in);
 void AllocateMemOptCuda(SparseMatrix& A_in);
 
