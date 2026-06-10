@@ -242,8 +242,10 @@ size_t OptimizeProblemGpu(SparseMatrix& A_in, CGData& data, Vector& b, Vector& x
 #ifdef USE_GRACE
 size_t OptimizeProblemCpu(SparseMatrix& A_in, CGData& data, Vector& b, Vector& x, Vector& xexact)
 {
-    // Initialize data structures
-    size_t mem = AllocateMemCpu(A_in);
+    // Start with AllocateMemCpu-retained host memory; add NVPL SpSV buffers
+    // allocated below as they are queried.
+    size_t mem = EstimateCpuOptMem(A_in);
+    AllocateMemCpu(A_in);
 
     SparseMatrix* A = &A_in;
     local_int_t numberOfMgLevels = 4;
@@ -443,6 +445,10 @@ double OptimizeProblemMemoryUse(const SparseMatrix& A)
 #ifdef USE_CUDA
     if (A.rankType == GPU)
         return (double) EstimateGpuOptMem(A);
+#endif
+#ifdef USE_GRACE
+    if (A.rankType == CPU)
+        return (double) EstimateCpuOptMem(A);
 #endif
 
     return 0.0;

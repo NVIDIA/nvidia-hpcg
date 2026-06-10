@@ -20,13 +20,98 @@
 
 extern bool Use_Hpcg_Mem_Reduction; /*USE HPCG aggresive memory reduction*/
 
+// Initial color count before ColorMatrixCpu runs (two colors per axis).
+static constexpr int kCpuOptInitialTotalColors = 2 * 2 * 2;
+
+/*
+    Size 512x512x288 is the largest int32 local problem size with
+        lowest convergence rate. Hard-coded size is used to avoid
+        allocate memory in the middle of the Optimization phase.
+    Size 512x512x296 is the largest possible int32 local problem
+     size.
+    Hard-coding is used only when Use_Hpcg_Mem_Reduction is set
+     to true in src/main. Other wise we use an estimation div-
+     isor for L and U matrices.
+*/
+static local_int_t EstimateCpuLUmem(size_t nrow, size_t padded_nrow, int level)
+{
+    bool power_two = (nrow & (nrow - 1)) == 0;
+    float divisor = nrow < 8192 ? 1.0 : (power_two ? 1.85 : 1.60);
+    local_int_t estimated_size = (padded_nrow * HPCG_MAX_ROW_LEN * 1.0f) / divisor;
+    local_int_t v288x512x512[] = {1057190464, 132276512, 16615072, 2074384};
+    local_int_t v296x512x512[] = {1095636608, 136618560, 16967616, 2883872};
+    local_int_t* v = nrow == 288 * 512 * 512 ? v288x512x512
+        : nrow == 296 * 512 * 512            ? v296x512x512
+        : nullptr;
+    if (v != nullptr)
+    {
+        if (level == 0)
+            estimated_size = v[0];
+        else if (level == 1)
+            estimated_size = v[1];
+        else if (level == 2)
+            estimated_size = v[2];
+        else if (level == 3)
+            estimated_size = v[3];
+    }
+    return estimated_size;
+}
+
+// Bytes allocated by one AllocateMemCpu multigrid level. Keep in sync with
+// AllocateMemCpu below.
+static void AccumulateCpuOptMemAllocateCpuLevel(
+    size_t& opt_mem, size_t nrow, size_t ncol, size_t extNnz, int slice_size, int level)
+{
+    opt_mem += nrow * sizeof(double); // diagonal
+    opt_mem += nrow * sizeof(double); // tempBuffer
+    opt_mem += 3 * ncol * sizeof(local_int_t); // ref2opt, opt2ref, f2cPerm
+    opt_mem += 2 * nrow * sizeof(local_int_t); // color, firstRowOfColor
+    opt_mem += kCpuOptInitialTotalColors * sizeof(local_int_t); // nRowsWithColor
+    opt_mem += (nrow + 1) * sizeof(local_int_t); // csrExtOffsets
+    opt_mem += extNnz * sizeof(local_int_t); // csrExtColumns
+    opt_mem += extNnz * sizeof(double); // csrExtValues
+
+    size_t num_slices = (nrow + slice_size - 1) / slice_size;
+    size_t padded_nrow = num_slices * slice_size;
+    local_int_t estimated_size = EstimateCpuLUmem(nrow, padded_nrow, level);
+
+    opt_mem += 3 * (num_slices + 1) * sizeof(local_int_t); // sell{A,L,U}SliceMrl
+    opt_mem += padded_nrow * HPCG_MAX_ROW_LEN * sizeof(local_int_t); // sellAPermColumns
+    opt_mem += 2 * estimated_size * sizeof(local_int_t); // sell{L,U}PermColumns
+    opt_mem += padded_nrow * HPCG_MAX_ROW_LEN * sizeof(double); // sellAPermValues
+    if (Use_Hpcg_Mem_Reduction)
+        opt_mem += estimated_size * sizeof(double); // sell{L,U}PermValues alias
+    else
+        opt_mem += 2 * estimated_size * sizeof(double);
+
+    if (Use_Hpcg_Mem_Reduction && nrow % 8 == 0)
+        opt_mem += 2048 + 8 * sizeof(local_int_t) * nrow; // bufferSvL/U (shared)
+}
+
+/*
+    Estimate host memory retained after AllocateMemCpu.
+*/
+size_t EstimateCpuOptMem(const SparseMatrix& A_in)
+{
+    const SparseMatrix* A = &A_in;
+    local_int_t numberOfMgLevels = 4;
+    int slice_size = A->slice_size;
+    size_t opt_mem = 0;
+    for (int level = 0; level < numberOfMgLevels; ++level)
+    {
+        AccumulateCpuOptMemAllocateCpuLevel(
+            opt_mem, A->localNumberOfRows, A->localNumberOfColumns, A->extNnz, slice_size, level);
+        A = A->Ac;
+    }
+    return opt_mem;
+}
+
 //////////////////////// Allocate CPU/Grace Memory data structures /////////////
-size_t AllocateMemCpu(SparseMatrix& A_in)
+void AllocateMemCpu(SparseMatrix& A_in)
 {
     SparseMatrix* A = &A_in;
     local_int_t numberOfMgLevels = 4;
     local_int_t slice_size = A->slice_size;
-    size_t opt_mem = 0;
     for (int level = 0; level < numberOfMgLevels; ++level)
     {
         A->level = level;
@@ -39,7 +124,7 @@ size_t AllocateMemCpu(SparseMatrix& A_in)
         A->ref2opt = new local_int_t[ncol];
         A->opt2ref = new local_int_t[ncol];
         A->f2cPerm = new local_int_t[ncol];
-        A->totalColors = 2 * 2 * 2; // two colors per axis
+        A->totalColors = kCpuOptInitialTotalColors; // two colors per axis
         A->cpuAux.color = new local_int_t[nrow];
         A->cpuAux.firstRowOfColor = new local_int_t[nrow];
         A->cpuAux.nRowsWithColor = new local_int_t[A->totalColors];
@@ -49,42 +134,9 @@ size_t AllocateMemCpu(SparseMatrix& A_in)
         A->csrExtColumns = new local_int_t[A->extNnz];
         A->csrExtValues = new double[A->extNnz];
 
-        opt_mem += 2 * nrow * sizeof(double);
-        opt_mem += 3 * ncol * sizeof(local_int_t);
-        opt_mem += 4 * nrow * sizeof(local_int_t);
-
         size_t num_slices = (nrow + slice_size - 1) / slice_size;
         size_t padded_nrow = num_slices * slice_size;
-
-        /*
-            Size 512x512x288 is the largest int32 local problem size with
-                lowest convergence rate. Hard-coded size is used to avoid
-                allocate memory in the middle of the Optimization phase.
-            Size 512x512x296 is the largest possible int32 local problem
-             size.
-            Hard-coding is used only when Use_Hpcg_Mem_Reduction is set
-             to true in src/main. Other wise we use an estimation div-
-             isor for L and U matrices.
-        */
-        bool power_two = (nrow & (nrow - 1)) == 0;
-        float divisor = nrow < 8192 ? 1.0 : (power_two? 1.85 : 1.60);
-        local_int_t estimated_size = (padded_nrow * HPCG_MAX_ROW_LEN * 1.0f) / divisor;
-        local_int_t v288x512x512[] = {1057190464, 132276512, 16615072, 2074384};
-        local_int_t v296x512x512[] = {1095636608, 136618560, 16967616, 2883872};
-        local_int_t* v = nrow == 288 * 512 * 512 ? v288x512x512
-            : nrow == 296 * 512 * 512            ? v296x512x512
-            : nullptr;
-        if (v != nullptr)
-        {
-            if (level == 0)
-                estimated_size = v[0];
-            else if (level == 1)
-                estimated_size = v[1];
-            else if (level == 2)
-                estimated_size = v[2];
-            else if (level == 3)
-                estimated_size = v[3];
-        }
+        local_int_t estimated_size = EstimateCpuLUmem(nrow, padded_nrow, level);
 
         A->sellASliceMrl = new local_int_t[num_slices + 1];
         A->sellLSliceMrl = new local_int_t[num_slices + 1];
@@ -100,35 +152,24 @@ size_t AllocateMemCpu(SparseMatrix& A_in)
         {
             // This optimization benefits from strictly L and U
             A->sellUPermValues = A->sellLPermValues;
-            opt_mem += 1 * estimated_size * (sizeof(double));
         }
         else
         {
             A->sellUPermValues = new double[estimated_size];
-            opt_mem += 2 * estimated_size * (sizeof(double));
         }
-
-        opt_mem += 3 * num_slices * sizeof(local_int_t);
-        opt_mem += padded_nrow * HPCG_MAX_ROW_LEN * (sizeof(double) + sizeof(local_int_t));
-        opt_mem += 2 * estimated_size * sizeof(local_int_t);
 
         // SpSV related memory optimization
         // HPCG estimated buffer size
         if (Use_Hpcg_Mem_Reduction && nrow % 8 == 0)
         {
             // Helps SpSV reduce memory footprint/HPCG specific
-            opt_mem += 2048 + 8 * sizeof(local_int_t) * nrow;
             A->bufferSvL = new char[2048 + 8 * sizeof(local_int_t) * nrow];
             // Same buffer since they both share the same diagional
             A->bufferSvU = A->bufferSvL;
         }
 
-        // Temporal vectors for permutation
-        opt_mem += 2 * A->localNumberOfRows * sizeof(double);
-
         A = A->Ac;
     }
-    return opt_mem;
 }
 
 //////////////////////// Deallocate CPU/Grace Memory data structures //////////
