@@ -117,6 +117,9 @@ bool Use_Compression;
 // USE HPCG aggresive memory reduction
 bool Use_Hpcg_Mem_Reduction;
 
+// Runtime-selected GPU Sliced-ELL index-width mode (--mi). See src/IndexMode.hpp.
+IndexMode Index_Mode = IndexMode::I32_I32;
+
 #ifndef HPCG_NO_MPI
 // Used to find ranks for CPU and GPU programs
 int* rankToId_h;
@@ -152,6 +155,7 @@ int main(int argc, char* argv[])
     Use_Compression = params.use_l2compression;
     Use_Hpcg_Mem_Reduction = true; // params.use_hpcg_mem_reduction;
     P2P_Mode = params.p2_mode;
+    Index_Mode = params.index_mode;
 
     // Number of iterations performed by the reference CG, fixed by the HPCG specification.
     constexpr int refMaxIters = 50;
@@ -190,6 +194,8 @@ int main(int argc, char* argv[])
         #ifdef INDEX_64
             printf(" | Using INT64 Indexing \n");
         #endif
+        if (params.exec_mode == GPUONLY || params.exec_mode == GPUCPU)
+            printf(" | GPU Sliced-ELL index mode (--mi %d): %s\n", (int) Index_Mode, toString(Index_Mode));
     }
 
     // Check P2P comm mode
@@ -387,6 +393,7 @@ int main(int argc, char* argv[])
 #ifdef USE_CUDA
         A.rankType = GPU;
         A.slice_size = params.gpu_slice_size;
+        A.index_mode = Index_Mode; // Propagated to coarse levels in AllocateMemCuda.
         cublasCreate(&(cublashandle));
         CHECK_CUSPARSE(cusparseCreate(&(cusparsehandle)));
         CHECK_CUDART(cudaStreamCreate(&(stream)));

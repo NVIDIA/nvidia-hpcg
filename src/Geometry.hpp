@@ -52,6 +52,16 @@ typedef long long local_int_t;
 #endif
 
 /*!
+  Type for GPU Sliced-ELL / CSR-scratch offsets and nonzero counters.
+
+  These quantities (flat value-array offsets, cumulative per-row nonzero
+  counts, per-slice offsets) can exceed 2^31 for large local problems
+  (e.g. 512^3 has ~3.6e9 local nonzeros), so they are always 64-bit,
+  independent of local_int_t. Column/row *indices* stay local_int_t.
+*/
+typedef long long slice_ptr_t;
+
+/*!
   This defines the type for integers that have global dimension
 
   Define as "long long" when global problem dimension is > 2^31

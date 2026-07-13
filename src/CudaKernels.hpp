@@ -25,7 +25,7 @@ cudaError_t cudaMallocCompressible(void** adr, size_t size);
 cudaError_t cudaFreeCompressible(void* ptr, size_t size);
 
 ///////// Allocate CUDA Memory for data structures //
-local_int_t EstimateLUmem(local_int_t n, local_int_t padded_n, local_int_t level, int slice_size);
+slice_ptr_t EstimateLUmem(local_int_t n, local_int_t padded_n, local_int_t level, int slice_size);
 size_t EstimateGpuOptMem(const SparseMatrix& A_in);
 void AllocateMemCuda(SparseMatrix& A_in);
 void AllocateMemOptCuda(SparseMatrix& A_in);
@@ -42,7 +42,7 @@ void SetupHaloCuda(SparseMatrix& A, local_int_t sendbufld, local_int_t* sendlen,
 void ExtToLocMapCuda(
     local_int_t localNumberOfRows, local_int_t str, local_int_t end, local_int_t* extToLocMap, local_int_t* eltsToRecv);
 void ExtTolocCuda(local_int_t localNumberOfRows, int neighborId, local_int_t ext_nnz, local_int_t* csr_ext_columns,
-    double* csr_ext_values, local_int_t* ext2csr_offsets, local_int_t* extToLocMap, local_int_t* csrColumns);
+    double* csr_ext_values, slice_ptr_t* ext2csr_offsets, local_int_t* extToLocMap, local_int_t* csrColumns);
 void PackSendBufferCuda(const SparseMatrix& A, Vector& x, bool cpu_data, cudaStream_t stream1);
 void ExchangeHaloCuda(const SparseMatrix& A, Vector& x, cudaStream_t stream1, int use_ibarrier = 0);
 
@@ -52,18 +52,26 @@ void ColorMatrixCuda(double* A_vals, local_int_t* A_col, local_int_t* nnzPerRow,
     int* num_colors, int* count_colors, int max_colors, local_int_t* ref2opt, local_int_t* opt2ref, int rank, int nx,
     int* rowhash);
 void PermElemToSendCuda(local_int_t totalToBeSent, local_int_t* elementsToSend, local_int_t* perm);
+// The SELL slice-offset and column device arrays are width-agnostic (void*); the
+// concrete int32/int64 element type is chosen at runtime from `mode` inside the
+// wrapper via dispatchIndexMode (see IndexMode.hpp).
 void EllPermColumnsValuesCuda(local_int_t localNumberOfRows, local_int_t* nnzPerRow, local_int_t* csrColumns,
-    double* csrValues, local_int_t* permOffsets, local_int_t* permColumns, double* permValues, local_int_t* opt2ref,
-    local_int_t* ref2opt, local_int_t* diagonalIdx, local_int_t* permLOffsets, local_int_t* permUOffsets, bool diag);
-void TransposeCuda(local_int_t n, local_int_t slice_size, local_int_t* sellCollIndex, double* sellValues);
-void EllMaxRowLenPerBlockCuda(local_int_t nrow, int sliceSize, local_int_t* sellLPermOffsets,
-    local_int_t* sellUPermOffsets, local_int_t* sellLSliceMrl, local_int_t* sellUSliceMrl);
-void PrefixsumCuda(local_int_t localNumberOfRows, local_int_t* arr);
-void MultiplyBySliceSizeCUDA(local_int_t nrow, int slice_size, local_int_t* arr);
-void CreateAMatrixSliceOffsetsCuda(local_int_t nrow, local_int_t slice_size, local_int_t* arr);
-void CreateSellLUColumnsValuesCuda(const local_int_t n, int sliceSize, local_int_t* columns, double* values,
-    local_int_t* sellLSliceOffset, local_int_t* sellLColumns, double* sellLValues, local_int_t* sellUSliceOffset,
-    local_int_t* sellUColumns, double* sellUValues, int level);
+    double* csrValues, slice_ptr_t* permOffsets, void* permColumns, double* permValues, local_int_t* opt2ref,
+    local_int_t* ref2opt, slice_ptr_t* diagonalIdx, slice_ptr_t* permLOffsets, slice_ptr_t* permUOffsets, bool diag,
+    IndexMode mode);
+void TransposeCuda(local_int_t n, local_int_t slice_size, void* sellCollIndex, double* sellValues, IndexMode mode);
+void EllMaxRowLenPerBlockCuda(local_int_t nrow, int sliceSize, slice_ptr_t* sellLPermOffsets,
+    slice_ptr_t* sellUPermOffsets, void* sellLSliceMrl, void* sellUSliceMrl, IndexMode mode);
+void PrefixsumCuda(local_int_t localNumberOfRows, void* arr, IndexMode mode);
+// 64-bit sum of a slice_ptr_t device array (exact per-matrix nnz for cuSPARSE).
+slice_ptr_t SumSlicePtrCuda(const slice_ptr_t* arr, local_int_t n);
+void MultiplyBySliceSizeCUDA(local_int_t nrow, int slice_size, void* arr, IndexMode mode);
+void CreateAMatrixSliceOffsetsCuda(local_int_t nrow, local_int_t slice_size, void* arr, IndexMode mode);
+void CreateSellLUColumnsValuesCuda(const local_int_t n, int sliceSize, void* columns, double* values,
+    void* sellLSliceOffset, void* sellLColumns, double* sellLValues, void* sellUSliceOffset,
+    void* sellUColumns, double* sellUValues, int level, IndexMode mode);
+// Reads slice-offset element `index` from a width-agnostic offset array, widened to 64-bit.
+long long ReadSellOffsetCuda(const void* arr, size_t index, IndexMode mode);
 void PermVectorCuda(local_int_t* perm, Vector& x, local_int_t length);
 void F2cPermCuda(local_int_t nrow_c, local_int_t* f2c, local_int_t* f2cPerm, local_int_t* permF, local_int_t* ipermC);
 

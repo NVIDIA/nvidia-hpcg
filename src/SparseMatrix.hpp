@@ -49,6 +49,7 @@
 
 #include "Cuda.hpp"
 #include "Geometry.hpp"
+#include "IndexMode.hpp"
 #include "MGData.hpp"
 #include "Vector.hpp"
 #include <cassert>
@@ -83,19 +84,41 @@ struct CUSPARSE_STRUCT
     cusparseSpSVDescr_t spsvDescrL, spsvDescrU;
 };
 
+/*!
+  Width-agnostic device storage for the GPU Sliced-ELL operator arrays.
+
+  The concrete element width (int32 vs int64) of the slice-offset and column
+  arrays is chosen at run time from SparseMatrix::index_mode (see IndexMode.hpp).
+  Values arrays remain double and stay in the typed SparseMatrix fields. Raw
+  casts of these pointers are confined to CudaKernels.cu and OptimizeProblem.cpp.
+ */
+struct SellDeviceArrays
+{
+    void* aSliceOffsets = nullptr; // matA slice offsets (offset width)
+    void* lSliceOffsets = nullptr; // matL slice offsets (offset width)
+    void* uSliceOffsets = nullptr; // matU slice offsets (offset width)
+    void* aColumns = nullptr;      // matA permuted columns (column width)
+    void* lColumns = nullptr;      // matL permuted columns (column width)
+    void* uColumns = nullptr;      // matU permuted columns (column width)
+
+    // True when lColumns/uColumns own their allocation (int64 columns) rather
+    // than aliasing gpuAux.columns (int32 columns). Governs cudaFree in cleanup.
+    bool ownsLuColumns = false;
+};
+
 struct GPU_AUX_STRUCT
 {
     // Uncolored row related info
     local_int_t* nnzPerRow;
     local_int_t* columns;
     double* values;
-    local_int_t* csrAPermOffsets;
-    local_int_t* csrLPermOffsets;
-    local_int_t* csrUPermOffsets;
-    local_int_t* diagonalIdx;
+    slice_ptr_t* csrAPermOffsets;
+    slice_ptr_t* csrLPermOffsets;
+    slice_ptr_t* csrUPermOffsets;
+    slice_ptr_t* diagonalIdx;
 
     // Sliced EllPACK Aux
-    local_int_t* sellADiagonalIdx;
+    slice_ptr_t* sellADiagonalIdx;
 
     // Auxiliary data
     local_int_t* f2c;
@@ -105,7 +128,7 @@ struct GPU_AUX_STRUCT
 
     // MULTI-GPU Aux data
     local_int_t* map;
-    local_int_t* ext2csrOffsets;
+    slice_ptr_t* ext2csrOffsets;
     local_int_t* elementsToSend;
     global_int_t* localToGlobalMap;
     local_int_t compressNumberOfRows;
@@ -201,7 +224,7 @@ struct SparseMatrix_STRUCT
     char* bufferMvU = nullptr;
 
     // MULTI-GPU data
-    local_int_t* csrExtOffsets;
+    slice_ptr_t* csrExtOffsets;
     local_int_t* csrExtColumns;
     double* csrExtValues;
     double* tempBuffer;
@@ -215,6 +238,8 @@ struct SparseMatrix_STRUCT
 #ifdef USE_CUDA
     CUSPARSE_STRUCT cusparseOpt;
     GPU_AUX_STRUCT gpuAux;
+    IndexMode index_mode = IndexMode::I32_I32; // GPU Sliced-ELL index widths (--mi)
+    SellDeviceArrays sellDev;                  // Width-agnostic SELL offset/column device arrays
 #endif
 
 #ifdef USE_GRACE

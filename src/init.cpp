@@ -254,7 +254,7 @@ int HPCG_Init(int* argc_p, char*** argv_p, HPCG_Params& params)
     char fname[80];
     int i, j, *iparams;
     char cparams[][9] = {"--nx=", "--ny=", "--nz=", "--rt=", "--npx=", "--npy=", "--npz=", "--b=", "--l2cmp=", "--mr=",
-        "--exm=", "--g2c=", "--ddm=", "--lpm=", "--p2p=", "--of=", "--gss=", "--css=", "--wt=", "--bi="};
+        "--exm=", "--g2c=", "--ddm=", "--lpm=", "--p2p=", "--of=", "--gss=", "--css=", "--wt=", "--bi=", "--mi="};
     time_t rawtime;
     tm* ptm;
     const int nparams = (sizeof cparams) / (sizeof cparams[0]);
@@ -407,6 +407,10 @@ int HPCG_Init(int* argc_p, char*** argv_p, HPCG_Params& params)
     // --bi: benchmark-mode overhead iterations added on top of refMaxIters. Defaults to 0
     // (i.e. refMaxIters iterations) when the flag is absent or set to 0.
     params.benchmark_overhead_iters = iparams[19] > 0 ? iparams[19] : 0;
+
+    // --mi: GPU Sliced-ELL index-width mode (0 int32/int32, 1 int64 offsets/int32 columns,
+    // 2 int64/int64). Runtime-selectable; defaults to legacy int32/int32.
+    params.index_mode = indexModeFromInt(iparams[20]);
 
     if (params.comm_rank == 0)
     {

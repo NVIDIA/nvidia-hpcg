@@ -89,63 +89,70 @@ size_t OptimizeProblemGpu(SparseMatrix& A_in, CGData& data, Vector& b, Vector& x
         A->totalColors = totalColors;
         PermElemToSendCuda(A->totalToBeSent, A->gpuAux.elementsToSend, A->ref2opt);
 
+        // Runtime-selected SELL index widths for this matrix (see IndexMode.hpp).
+        const IndexMode mode = A->index_mode;
+        const size_t colBytes = columnIndexBytes(mode);
+        const size_t offBytes = offsetIndexBytes(mode);
+
         // Create (S)ELL
         local_int_t TranslateIndex = slice_size * HPCG_MAX_ROW_LEN;
-        local_int_t* translated_ell_col_index = A->sellAPermColumns + TranslateIndex;
+        void* translated_ell_col_index = byteOffset(A->sellDev.aColumns, (size_t) TranslateIndex, colBytes);
         double* translated_ell_values = A->sellAPermValues + TranslateIndex;
 
         EllPermColumnsValuesCuda(nrow, A->gpuAux.nnzPerRow, A->gpuAux.columns, A->gpuAux.values,
             A->gpuAux.csrAPermOffsets, translated_ell_col_index, translated_ell_values, A->opt2ref, A->ref2opt,
-            A->gpuAux.sellADiagonalIdx, A->gpuAux.csrLPermOffsets, A->gpuAux.csrUPermOffsets, false);
+            A->gpuAux.sellADiagonalIdx, A->gpuAux.csrLPermOffsets, A->gpuAux.csrUPermOffsets, false, mode);
 
         // Coloumn mojor blocked/sliced ellpack
-        TransposeCuda(nrow, slice_size, A->sellAPermColumns, A->sellAPermValues);
+        TransposeCuda(nrow, slice_size, A->sellDev.aColumns, A->sellAPermValues, mode);
 
         // Per block max row len
         local_int_t num_slices = (nrow + slice_size - 1) / slice_size;
         EllMaxRowLenPerBlockCuda(nrow, slice_size, A->gpuAux.csrLPermOffsets, A->gpuAux.csrUPermOffsets,
-            A->sellLSliceMrl, A->sellUSliceMrl);
+            A->sellDev.lSliceOffsets, A->sellDev.uSliceOffsets, mode);
 
         // Find prefix sum for sliced ell
-        PrefixsumCuda(num_slices, A->sellLSliceMrl);
-        MultiplyBySliceSizeCUDA(num_slices, slice_size, A->sellLSliceMrl + 1);
+        PrefixsumCuda(num_slices, A->sellDev.lSliceOffsets, mode);
+        MultiplyBySliceSizeCUDA(num_slices, slice_size, byteOffset(A->sellDev.lSliceOffsets, 1, offBytes), mode);
 
-        PrefixsumCuda(num_slices, A->sellUSliceMrl);
-        MultiplyBySliceSizeCUDA(num_slices, slice_size, A->sellUSliceMrl + 1);
+        PrefixsumCuda(num_slices, A->sellDev.uSliceOffsets, mode);
+        MultiplyBySliceSizeCUDA(num_slices, slice_size, byteOffset(A->sellDev.uSliceOffsets, 1, offBytes), mode);
 
         // Set the general matrix slice_offsets
-        CreateAMatrixSliceOffsetsCuda(num_slices + 1, A->slice_size, A->sellASliceMrl);
+        CreateAMatrixSliceOffsetsCuda(num_slices + 1, A->slice_size, A->sellDev.aSliceOffsets, mode);
 
         // Lower Upper ELL variant parts
-        CreateSellLUColumnsValuesCuda(nrow, slice_size, A->sellAPermColumns, A->sellAPermValues, A->sellLSliceMrl,
-            A->sellLPermColumns, A->sellLPermValues, A->sellUSliceMrl, A->sellUPermColumns, A->sellUPermValues, level);
+        CreateSellLUColumnsValuesCuda(nrow, slice_size, A->sellDev.aColumns, A->sellAPermValues,
+            A->sellDev.lSliceOffsets, A->sellDev.lColumns, A->sellLPermValues, A->sellDev.uSliceOffsets,
+            A->sellDev.uColumns, A->sellUPermValues, level, mode);
 
         local_int_t sell_slices = (nrow + slice_size - 1) / slice_size;
-        const local_int_t half_nnz = (A->localNumberOfNonzeros - nrow - A->extNnz) / 2;
 
-        local_int_t sell_l_nnz = 0;
-        CHECK_CUDART(cudaMemcpyAsync(
-            &sell_l_nnz, &(A->sellLSliceMrl[sell_slices]), sizeof(local_int_t), cudaMemcpyDeviceToHost, stream));
+        // Actual (non-padded) L/U/A nonzero counts for the cuSPARSE descriptors.
+        // Derived from the per-row L/U counts in 64-bit; the int32
+        // localNumberOfNonzeros wraps negative for local problems > 2^31 nnz.
+        const slice_ptr_t half_nnz_l = SumSlicePtrCuda(A->gpuAux.csrLPermOffsets, nrow);
+        const slice_ptr_t half_nnz_u = SumSlicePtrCuda(A->gpuAux.csrUPermOffsets, nrow);
+        const slice_ptr_t matA_nnz = half_nnz_l + half_nnz_u + (slice_ptr_t) nrow + (slice_ptr_t) A->extNnz;
 
-        local_int_t sell_u_nnz = 0;
-        CHECK_CUDART(cudaMemcpyAsync(
-            &sell_u_nnz, &(A->sellUSliceMrl[sell_slices]), sizeof(local_int_t), cudaMemcpyDeviceToHost, stream));
+        // Total stored nnz for L/U: last slice offset, read at the mode's element width.
+        const long long sell_l_nnz = ReadSellOffsetCuda(A->sellDev.lSliceOffsets, (size_t) sell_slices, mode);
+        const long long sell_u_nnz = ReadSellOffsetCuda(A->sellDev.uSliceOffsets, (size_t) sell_slices, mode);
 
-        auto INDEX_TYPE = CUSPARSE_INDEX_32I;
-#ifdef INDEX_64 // In src/Geometry
-        INDEX_TYPE = CUSPARSE_INDEX_64I;
-#endif
-        CHECK_CUSPARSE(cusparseCreateSlicedEll(&(A->cusparseOpt.matL), nrow, nrow, half_nnz, sell_l_nnz, slice_size,
-            A->sellLSliceMrl, A->sellLPermColumns, A->sellLPermValues, INDEX_TYPE, INDEX_TYPE, CUSPARSE_INDEX_BASE_ZERO,
-            CUDA_R_64F));
+        const cusparseIndexType_t offsetType = offsetCusparseIndexType(mode);
+        const cusparseIndexType_t colType = columnCusparseIndexType(mode);
+        CHECK_CUSPARSE(cusparseCreateSlicedEll(&(A->cusparseOpt.matL), nrow, nrow, half_nnz_l, sell_l_nnz, slice_size,
+            A->sellDev.lSliceOffsets, A->sellDev.lColumns, A->sellLPermValues, offsetType, colType,
+            CUSPARSE_INDEX_BASE_ZERO, CUDA_R_64F));
 
-        CHECK_CUSPARSE(cusparseCreateSlicedEll(&(A->cusparseOpt.matU), nrow, nrow, half_nnz, sell_u_nnz, slice_size,
-            A->sellUSliceMrl, A->sellUPermColumns, A->sellUPermValues, INDEX_TYPE, INDEX_TYPE, CUSPARSE_INDEX_BASE_ZERO,
-            CUDA_R_64F));
+        CHECK_CUSPARSE(cusparseCreateSlicedEll(&(A->cusparseOpt.matU), nrow, nrow, half_nnz_u, sell_u_nnz, slice_size,
+            A->sellDev.uSliceOffsets, A->sellDev.uColumns, A->sellUPermValues, offsetType, colType,
+            CUSPARSE_INDEX_BASE_ZERO, CUDA_R_64F));
 
-        local_int_t sell_nnz = sell_slices * slice_size * HPCG_MAX_ROW_LEN;
-        CHECK_CUSPARSE(cusparseCreateSlicedEll(&(A->cusparseOpt.matA), nrow, nrow, A->localNumberOfNonzeros, sell_nnz,
-            slice_size, A->sellASliceMrl, A->sellAPermColumns, A->sellAPermValues, INDEX_TYPE, INDEX_TYPE,
+        // Padded A storage size can exceed 2^31: compute in 64-bit.
+        const long long sell_nnz = (long long) sell_slices * slice_size * HPCG_MAX_ROW_LEN;
+        CHECK_CUSPARSE(cusparseCreateSlicedEll(&(A->cusparseOpt.matA), nrow, nrow, matA_nnz, sell_nnz,
+            slice_size, A->sellDev.aSliceOffsets, A->sellDev.aColumns, A->sellAPermValues, offsetType, colType,
             CUSPARSE_INDEX_BASE_ZERO, CUDA_R_64F));
 
         double alpha = 1.0, beta = 0.0;

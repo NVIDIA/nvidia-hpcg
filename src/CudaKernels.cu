@@ -143,10 +143,14 @@ cudaError_t cudaFreeCompressible(void* ptr, size_t size)
     This functions estimates the neede memory for SELL L and U matrices
     Helps reduce memory footprint
 */
-local_int_t EstimateLUmem(local_int_t n, local_int_t padded_n, local_int_t level, int slice_size) {
+slice_ptr_t EstimateLUmem(local_int_t n, local_int_t padded_n, local_int_t level, int slice_size) {
     bool power_two = (n & (n - 1)) == 0;
     float divisor = n <= slice_size * 6 ? 1.0 : (power_two? 1.85 : 1.60);
-    local_int_t estimated_size = (padded_n * HPCG_MAX_ROW_LEN * 1.0f) / divisor;
+    // Compute the padded storage estimate in 64-bit: padded_n * HPCG_MAX_ROW_LEN
+    // (and the estimate itself) exceeds 2^31 for large local problems
+    // (e.g. 1024x512x512 -> ~3.9e9), so both the intermediate and the result
+    // must be 64-bit or they overflow.
+    slice_ptr_t estimated_size = (slice_ptr_t) ((slice_ptr_t) padded_n * HPCG_MAX_ROW_LEN * 1.0f / divisor);
     local_int_t v288x512x512[] = {1057190464, 132276512, 16615072, 2074384};
     local_int_t v296x512x512[] = {1095636608, 136618560, 16967616, 2883872};
     local_int_t* v = n == 288 * 512 * 512 ? v288x512x512
@@ -179,23 +183,25 @@ void AllocateMemCuda(SparseMatrix& A_in)
 
     local_int_t numberOfMgLevels = 4;
     local_int_t slice_size = A->slice_size;
+    IndexMode index_mode = A->index_mode; // Propagate the runtime index mode to every MG level.
     CHECK_CUDART(cudaMalloc((void**) &(ranktoId), sizeof(local_int_t) * (A->geom->size + 1)));
 
     for (int level = 0; level < numberOfMgLevels; ++level)
     {
         A->level = level;
         A->slice_size = slice_size;
+        A->index_mode = index_mode;
         local_int_t localNumberOfRows = nx * ny * nz;
 
         size_t num_blocks = (localNumberOfRows + slice_size - 1) / slice_size;
         size_t paddedRowLen = num_blocks * slice_size;
 
         CHECK_CUDART(cudaMalloc((void**) &(A->gpuAux.nnzPerRow), sizeof(local_int_t) * (localNumberOfRows + 1)));
-        CHECK_CUDART(cudaMalloc((void**) &(A->gpuAux.csrLPermOffsets), sizeof(local_int_t) * (localNumberOfRows + 1)));
-        CHECK_CUDART(cudaMalloc((void**) &(A->gpuAux.csrUPermOffsets), sizeof(local_int_t) * (localNumberOfRows + 1)));
+        CHECK_CUDART(cudaMalloc((void**) &(A->gpuAux.csrLPermOffsets), sizeof(slice_ptr_t) * (localNumberOfRows + 1)));
+        CHECK_CUDART(cudaMalloc((void**) &(A->gpuAux.csrUPermOffsets), sizeof(slice_ptr_t) * (localNumberOfRows + 1)));
         CHECK_CUDART(cudaMalloc((void**) &(A->gpuAux.map), sizeof(local_int_t) * (localNumberOfRows + 1)));
-        CHECK_CUDART(cudaMalloc((void**) &(A->csrExtOffsets), sizeof(local_int_t) * (localNumberOfRows + 1)));
-        CHECK_CUDART(cudaMalloc((void**) &(A->gpuAux.diagonalIdx), sizeof(local_int_t) * localNumberOfRows));
+        CHECK_CUDART(cudaMalloc((void**) &(A->csrExtOffsets), sizeof(slice_ptr_t) * (localNumberOfRows + 1)));
+        CHECK_CUDART(cudaMalloc((void**) &(A->gpuAux.diagonalIdx), sizeof(slice_ptr_t) * localNumberOfRows));
         CHECK_CUDART(cudaMalloc((void**) &(A->gpuAux.localToGlobalMap), sizeof(global_int_t) * localNumberOfRows));
         CHECK_CUDART(cudaMalloc(&(A->ref2opt), localNumberOfRows * sizeof(local_int_t)));
         CHECK_CUDART(cudaMalloc(&(A->opt2ref), localNumberOfRows * sizeof(local_int_t)));
@@ -216,7 +222,7 @@ void AllocateMemCuda(SparseMatrix& A_in)
         */
 
         /*Memory Estimation for lower and upper parts*/
-        local_int_t estimated_size = EstimateLUmem(localNumberOfRows, paddedRowLen, level, slice_size);
+        slice_ptr_t estimated_size = EstimateLUmem(localNumberOfRows, (local_int_t) paddedRowLen, level, slice_size);
 
         CHECK_CUDART(cudaMalloc((void**) &(A->gpuAux.columns), sizeof(local_int_t) * estimated_size * 2));
 
@@ -249,9 +255,9 @@ static void AccumulateGpuOptMemOptCudaLevel(size_t& opt_mem, local_int_t localNu
 {
     local_int_t num_blocks = (localNumberOfRows + slice_size - 1) / slice_size;
     local_int_t paddedRowLen = num_blocks * slice_size;
-    local_int_t estimated_size = EstimateLUmem(localNumberOfRows, paddedRowLen, level, slice_size);
+    slice_ptr_t estimated_size = EstimateLUmem(localNumberOfRows, paddedRowLen, level, slice_size);
 
-    opt_mem += sizeof(local_int_t) * (paddedRowLen * HPCG_MAX_ROW_LEN + slice_size * HPCG_MAX_ROW_LEN);
+    opt_mem += sizeof(local_int_t) * ((size_t) paddedRowLen * HPCG_MAX_ROW_LEN + (size_t) slice_size * HPCG_MAX_ROW_LEN);
     if (Use_Hpcg_Mem_Reduction)
         opt_mem += sizeof(double) * estimated_size;
     else
@@ -314,17 +320,35 @@ void AllocateMemOptCuda(SparseMatrix& A_in)
         local_int_t num_blocks = (localNumberOfRows + slice_size - 1) / slice_size;
         local_int_t paddedRowLen = num_blocks * slice_size;
 
-        // Okay We need to find the memory needed
-        CHECK_CUDART(cudaMalloc((void**) &(A->sellAPermColumns),
-            sizeof(local_int_t) * (paddedRowLen * HPCG_MAX_ROW_LEN + slice_size * HPCG_MAX_ROW_LEN)));
+        // Index-mode-selected element widths for the SELL offset/column arrays.
+        const IndexMode mode = A->index_mode;
+        const size_t colBytes = columnIndexBytes(mode);
+        const size_t offBytes = offsetIndexBytes(mode);
+        const size_t aColElems
+            = (size_t) paddedRowLen * HPCG_MAX_ROW_LEN + (size_t) slice_size * HPCG_MAX_ROW_LEN;
+
+        // A operator columns (column-index width), 64-bit size math to avoid overflow.
+        CHECK_CUDART(cudaMalloc(&(A->sellDev.aColumns), colBytes * aColElems));
         A->sellAPermValues = A->gpuAux.values; // Use the same space as values
 
         /*Memory Estimation for lower and upper parts*/
-        local_int_t estimated_size = EstimateLUmem(localNumberOfRows, paddedRowLen, level, slice_size);
+        slice_ptr_t estimated_size = EstimateLUmem(localNumberOfRows, (local_int_t) paddedRowLen, level, slice_size);
 
-        // Reuse columns arrays, not used after we create SELL
-        A->sellLPermColumns = A->gpuAux.columns;
-        A->sellUPermColumns = A->gpuAux.columns + estimated_size;
+        // L/U columns: when columns are 32-bit we reuse gpuAux.columns (int32, unused
+        // after SELL creation); when columns are 64-bit that int32 buffer cannot be
+        // reused, so we own dedicated buffers instead.
+        if (columnsAre64(mode))
+        {
+            CHECK_CUDART(cudaMalloc(&(A->sellDev.lColumns), colBytes * (size_t) estimated_size));
+            CHECK_CUDART(cudaMalloc(&(A->sellDev.uColumns), colBytes * (size_t) estimated_size));
+            A->sellDev.ownsLuColumns = true;
+        }
+        else
+        {
+            A->sellDev.lColumns = A->gpuAux.columns;
+            A->sellDev.uColumns = A->gpuAux.columns + estimated_size;
+            A->sellDev.ownsLuColumns = false;
+        }
         if (!Use_Compression)
         {
             if (Use_Hpcg_Mem_Reduction)
@@ -356,9 +380,10 @@ void AllocateMemOptCuda(SparseMatrix& A_in)
             }
         }
 
-        CHECK_CUDART(cudaMalloc((void**) &(A->sellLSliceMrl), sizeof(local_int_t) * (paddedRowLen / slice_size + 1)));
-        CHECK_CUDART(cudaMalloc((void**) &(A->sellUSliceMrl), sizeof(local_int_t) * (paddedRowLen / slice_size + 1)));
-        CHECK_CUDART(cudaMalloc((void**) &(A->sellASliceMrl), sizeof(local_int_t) * (paddedRowLen / slice_size + 1)));
+        const size_t numSliceEntries = (size_t) (paddedRowLen / slice_size + 1);
+        CHECK_CUDART(cudaMalloc(&(A->sellDev.lSliceOffsets), offBytes * numSliceEntries));
+        CHECK_CUDART(cudaMalloc(&(A->sellDev.uSliceOffsets), offBytes * numSliceEntries));
+        CHECK_CUDART(cudaMalloc(&(A->sellDev.aSliceOffsets), offBytes * numSliceEntries));
 
         CHECK_CUDART(cudaMalloc((void**) &(A->gpuAux.color), localNumberOfRows * sizeof(local_int_t)));
         CHECK_CUDART(cudaMemset(A->gpuAux.color, -1, localNumberOfRows * sizeof(local_int_t)));
@@ -369,10 +394,13 @@ void AllocateMemOptCuda(SparseMatrix& A_in)
         }
 
         // SpSV related memory optimization
-        // HPCG estimated buffer size
+        // HPCG estimated buffer size. The cuSPARSE Sliced-ELL SpSV scratch buffer
+        // scales with the index element width, so use the mode's offset width
+        // (offBytes) rather than sizeof(local_int_t); for the default int32 mode
+        // offBytes == sizeof(local_int_t) so legacy sizing is preserved.
         if (Use_Hpcg_Mem_Reduction && (localNumberOfRows % 8 == 0))
         {
-            size_t buffer_size_sv_l = 2048 + (8 * sizeof(local_int_t) * size_t(localNumberOfRows));
+            size_t buffer_size_sv_l = 2048 + (8 * offBytes * size_t(localNumberOfRows));
             CHECK_CUDART(cudaMalloc(&A->bufferSvL, buffer_size_sv_l));
             // Same buffer since we they both share the same diagional
             A->bufferSvU = A->bufferSvL;
@@ -474,7 +502,12 @@ void DeleteMatrixGpu(SparseMatrix& A)
             CHECK_CUDART(cudaFreeCompressible(AA->gpuAux.values,
                 sizeof(double) * (paddedRowLen * HPCG_MAX_ROW_LEN + slice_size * HPCG_MAX_ROW_LEN)));
 
-        CHECK_CUDART(cudaFree(AA->sellAPermColumns));
+        CHECK_CUDART(cudaFree(AA->sellDev.aColumns));
+        if (AA->sellDev.ownsLuColumns)
+        {
+            CHECK_CUDART(cudaFree(AA->sellDev.lColumns));
+            CHECK_CUDART(cudaFree(AA->sellDev.uColumns));
+        }
 
         if (!Use_Compression)
         {
@@ -490,7 +523,7 @@ void DeleteMatrixGpu(SparseMatrix& A)
         }
         else
         {
-            local_int_t estimated_size = EstimateLUmem(AA->localNumberOfRows, paddedRowLen, level, slice_size);
+            slice_ptr_t estimated_size = EstimateLUmem(AA->localNumberOfRows, (local_int_t) paddedRowLen, level, slice_size);
             if (Use_Hpcg_Mem_Reduction)
             {
                 CHECK_CUDART(cudaFreeCompressible(AA->sellLPermValues, sizeof(double) * estimated_size));
@@ -502,9 +535,9 @@ void DeleteMatrixGpu(SparseMatrix& A)
             }
         }
 
-        CHECK_CUDART(cudaFree(AA->sellLSliceMrl));
-        CHECK_CUDART(cudaFree(AA->sellUSliceMrl));
-        CHECK_CUDART(cudaFree(AA->sellASliceMrl));
+        CHECK_CUDART(cudaFree(AA->sellDev.lSliceOffsets));
+        CHECK_CUDART(cudaFree(AA->sellDev.uSliceOffsets));
+        CHECK_CUDART(cudaFree(AA->sellDev.aSliceOffsets));
 
         if (AA->cusparseOpt.vecX)
             CHECK_CUSPARSE(cusparseDestroyDnVec(AA->cusparseOpt.vecX));
@@ -562,9 +595,9 @@ __device__ char4 tid2ind[32] = {{-1, -1, -1, 0}, {0, -1, -1, 0}, {1, -1, -1, 0},
     GPU Kernel
     Sets an array values to minus one
 */
-__global__ void __launch_bounds__(128) setMinusOne_kernel(local_int_t count, double* arr)
+__global__ void __launch_bounds__(128) setMinusOne_kernel(size_t count, double* arr)
 {
-    const local_int_t i = blockIdx.x * 128 + threadIdx.x;
+    const size_t i = (size_t) blockIdx.x * 128 + threadIdx.x;
     if (i < count)
         arr[i] = -1.0;
 }
@@ -598,7 +631,7 @@ __device__ __inline__ double shfl64_device(long long int x, int src)
 */
 template <int THREADS_PER_CTA, int GRIDX>
 __global__ void __launch_bounds__(THREADS_PER_CTA) compressCsrOffsets_kernel(local_int_t localNumberOfRows,
-    local_int_t* csr_offsets, local_int_t* map, local_int_t* tmp_offsets, int* temp, local_int_t* nnz_per_row, int rank)
+    slice_ptr_t* csr_offsets, local_int_t* map, slice_ptr_t* tmp_offsets, int* temp, slice_ptr_t* nnz_per_row, int rank)
 {
 
     const int tidx = threadIdx.x;
@@ -694,8 +727,8 @@ __global__ void __launch_bounds__(THREADS_PER_CTA) compressCsrOffsets_kernel(loc
 __global__ void __launch_bounds__(128) generateProblem_kernel(int rank, int partition_by, local_int_t npx,
     local_int_t npy, local_int_t nx, local_int_t ny, local_int_t nz, local_int_t gnx, local_int_t gny, local_int_t gnz,
     local_int_t gix0, local_int_t giy0, local_int_t giz0, local_int_t* csr_offsets, local_int_t* columns,
-    double* values, double* bv, double* xv, double* ev, local_int_t* diagonalIdx, double* diagonal,
-    local_int_t* csrExtOffsets, global_int_t* localToGlobalMap, bool update, int* rankToId)
+    double* values, double* bv, double* xv, double* ev, slice_ptr_t* diagonalIdx, double* diagonal,
+    slice_ptr_t* csrExtOffsets, global_int_t* localToGlobalMap, bool update, int* rankToId)
 {
 
     extern __shared__ int shdiag[];
@@ -792,8 +825,8 @@ __global__ void __launch_bounds__(128) generateProblem_kernel(int rank, int part
     if (lrow >= ntot)
         return;
 
-    local_int_t in_id = (local_int_t)shd[lid] + (local_int_t)lrow * HPCG_MAX_ROW_LEN;
-    
+    slice_ptr_t in_id = (slice_ptr_t) shd[lid] + (slice_ptr_t) lrow * HPCG_MAX_ROW_LEN;
+
     diagonalIdx[lrow] = in_id;
     
     localToGlobalMap[lrow] = currentGlobalRow;
@@ -851,14 +884,15 @@ void GenerateProblemCuda(SparseMatrix& A, Vector* b, Vector* x, Vector* xexact)
 
     // Generete nnzPerRow
     CHECK_CUDART(cudaMemsetAsync(&(A.gpuAux.nnzPerRow[localNumberOfRows]), 0, sizeof(local_int_t), stream));
-    const local_int_t grid_nnz = (localNumberOfRows * HPCG_MAX_ROW_LEN + 128 - 1) / 128;
-    setMinusOne_kernel<<<grid_nnz, 128, 0, stream>>>(localNumberOfRows * HPCG_MAX_ROW_LEN, A.gpuAux.values);
+    const size_t total_nnz = (size_t) localNumberOfRows * HPCG_MAX_ROW_LEN;
+    const size_t grid_nnz = (total_nnz + 128 - 1) / 128;
+    setMinusOne_kernel<<<grid_nnz, 128, 0, stream>>>(total_nnz, A.gpuAux.values);
     generateProblem_kernel<<<grid2, block2, block2.x * sizeof(int), stream>>>(A.geom->logical_rank,
         A.geom->different_dim, npx, npy, nx, ny, nz, gnx, gny, gnz, gix0, giy0, giz0, A.gpuAux.nnzPerRow,
         A.gpuAux.columns, A.gpuAux.values, bv, xv, ev, A.gpuAux.diagonalIdx, A.diagonal, A.csrExtOffsets,
         A.gpuAux.localToGlobalMap, A.level == 0, ranktoId);
 
-    CHECK_CUDART(cudaMemcpy(A.gpuAux.csrUPermOffsets, A.csrExtOffsets, sizeof(local_int_t) * (localNumberOfRows + 1),
+    CHECK_CUDART(cudaMemcpy(A.gpuAux.csrUPermOffsets, A.csrExtOffsets, sizeof(slice_ptr_t) * (localNumberOfRows + 1),
         cudaMemcpyDeviceToDevice));
     CHECK_CUDART(cudaMemsetAsync(&(temp[64 * 128]), 0, sizeof(int), stream));
     compressCsrOffsets_kernel<128, 64><<<64, 128, 0, stream>>>(localNumberOfRows, A.csrExtOffsets, A.gpuAux.map,
@@ -867,15 +901,17 @@ void GenerateProblemCuda(SparseMatrix& A, Vector* b, Vector* x, Vector* xexact)
         cudaMemcpyDeviceToHost));
 
     A.extNnz = 0;
+    slice_ptr_t extNnz_tmp = 0;
     CHECK_CUDART(cudaMemcpy(
-        &(A.extNnz), &(A.csrExtOffsets[A.gpuAux.compressNumberOfRows]), sizeof(local_int_t), cudaMemcpyDeviceToHost));
+        &extNnz_tmp, &(A.csrExtOffsets[A.gpuAux.compressNumberOfRows]), sizeof(slice_ptr_t), cudaMemcpyDeviceToHost));
+    A.extNnz = (local_int_t) extNnz_tmp;
     local_int_t localNumberOfNonzeros = 0;
     CHECK_CUDART(cudaMemcpy(
         &localNumberOfNonzeros, &(A.gpuAux.nnzPerRow[localNumberOfRows]), sizeof(local_int_t), cudaMemcpyDeviceToHost));
 
     CHECK_CUDART(cudaMalloc((void**) &(A.csrExtColumns), sizeof(local_int_t) * A.extNnz));
     CHECK_CUDART(cudaMalloc((void**) &(A.csrExtValues), sizeof(double) * A.extNnz));
-    CHECK_CUDART(cudaMalloc((void**) &(A.gpuAux.ext2csrOffsets), sizeof(local_int_t) * A.extNnz));
+    CHECK_CUDART(cudaMalloc((void**) &(A.gpuAux.ext2csrOffsets), sizeof(slice_ptr_t) * A.extNnz));
 
     if (A.level == 0)
         cub::DeviceScan::InclusiveSum(temp, temp_storage_bytes, ranktoId, ranktoId, A.geom->size);
@@ -900,8 +936,8 @@ __global__ void __launch_bounds__(128) setupHalo_kernel(int rank, int partition_
     ,
     int nnd /*next neighbor dim*/, local_int_t npx, local_int_t npy, local_int_t nx, local_int_t ny, local_int_t nz,
     local_int_t gnx, local_int_t gny, local_int_t gnz, local_int_t gix0, local_int_t giy0, local_int_t giz0,
-    local_int_t* csr_offsets, local_int_t* columns, double* values, local_int_t* diagonalIdx, double* diagonal,
-    local_int_t* csrExtOffsets, local_int_t* csrExtColumns, local_int_t* ext2csrOffsets, global_int_t* localToGlobalMap,
+    local_int_t* csr_offsets, local_int_t* columns, double* values, slice_ptr_t* diagonalIdx, double* diagonal,
+    slice_ptr_t* csrExtOffsets, local_int_t* csrExtColumns, slice_ptr_t* ext2csrOffsets, global_int_t* localToGlobalMap,
     local_int_t* f2c, local_int_t sendbufld, local_int_t* sendcnt, local_int_t* sendbuf, int* rankToId)
 {
 
@@ -929,7 +965,7 @@ __global__ void __launch_bounds__(128) setupHalo_kernel(int rank, int partition_
 
     char4 disp = tid2ind[lid];
 
-    global_int_t offset = wid * WARPSIZE * HPCG_MAX_ROW_LEN;
+    global_int_t offset = (global_int_t) wid * WARPSIZE * HPCG_MAX_ROW_LEN;
 
     csrExtColumns += csrExtOffsets[wid * WARPSIZE];
     ext2csrOffsets += csrExtOffsets[wid * WARPSIZE];
@@ -1107,7 +1143,7 @@ __global__ void __launch_bounds__(128) extToLocMap_kernel(
 */
 __global__ void __launch_bounds__(128)
     extToloc_kernel(local_int_t localNumberOfRows, int neighborId, local_int_t ext_nnz, local_int_t* csrExtColumns,
-        double* csrExtValues, local_int_t* ext2csrOffsets, local_int_t* extToLocMap, local_int_t* columns)
+        double* csrExtValues, slice_ptr_t* ext2csrOffsets, local_int_t* extToLocMap, local_int_t* columns)
 {
 
     const local_int_t i = blockIdx.x * 128 + threadIdx.x;
@@ -1221,7 +1257,7 @@ void ExtToLocMapCuda(
     Calls extToLoc_kernel
 */
 void ExtTolocCuda(local_int_t localNumberOfRows, int neighborId, local_int_t ext_nnz, local_int_t* csrExtColumns,
-    double* csrExtValues, local_int_t* ext2csrOffsets, local_int_t* extToLocMap, local_int_t* columns)
+    double* csrExtValues, slice_ptr_t* ext2csrOffsets, local_int_t* extToLocMap, local_int_t* columns)
 {
 
     const local_int_t grid = (ext_nnz + 128 - 1) / 128;
@@ -1431,8 +1467,8 @@ __global__ void minmaxHashStep_kernel(const local_int_t* A_cols, const local_int
     // have we been proved to be not min or max
     bool not_min = false;
     bool not_max = false;
-    local_int_t row_start = i * HPCG_MAX_ROW_LEN;
-    local_int_t row_end = row_start + nnz_per_row[i];
+    slice_ptr_t row_start = (slice_ptr_t) i * HPCG_MAX_ROW_LEN;
+    slice_ptr_t row_end = row_start + nnz_per_row[i];
     for (auto r = row_start; r < row_end; r++)
     {
         auto j = A_cols[r];
@@ -1473,8 +1509,8 @@ __global__ void testHashStep3_kernel(const local_int_t* A_cols, const local_int_
         return;
     if (color[i] != check_color)
         return;
-    local_int_t row_start = i * HPCG_MAX_ROW_LEN;
-    local_int_t row_end = row_start + nnz_per_row[i];
+    slice_ptr_t row_start = (slice_ptr_t) i * HPCG_MAX_ROW_LEN;
+    slice_ptr_t row_end = row_start + nnz_per_row[i];
     int trial_color;
     int iter;
 
@@ -1538,11 +1574,11 @@ __global__ void __launch_bounds__(128)
     **Note** The internal column indices are assumed to be ascendingly
         ordered. Order is enforced during setupHalo_kernel
 */
-template <int BLOCK_SIZE, int GROUP_SIZE, bool DIAG>
+template <int BLOCK_SIZE, int GROUP_SIZE, bool DIAG, class ColT>
 __global__ void __launch_bounds__(BLOCK_SIZE) ellPermColumnsValues_kernel(local_int_t localNumberOfRows,
-    local_int_t* nnzPerRow, local_int_t* columns, double* values, local_int_t* csr_perm_offsets,
-    local_int_t* csr_perm_columns, double* csr_perm_values, local_int_t* opt2ref, local_int_t* ref2opt,
-    local_int_t* ell_diagonal_idx, local_int_t* csrLPermOffsets, local_int_t* csrUPermOffsets)
+    local_int_t* nnzPerRow, local_int_t* columns, double* values, slice_ptr_t* csr_perm_offsets,
+    ColT* csr_perm_columns, double* csr_perm_values, local_int_t* opt2ref, local_int_t* ref2opt,
+    slice_ptr_t* ell_diagonal_idx, slice_ptr_t* csrLPermOffsets, slice_ptr_t* csrUPermOffsets)
 {
 
     int lx = threadIdx.x % GROUP_SIZE;
@@ -1564,10 +1600,10 @@ __global__ void __launch_bounds__(BLOCK_SIZE) ellPermColumnsValues_kernel(local_
     __syncwarp();
 
     const local_int_t perm_row = opt2ref[row];
-    const local_int_t str = perm_row * HPCG_MAX_ROW_LEN;
+    const slice_ptr_t str = (slice_ptr_t) perm_row * HPCG_MAX_ROW_LEN;
     const local_int_t nnz = nnzPerRow[perm_row];
     columns += str;
-    local_int_t perm_str = row * HPCG_MAX_ROW_LEN;
+    slice_ptr_t perm_str = (slice_ptr_t) row * HPCG_MAX_ROW_LEN;
     csr_perm_columns += perm_str;
     local_int_t l_nnz = 0, u_nnz = 0;
 #pragma unroll 9
@@ -1599,19 +1635,20 @@ __global__ void __launch_bounds__(BLOCK_SIZE) ellPermColumnsValues_kernel(local_
         }
     }
 
-    atomic_add(&(csrLPermOffsets[row]), l_nnz);
-    atomic_add(&(csrUPermOffsets[row]), u_nnz);
+    atomic_add(&(csrLPermOffsets[row]), (slice_ptr_t) l_nnz);
+    atomic_add(&(csrUPermOffsets[row]), (slice_ptr_t) u_nnz);
 }
 
 /*
     GPU Kernel
     Transpose a block of values, for HPCG using sliced size of A = slice_size x 27
 */
+template <class ColT>
 __device__ void transposeBlock_device_kernel(
-    local_int_t n, int stride, double* outd, local_int_t* outi, double* ind, local_int_t* ini, local_int_t block_id)
+    local_int_t n, int stride, double* outd, ColT* outi, double* ind, ColT* ini, local_int_t block_id)
 {
     __shared__ double scratchd[16][16];
-    __shared__ local_int_t scratchi[16][16];
+    __shared__ ColT scratchi[16][16];
     local_int_t tx = threadIdx.x;
     local_int_t ty = threadIdx.y;
     
@@ -1639,20 +1676,20 @@ __device__ void transposeBlock_device_kernel(
 }
 
 
-__global__ void transpose_kernel(local_int_t n, local_int_t *sellCollIndex, double *sellValues, local_int_t slice_size)
+template <class ColT>
+__global__ void transpose_kernel(local_int_t n, ColT* sellCollIndex, double* sellValues, local_int_t slice_size)
 {
     using namespace cooperative_groups;
     cooperative_groups::grid_group grid = cooperative_groups::this_grid();
-    
-    for(local_int_t i = 0; i < n; i += slice_size)
+
+    for (local_int_t i = 0; i < n; i += slice_size)
     {
-        transposeBlock_device_kernel(n, slice_size, 
-             sellValues + i * HPCG_MAX_ROW_LEN,
-             sellCollIndex + i * HPCG_MAX_ROW_LEN,
-             sellValues + (i + slice_size) * HPCG_MAX_ROW_LEN,
-             sellCollIndex + (i + slice_size) * HPCG_MAX_ROW_LEN,
-             i/slice_size);
-    
+        // Element offsets can exceed 2^31 for large problems: compute in 64-bit.
+        const size_t base = (size_t) i * HPCG_MAX_ROW_LEN;
+        const size_t next = (size_t) (i + slice_size) * HPCG_MAX_ROW_LEN;
+        transposeBlock_device_kernel<ColT>(n, slice_size, sellValues + base, sellCollIndex + base,
+            sellValues + next, sellCollIndex + next, i / slice_size);
+
         grid.sync();
     }
 }
@@ -1661,8 +1698,9 @@ __global__ void transpose_kernel(local_int_t n, local_int_t *sellCollIndex, doub
     GPU Kernel
     Finds the maximum row length for lower and upper sliced ELLPACK slices
 */
-__global__ void ellMaxRowLenPerBlock_kernel(local_int_t nrow, local_int_t slice_size, local_int_t* csrLPermOffsets,
-    local_int_t* csrUPermOffsets, local_int_t* ell_l_per_color_mrl, local_int_t* ell_u_per_color_mrl)
+template <class OffsetT>
+__global__ void ellMaxRowLenPerBlock_kernel(local_int_t nrow, local_int_t slice_size, slice_ptr_t* csrLPermOffsets,
+    slice_ptr_t* csrUPermOffsets, OffsetT* ell_l_per_color_mrl, OffsetT* ell_u_per_color_mrl)
 {
     __shared__ local_int_t l_global_mrl, u_global_mrl;
 
@@ -1711,14 +1749,15 @@ __global__ void ellMaxRowLenPerBlock_kernel(local_int_t nrow, local_int_t slice_
     Multiplies each element in arr with slice_size to create a slice offset
         based on the number of nonzeros
 */
-__global__ void multiplyBySliceSize_kernel(local_int_t nrow, local_int_t slice_size, local_int_t* arr)
+template <class OffsetT>
+__global__ void multiplyBySliceSize_kernel(local_int_t nrow, local_int_t slice_size, OffsetT* arr)
 {
 
     const local_int_t i = blockIdx.x * 128 + threadIdx.x;
     if (i >= nrow)
         return;
 
-    arr[i] = arr[i] * slice_size;
+    arr[i] = arr[i] * (OffsetT) slice_size;
 }
 
 /*
@@ -1726,13 +1765,15 @@ __global__ void multiplyBySliceSize_kernel(local_int_t nrow, local_int_t slice_s
     Generates the HPCG general matrix slice offset, based on the slice size
         and 27 nnz per row
 */
-__global__ void createAMatrixSliceOffsets_kernel(local_int_t nrow, local_int_t slice_size, local_int_t* arr)
+template <class OffsetT>
+__global__ void createAMatrixSliceOffsets_kernel(local_int_t nrow, local_int_t slice_size, OffsetT* arr)
 {
     const local_int_t i = blockIdx.x * 128 + threadIdx.x;
     if (i >= nrow)
         return;
 
-    arr[i] = HPCG_MAX_ROW_LEN * i * slice_size;
+    // Offsets can exceed 2^31 for large problems: accumulate in the offset type.
+    arr[i] = (OffsetT) i * slice_size * HPCG_MAX_ROW_LEN;
 }
 
 /*
@@ -1741,16 +1782,16 @@ __global__ void createAMatrixSliceOffsets_kernel(local_int_t nrow, local_int_t s
 */
 template<int THREADS_PER_CTA, int ELEMENTS_PER_THREAD>
 __global__ void __launch_bounds__(THREADS_PER_CTA)
-    setLUValues_kernel(local_int_t nnz, double* __restrict__ l_values, double* __restrict__ u_values)
+    setLUValues_kernel(slice_ptr_t nnz, double* __restrict__ l_values, double* __restrict__ u_values)
 {
-    const local_int_t gid = blockIdx.x * blockDim.x + threadIdx.x;
-    const local_int_t stride = blockDim.x * gridDim.x;
+    const slice_ptr_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+    const slice_ptr_t stride = blockDim.x * gridDim.x;
     
     // Process multiple elements per thread with unrolling
     #pragma unroll
     for (int i = 0; i < ELEMENTS_PER_THREAD; ++i)
     {
-        local_int_t idx = gid + i * stride;
+        slice_ptr_t idx = gid + i * stride;
         if (idx < nnz)
         {
             l_values[idx] = -1.0;
@@ -1765,10 +1806,11 @@ __global__ void __launch_bounds__(THREADS_PER_CTA)
     Pads -1 for each row when its length is less tahn its max row
         length per slice
 */
+template <class OffsetT, class ColT>
 __global__ void createSellLUColumnsValues_kernel(const local_int_t n, const local_int_t slice_size,
-    local_int_t* __restrict ell_columns, double* __restrict ell_values, local_int_t* __restrict ell_l_slice_offset,
-    local_int_t* __restrict ell_l_columns, double* __restrict ell_l_values, local_int_t* __restrict ell_u_slice_offset,
-    local_int_t* __restrict ell_u_columns, double* __restrict ell_u_values)
+    const ColT* __restrict ell_columns, double* __restrict ell_values, const OffsetT* __restrict ell_l_slice_offset,
+    ColT* __restrict ell_l_columns, double* __restrict ell_l_values, const OffsetT* __restrict ell_u_slice_offset,
+    ColT* __restrict ell_u_columns, double* __restrict ell_u_values)
 {
 
     constexpr int MaxRowLen = HPCG_MAX_ROW_LEN;
@@ -1780,22 +1822,23 @@ __global__ void createSellLUColumnsValues_kernel(const local_int_t n, const loca
     local_int_t row_inblock_id = row_original_id % slice_size;
     local_int_t row_block_id = row_original_id / slice_size;
 
-    local_int_t row_start_index = row_block_id * MaxRowLen * slice_size + row_inblock_id;
-    local_int_t row_end_index = row_start_index + MaxRowLen * slice_size;
+    // Array indices are driven by the (possibly 64-bit) slice offsets, so use OffsetT.
+    OffsetT row_start_index = (OffsetT) row_block_id * MaxRowLen * slice_size + row_inblock_id;
+    OffsetT row_end_index = row_start_index + (OffsetT) MaxRowLen * slice_size;
 
-    local_int_t l_row_start = ell_l_slice_offset[row_block_id] + row_inblock_id;
-    local_int_t u_row_start = ell_u_slice_offset[row_block_id] + row_inblock_id;
+    OffsetT l_row_start = ell_l_slice_offset[row_block_id] + row_inblock_id;
+    OffsetT u_row_start = ell_u_slice_offset[row_block_id] + row_inblock_id;
 
-    local_int_t l_len = (ell_l_slice_offset[row_block_id + 1] - ell_l_slice_offset[row_block_id]) / slice_size;
-    local_int_t u_len = (ell_u_slice_offset[row_block_id + 1] - ell_u_slice_offset[row_block_id]) / slice_size;
+    OffsetT l_len = (ell_l_slice_offset[row_block_id + 1] - ell_l_slice_offset[row_block_id]) / slice_size;
+    OffsetT u_len = (ell_u_slice_offset[row_block_id + 1] - ell_u_slice_offset[row_block_id]) / slice_size;
 
-    local_int_t l_row_end = l_row_start + l_len * slice_size;
-    local_int_t u_row_end = u_row_start + u_len * slice_size;
+    OffsetT l_row_end = l_row_start + l_len * slice_size;
+    OffsetT u_row_end = u_row_start + u_len * slice_size;
 
 #pragma unroll MaxRowLen
-    for (auto i = row_start_index; i < row_end_index; i += slice_size)
+    for (OffsetT i = row_start_index; i < row_end_index; i += slice_size)
     {
-        local_int_t col = __ldcs(&ell_columns[i]);
+        ColT col = __ldcs(&ell_columns[i]);
         double val = __ldcs(&ell_values[i]);
         if (col != -1 && col < row_original_id)
         {
@@ -1810,13 +1853,13 @@ __global__ void createSellLUColumnsValues_kernel(const local_int_t n, const loca
     }
 
     // Padd lower
-    for (auto i = l_row_start; i < l_row_end; i += slice_size)
+    for (OffsetT i = l_row_start; i < l_row_end; i += slice_size)
     {
         ell_l_columns[i] = -1;
     }
 
     // Padd upper
-    for (auto i = u_row_start; i < u_row_end; i += slice_size)
+    for (OffsetT i = u_row_start; i < u_row_end; i += slice_size)
     {
         ell_u_columns[i] = -1;
     }
@@ -1975,13 +2018,13 @@ void PermElemToSendCuda(local_int_t totalToBeSent, local_int_t* elementsToSend, 
     Creates the internal permuted matrix in (Sliced-)ELLPACK format
 */
 void EllPermColumnsValuesCuda(local_int_t localNumberOfRows, local_int_t* nnzPerRow, local_int_t* columns,
-    double* values, local_int_t* csr_perm_offsets, local_int_t* csr_perm_columns, double* csr_perm_values,
-    local_int_t* opt2ref, local_int_t* ref2opt, local_int_t* diagonalIdx, local_int_t* csrLPermOffsets,
-    local_int_t* csrUPermOffsets, bool find_diag)
+    double* values, slice_ptr_t* csr_perm_offsets, void* csr_perm_columns, double* csr_perm_values,
+    local_int_t* opt2ref, local_int_t* ref2opt, slice_ptr_t* diagonalIdx, slice_ptr_t* csrLPermOffsets,
+    slice_ptr_t* csrUPermOffsets, bool find_diag, IndexMode mode)
 {
-    const local_int_t nnz_out = localNumberOfRows * HPCG_MAX_ROW_LEN;
+    const size_t nnz_out = (size_t) localNumberOfRows * HPCG_MAX_ROW_LEN;
 
-    const local_int_t grid_nnz = (nnz_out + 128 - 1) / 128;
+    const size_t grid_nnz = (nnz_out + 128 - 1) / 128;
     setMinusOne_kernel<<<grid_nnz, 128, 0, stream>>>(nnz_out, csr_perm_values);
 
     const int BLOCK_SIZE = 128;
@@ -1990,110 +2033,181 @@ void EllPermColumnsValuesCuda(local_int_t localNumberOfRows, local_int_t* nnzPer
     const int WORKERS = BLOCK_SIZE / GROUP_SIZE;
     const local_int_t grid = (localNumberOfRows + WORKERS - 1) / WORKERS;
 
-    if (find_diag)
-        ellPermColumnsValues_kernel<BLOCK_SIZE, GROUP_SIZE, true><<<grid, BLOCK_SIZE, 0, stream>>>(localNumberOfRows,
-            nnzPerRow, columns, values, csr_perm_offsets, csr_perm_columns, csr_perm_values, opt2ref, ref2opt,
-            diagonalIdx, csrLPermOffsets, csrUPermOffsets);
-    else
-        ellPermColumnsValues_kernel<BLOCK_SIZE, GROUP_SIZE, false><<<grid, BLOCK_SIZE, 0, stream>>>(localNumberOfRows,
-            nnzPerRow, columns, values, csr_perm_offsets, csr_perm_columns, csr_perm_values, opt2ref, ref2opt,
-            diagonalIdx, csrLPermOffsets, csrUPermOffsets);
+    // Only the column-index element type varies with the index mode here.
+    dispatchIndexMode(mode,
+        [&](auto /*offTag*/, auto colTag)
+        {
+            using ColT = decltype(colTag);
+            ColT* cols = static_cast<ColT*>(csr_perm_columns);
+            if (find_diag)
+                ellPermColumnsValues_kernel<BLOCK_SIZE, GROUP_SIZE, true, ColT><<<grid, BLOCK_SIZE, 0, stream>>>(
+                    localNumberOfRows, nnzPerRow, columns, values, csr_perm_offsets, cols, csr_perm_values, opt2ref,
+                    ref2opt, diagonalIdx, csrLPermOffsets, csrUPermOffsets);
+            else
+                ellPermColumnsValues_kernel<BLOCK_SIZE, GROUP_SIZE, false, ColT><<<grid, BLOCK_SIZE, 0, stream>>>(
+                    localNumberOfRows, nnzPerRow, columns, values, csr_perm_offsets, cols, csr_perm_values, opt2ref,
+                    ref2opt, diagonalIdx, csrLPermOffsets, csrUPermOffsets);
+        });
 }
 
 /*
     Transpose a slice of (sliced-)ELLPACK matrix
 */
-void TransposeCuda(local_int_t n, local_int_t slice_size, local_int_t* sellCollIndex, double* sellValues)
+void TransposeCuda(local_int_t n, local_int_t slice_size, void* sellCollIndex, double* sellValues, IndexMode mode)
 {
-    int dev;
-    cudaDeviceProp deviceProp;
-    int numBlocksPerSm = 0;
-    dim3 block(16, 16, 1);
-    int numThreadsPerBlock = block.x * block.y;
+    // Only the column-index element type varies with the index mode here.
+    dispatchIndexMode(mode,
+        [&](auto /*offTag*/, auto colTag)
+        {
+            using ColT = decltype(colTag);
+            ColT* cols = static_cast<ColT*>(sellCollIndex);
 
-    CHECK_CUDART(cudaGetDevice(&dev));
-    CHECK_CUDART(cudaGetDeviceProperties(&deviceProp, dev));
-    CHECK_CUDART(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&numBlocksPerSm, transpose_kernel, numThreadsPerBlock, 0));
+            int dev;
+            cudaDeviceProp deviceProp;
+            int numBlocksPerSm = 0;
+            dim3 block(16, 16, 1);
+            int numThreadsPerBlock = block.x * block.y;
 
-    size_t blocksInY = (HPCG_MAX_ROW_LEN + block.y - 1) / block.y;
-    size_t blocksInX = deviceProp.multiProcessorCount * numBlocksPerSm / blocksInY; //In x direction
-    size_t blocksInXNeeded =(slice_size + block.x - 1) / block.x;
-    blocksInXNeeded = blocksInXNeeded > blocksInX ? blocksInX : blocksInXNeeded;
-    
-    dim3 grid(blocksInXNeeded, blocksInY, 1);
-    void*         args[]     = {(void*) &n,
-                                (void*) &sellCollIndex,
-                                (void*) &sellValues,
-                                (void*) &slice_size};
-    CHECK_CUDART(cudaLaunchCooperativeKernel((void*)transpose_kernel, grid, block, args, 0, stream));
+            CHECK_CUDART(cudaGetDevice(&dev));
+            CHECK_CUDART(cudaGetDeviceProperties(&deviceProp, dev));
+            CHECK_CUDART(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &numBlocksPerSm, transpose_kernel<ColT>, numThreadsPerBlock, 0));
+
+            size_t blocksInY = (HPCG_MAX_ROW_LEN + block.y - 1) / block.y;
+            size_t blocksInX = deviceProp.multiProcessorCount * numBlocksPerSm / blocksInY; // In x direction
+            size_t blocksInXNeeded = (slice_size + block.x - 1) / block.x;
+            blocksInXNeeded = blocksInXNeeded > blocksInX ? blocksInX : blocksInXNeeded;
+
+            dim3 grid(blocksInXNeeded, blocksInY, 1);
+            void* args[] = {(void*) &n, (void*) &cols, (void*) &sellValues, (void*) &slice_size};
+            CHECK_CUDART(
+                cudaLaunchCooperativeKernel((void*) transpose_kernel<ColT>, grid, block, args, 0, stream));
+        });
 }
 
 /*
     Finds the max lower and upper row length for each slice
 */
-void EllMaxRowLenPerBlockCuda(local_int_t nrow, int slice_size, local_int_t* ell_perm_l_offsets,
-    local_int_t* ell_perm_u_offsets, local_int_t* sellLSliceMrl, local_int_t* ell_u_block_mrl)
+void EllMaxRowLenPerBlockCuda(local_int_t nrow, int slice_size, slice_ptr_t* ell_perm_l_offsets,
+    slice_ptr_t* ell_perm_u_offsets, void* sellLSliceMrl, void* ell_u_block_mrl, IndexMode mode)
 {
     int blockSize = 512;
     local_int_t gridSize = (nrow + slice_size - 1) / slice_size;
-    ellMaxRowLenPerBlock_kernel<<<gridSize, blockSize, 0, stream>>>(
-        nrow, slice_size, ell_perm_l_offsets, ell_perm_u_offsets, sellLSliceMrl, ell_u_block_mrl);
+    dispatchIndexMode(mode,
+        [&](auto offTag, auto /*colTag*/)
+        {
+            using OffsetT = decltype(offTag);
+            ellMaxRowLenPerBlock_kernel<OffsetT><<<gridSize, blockSize, 0, stream>>>(nrow, slice_size,
+                ell_perm_l_offsets, ell_perm_u_offsets, static_cast<OffsetT*>(sellLSliceMrl),
+                static_cast<OffsetT*>(ell_u_block_mrl));
+        });
 }
 
 /*
     Finds prefix sum using CUB
 */
-void PrefixsumCuda(local_int_t localNumberOfRows, local_int_t* arr)
+void PrefixsumCuda(local_int_t localNumberOfRows, void* arr, IndexMode mode)
 {
-    void* d_temp_storage = NULL;
-    size_t temp_storage_bytes = 0;
-    CHECK_CUDART(cudaMemsetAsync(arr, 0, sizeof(local_int_t), stream));
-    cub::DeviceScan::InclusiveSum(d_temp_storage, temp_storage_bytes, arr + 1, arr + 1, localNumberOfRows);
-    CHECK_CUDART(cudaMalloc(&d_temp_storage, temp_storage_bytes));
-    cub::DeviceScan::InclusiveSum(d_temp_storage, temp_storage_bytes, arr + 1, arr + 1, localNumberOfRows);
-    CHECK_CUDART(cudaFree(d_temp_storage));
+    dispatchIndexMode(mode,
+        [&](auto offTag, auto /*colTag*/)
+        {
+            using OffsetT = decltype(offTag);
+            OffsetT* a = static_cast<OffsetT*>(arr);
+            void* d_temp_storage = NULL;
+            size_t temp_storage_bytes = 0;
+            CHECK_CUDART(cudaMemsetAsync(a, 0, sizeof(OffsetT), stream));
+            cub::DeviceScan::InclusiveSum(d_temp_storage, temp_storage_bytes, a + 1, a + 1, localNumberOfRows);
+            CHECK_CUDART(cudaMalloc(&d_temp_storage, temp_storage_bytes));
+            cub::DeviceScan::InclusiveSum(d_temp_storage, temp_storage_bytes, a + 1, a + 1, localNumberOfRows);
+            CHECK_CUDART(cudaFree(d_temp_storage));
+        });
+}
+
+/*
+    64-bit sum of a slice_ptr_t device array.
+
+    Used to derive exact per-matrix nonzero counts for the cuSPARSE Sliced-ELL
+    descriptors without relying on the int32 localNumberOfNonzeros, which wraps
+    for local problems with more than 2^31 nonzeros (e.g. 512^3).
+*/
+slice_ptr_t SumSlicePtrCuda(const slice_ptr_t* arr, local_int_t n)
+{
+    slice_ptr_t* d_out = nullptr;
+    CHECK_CUDART(cudaMalloc(&d_out, sizeof(slice_ptr_t)));
+    void* d_temp = nullptr;
+    size_t temp_bytes = 0;
+    cub::DeviceReduce::Sum(d_temp, temp_bytes, arr, d_out, n, stream);
+    CHECK_CUDART(cudaMalloc(&d_temp, temp_bytes));
+    cub::DeviceReduce::Sum(d_temp, temp_bytes, arr, d_out, n, stream);
+    slice_ptr_t h = 0;
+    CHECK_CUDART(cudaMemcpyAsync(&h, d_out, sizeof(slice_ptr_t), cudaMemcpyDeviceToHost, stream));
+    CHECK_CUDART(cudaStreamSynchronize(stream));
+    CHECK_CUDART(cudaFree(d_temp));
+    CHECK_CUDART(cudaFree(d_out));
+    return h;
 }
 
 /*
     Multiplies the slice offset based on max row length by
         the slice size to make based on number of nnz
 */
-void MultiplyBySliceSizeCUDA(local_int_t nrow, int slice_size, local_int_t* arr)
+void MultiplyBySliceSizeCUDA(local_int_t nrow, int slice_size, void* arr, IndexMode mode)
 {
     const local_int_t grid = (nrow + 128 - 1) / 128;
-    multiplyBySliceSize_kernel<<<grid, 128, 0, stream>>>(nrow, slice_size, arr);
+    dispatchIndexMode(mode,
+        [&](auto offTag, auto /*colTag*/)
+        {
+            using OffsetT = decltype(offTag);
+            multiplyBySliceSize_kernel<OffsetT><<<grid, 128, 0, stream>>>(
+                nrow, slice_size, static_cast<OffsetT*>(arr));
+        });
 }
 
 /*
     Creates a slice offset for the general matrix that has exactly
 */
-void CreateAMatrixSliceOffsetsCuda(local_int_t nrow, local_int_t slice_size, local_int_t* arr)
+void CreateAMatrixSliceOffsetsCuda(local_int_t nrow, local_int_t slice_size, void* arr, IndexMode mode)
 {
     const local_int_t grid = (nrow + 128 - 1) / 128;
-    createAMatrixSliceOffsets_kernel<<<grid, 128, 0, stream>>>(nrow, slice_size, arr);
+    dispatchIndexMode(mode,
+        [&](auto offTag, auto /*colTag*/)
+        {
+            using OffsetT = decltype(offTag);
+            createAMatrixSliceOffsets_kernel<OffsetT><<<grid, 128, 0, stream>>>(
+                nrow, slice_size, static_cast<OffsetT*>(arr));
+        });
 }
 
 /*
     Creates the lower and upper matrices in sliced ELLPACK format
 */
-void CreateSellLUColumnsValuesCuda(const local_int_t n, const int slice_size, local_int_t* ell_columns,
-    double* ell_values, local_int_t* ell_l_slice_offset, local_int_t* ell_l_columns, double* ell_l_values,
-    local_int_t* ell_u_slice_offset, local_int_t* ell_u_columns, double* ell_u_values, int level)
+void CreateSellLUColumnsValuesCuda(const local_int_t n, const int slice_size, void* ell_columns,
+    double* ell_values, void* ell_l_slice_offset, void* ell_l_columns, double* ell_l_values,
+    void* ell_u_slice_offset, void* ell_u_columns, double* ell_u_values, int level, IndexMode mode)
 {
     local_int_t num_blocks = (n + slice_size - 1) / slice_size;
     local_int_t paddedRowLen = num_blocks * slice_size;
 
     /*Memory Estimation for lower and upper parts*/
-    local_int_t estimated_size = EstimateLUmem(n, paddedRowLen, level, slice_size);
+    slice_ptr_t estimated_size = EstimateLUmem(n, (local_int_t) paddedRowLen, level, slice_size);
 
     const int BlockSize = 128;
     const int ELEMENTS_PER_THREAD = 8;
     const int ELEMENTS_PER_CTA = BlockSize * ELEMENTS_PER_THREAD;
-    const local_int_t grid_nnz = (estimated_size + ELEMENTS_PER_CTA - 1) / ELEMENTS_PER_CTA;
+    const slice_ptr_t grid_nnz = (estimated_size + ELEMENTS_PER_CTA - 1) / ELEMENTS_PER_CTA;
     local_int_t grid = (n + BlockSize - 1) / BlockSize;
-    setLUValues_kernel<BlockSize, ELEMENTS_PER_THREAD><<<grid_nnz, BlockSize, 0, stream>>>(estimated_size, ell_u_values, ell_l_values);
-    createSellLUColumnsValues_kernel<<<grid, BlockSize, 0, stream>>>(n, slice_size, ell_columns, ell_values,
-        ell_l_slice_offset, ell_l_columns, ell_l_values, ell_u_slice_offset, ell_u_columns, ell_u_values);
+    setLUValues_kernel<BlockSize, ELEMENTS_PER_THREAD><<<grid_nnz, BlockSize, 0, stream>>>(
+        estimated_size, ell_u_values, ell_l_values);
+    dispatchIndexMode(mode,
+        [&](auto offTag, auto colTag)
+        {
+            using OffsetT = decltype(offTag);
+            using ColT = decltype(colTag);
+            createSellLUColumnsValues_kernel<OffsetT, ColT><<<grid, BlockSize, 0, stream>>>(n, slice_size,
+                static_cast<const ColT*>(ell_columns), ell_values, static_cast<const OffsetT*>(ell_l_slice_offset),
+                static_cast<ColT*>(ell_l_columns), ell_l_values, static_cast<const OffsetT*>(ell_u_slice_offset),
+                static_cast<ColT*>(ell_u_columns), ell_u_values);
+        });
 }
 
 /*
@@ -2119,14 +2233,35 @@ void F2cPermCuda(local_int_t nrow_c, local_int_t* f2c, local_int_t* f2cPerm, loc
     f2cPerm_kernel<<<grid, 128, 0, stream>>>(nrow_c, f2c, f2cPerm, perm_f, iperm_c);
 }
 
+/*
+    Reads a single slice-offset element (element `index`) from a width-agnostic
+    device offset array and returns it widened to 64-bit host storage. Confines
+    the mode-dependent element-width read to one place.
+*/
+long long ReadSellOffsetCuda(const void* arr, size_t index, IndexMode mode)
+{
+    if (offsetsAre64(mode))
+    {
+        long long value = 0;
+        CHECK_CUDART(cudaMemcpy(
+            &value, static_cast<const long long*>(arr) + index, sizeof(long long), cudaMemcpyDeviceToHost));
+        return value;
+    }
+    int value = 0;
+    CHECK_CUDART(
+        cudaMemcpy(&value, static_cast<const int*>(arr) + index, sizeof(int), cudaMemcpyDeviceToHost));
+    return (long long) value;
+}
+
 //////////////////////// Test CG //////////////////////////////////////////////
 /*
     GPU Kernel
     Replaces matrix, in sliced ELLPACK format, diagonal with values in
         diagonal_buf
 */
+template <class ColT>
 __global__ void __launch_bounds__(128) replaceMatrixDiagonal_kernel(
-    local_int_t localNumberOfRows, local_int_t slice_size, local_int_t* ell_cols, double* ell_values, double* diagonal, double* diagonal_buf)
+    local_int_t localNumberOfRows, local_int_t slice_size, const ColT* ell_cols, double* ell_values, double* diagonal, double* diagonal_buf)
 {
 
     local_int_t row_index = threadIdx.x + blockDim.x * blockIdx.x;
@@ -2134,10 +2269,11 @@ __global__ void __launch_bounds__(128) replaceMatrixDiagonal_kernel(
     {
         local_int_t row_x = row_index % slice_size;
         local_int_t row_y = row_index / slice_size;
-        local_int_t start_id = row_x + row_y * slice_size * HPCG_MAX_ROW_LEN;
-        local_int_t end_id = start_id + HPCG_MAX_ROW_LEN * slice_size;
-        local_int_t id = start_id;
-        while (ell_cols[id] != row_index && id < end_id)
+        // Element offsets into the A operator can exceed 2^31: compute in 64-bit.
+        size_t start_id = (size_t) row_x + (size_t) row_y * slice_size * HPCG_MAX_ROW_LEN;
+        size_t end_id = start_id + (size_t) HPCG_MAX_ROW_LEN * slice_size;
+        size_t id = start_id;
+        while (ell_cols[id] != (ColT) row_index && id < end_id)
             id += slice_size;
         double mydiag = diagonal_buf[row_index];
         ell_values[id] = mydiag;
@@ -2152,8 +2288,13 @@ __global__ void __launch_bounds__(128) replaceMatrixDiagonal_kernel(
 void ReplaceMatrixDiagonalCuda(SparseMatrix& A, Vector& diagonal)
 {
     const int grid = (A.localNumberOfRows + 128 - 1) / 128;
-    replaceMatrixDiagonal_kernel<<<grid, 128, 0, stream>>>(
-        A.localNumberOfRows, A.slice_size, A.sellAPermColumns, A.sellAPermValues, A.diagonal, diagonal.values_d);
+    dispatchIndexMode(A.index_mode,
+        [&](auto /*offTag*/, auto colTag)
+        {
+            using ColT = decltype(colTag);
+            replaceMatrixDiagonal_kernel<ColT><<<grid, 128, 0, stream>>>(A.localNumberOfRows, A.slice_size,
+                static_cast<const ColT*>(A.sellDev.aColumns), A.sellAPermValues, A.diagonal, diagonal.values_d);
+        });
 }
 
 /*
@@ -2455,7 +2596,7 @@ void SpFmaCuda(local_int_t n, double* x, double* y, double* z)
     Scatter and permutes the results to the original y
 */
 template <int THREADS_PER_CTA, int NTHREADS, int UNROLL>
-__global__ void __launch_bounds__(THREADS_PER_CTA) extMv_kernel(const local_int_t n, local_int_t* csr_offsets,
+__global__ void __launch_bounds__(THREADS_PER_CTA) extMv_kernel(const local_int_t n, slice_ptr_t* csr_offsets,
     local_int_t* columns, double* values, double alpha, double* x, double* y, local_int_t* ref2opt, local_int_t* map)
 {
 
@@ -2553,22 +2694,25 @@ size_t CopyDataToHostCuda(SparseMatrix& A_in, Vector* b, Vector* x, Vector* xexa
 
         A->localToGlobalMap.resize(localNumberOfRows);
 
-        mtxIndL[0] = new local_int_t[localNumberOfRows * numberOfNonzerosPerRow];
-        matrixValues[0] = new double[localNumberOfRows * numberOfNonzerosPerRow];
+        const slice_ptr_t totalEntries = (slice_ptr_t) localNumberOfRows * numberOfNonzerosPerRow;
+        mtxIndL[0] = new local_int_t[totalEntries];
+        matrixValues[0] = new double[totalEntries];
 
-        memset(mtxIndL[0], 0x00, sizeof(local_int_t) * (localNumberOfRows * numberOfNonzerosPerRow));
-        memset(matrixValues[0], 0x00, sizeof(double) * (localNumberOfRows * numberOfNonzerosPerRow));
+        memset(mtxIndL[0], 0x00, sizeof(local_int_t) * totalEntries);
+        memset(matrixValues[0], 0x00, sizeof(double) * totalEntries);
 
-        CHECK_CUDART(cudaMemcpy(mtxIndL[0], A->gpuAux.columns, sizeof(local_int_t) * A->localNumberOfRows * HPCG_MAX_ROW_LEN,
+        CHECK_CUDART(cudaMemcpy(mtxIndL[0], A->gpuAux.columns,
+            sizeof(local_int_t) * (slice_ptr_t) A->localNumberOfRows * HPCG_MAX_ROW_LEN,
             cudaMemcpyDeviceToHost));
-        CHECK_CUDART(cudaMemcpy(matrixValues[0], A->gpuAux.values, sizeof(double) * A->localNumberOfRows * HPCG_MAX_ROW_LEN,
+        CHECK_CUDART(cudaMemcpy(matrixValues[0], A->gpuAux.values,
+            sizeof(double) * (slice_ptr_t) A->localNumberOfRows * HPCG_MAX_ROW_LEN,
             cudaMemcpyDeviceToHost));
         CHECK_CUDART(cudaMemcpy(
             nonzerosInRow, A->gpuAux.nnzPerRow, sizeof(local_int_t) * A->localNumberOfRows, cudaMemcpyDeviceToHost));
 
-        local_int_t* diagonalIdx = new local_int_t[localNumberOfRows];
-        memset(diagonalIdx, 0x00, sizeof(local_int_t) * (localNumberOfRows));
-        CHECK_CUDART(cudaMemcpy(diagonalIdx, A->gpuAux.diagonalIdx, sizeof(local_int_t) * localNumberOfRows, cudaMemcpyDeviceToHost));
+        slice_ptr_t* diagonalIdx = new slice_ptr_t[localNumberOfRows];
+        memset(diagonalIdx, 0x00, sizeof(slice_ptr_t) * (localNumberOfRows));
+        CHECK_CUDART(cudaMemcpy(diagonalIdx, A->gpuAux.diagonalIdx, sizeof(slice_ptr_t) * localNumberOfRows, cudaMemcpyDeviceToHost));
 
         memset(&(A->localToGlobalMap[0]), 0x00, sizeof(global_int_t) * (localNumberOfRows));
         CHECK_CUDART(cudaMemcpy(&(A->localToGlobalMap[0]), A->gpuAux.localToGlobalMap, sizeof(global_int_t) * localNumberOfRows,
@@ -2579,8 +2723,8 @@ size_t CopyDataToHostCuda(SparseMatrix& A_in, Vector* b, Vector* x, Vector* xexa
 #endif
         for (auto i = 0; i < localNumberOfRows; ++i)
         {
-            mtxIndL[i] = mtxIndL[0] + i * HPCG_MAX_ROW_LEN;
-            matrixValues[i] = matrixValues[0] + i * HPCG_MAX_ROW_LEN;
+            mtxIndL[i] = mtxIndL[0] + (slice_ptr_t) i * HPCG_MAX_ROW_LEN;
+            matrixValues[i] = matrixValues[0] + (slice_ptr_t) i * HPCG_MAX_ROW_LEN;
             matrixDiagonal[i] = matrixValues[0] + diagonalIdx[i];
         }
         delete[] diagonalIdx;

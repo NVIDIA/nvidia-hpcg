@@ -44,6 +44,7 @@ Hitory:
 #define HPCG_HPP
 
 #include "Geometry.hpp"
+#include "IndexMode.hpp"
 #include <fstream>
 
 #ifndef USE_CUDA
@@ -139,6 +140,7 @@ struct HPCG_Params_STRUCT
                                // throughout the files
     local_int_t gpu_slice_size;
     local_int_t cpu_slice_size;
+    IndexMode index_mode; // !< GPU Sliced-ELL index widths, runtime-selectable (--mi). Default I32_I32.
 };
 /*!
   HPCG_Params is a shorthand for HPCG_Params_STRUCT
