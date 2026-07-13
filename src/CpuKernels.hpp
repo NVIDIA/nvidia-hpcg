@@ -58,8 +58,9 @@ constexpr int tid2indCpu[32][4] = {{-1, -1, -1, 0}, {0, -1, -1, 0}, {1, -1, -1, 
     {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}};
 
 // Generate Problem
-// Inclusive Prefix Sum
+// Inclusive Prefix Sum (int for neighbor-rank compression; slice_ptr_t for CSR offsets)
 void PrefixsumCpu(int* x, int N);
+void PrefixsumCpu(slice_ptr_t* x, int N);
 
 // Optimize Problem
 void AllocateMemCpu(SparseMatrix& A_in);

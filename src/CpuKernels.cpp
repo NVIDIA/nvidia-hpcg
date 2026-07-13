@@ -67,7 +67,7 @@ static void AccumulateCpuOptMemAllocateCpuLevel(
     opt_mem += 3 * ncol * sizeof(local_int_t); // ref2opt, opt2ref, f2cPerm
     opt_mem += 2 * nrow * sizeof(local_int_t); // color, firstRowOfColor
     opt_mem += kCpuOptInitialTotalColors * sizeof(local_int_t); // nRowsWithColor
-    opt_mem += (nrow + 1) * sizeof(local_int_t); // csrExtOffsets
+    opt_mem += (nrow + 1) * sizeof(slice_ptr_t); // csrExtOffsets
     opt_mem += extNnz * sizeof(local_int_t); // csrExtColumns
     opt_mem += extNnz * sizeof(double); // csrExtValues
 
@@ -130,7 +130,7 @@ void AllocateMemCpu(SparseMatrix& A_in)
         A->cpuAux.nRowsWithColor = new local_int_t[A->totalColors];
         A->tempBuffer = new double[nrow];
         // CSR external matrix
-        A->csrExtOffsets = new local_int_t[nrow + 1];
+        A->csrExtOffsets = new slice_ptr_t[nrow + 1];
         A->csrExtColumns = new local_int_t[A->extNnz];
         A->csrExtValues = new double[A->extNnz];
 
@@ -371,19 +371,20 @@ size_t EstimateCpuRefMem(SparseMatrix& A)
 /*
     Inclusive Prefix Sum
 */
-void PrefixsumCpu(int* x, int N)
+template <typename T>
+static void PrefixsumCpuImpl(T* x, int N)
 {
-    local_int_t* suma;
+    T* suma;
 #pragma omp parallel
     {
         const int ithread = omp_get_thread_num();
         const int nthreads = omp_get_num_threads();
-        local_int_t sum = local_int_t{};
+        T sum = T{};
 
 #pragma omp single
         {
-            suma = new local_int_t[nthreads + 1];
-            suma[0] = local_int_t{};
+            suma = new T[nthreads + 1];
+            suma[0] = T{};
         }
 
 #pragma omp for schedule(static)
@@ -396,8 +397,8 @@ void PrefixsumCpu(int* x, int N)
 
 #pragma omp barrier
 
-        local_int_t offset = local_int_t{};
-        for (local_int_t i = 0; i < (ithread + 1); i++)
+        T offset = T{};
+        for (int i = 0; i < (ithread + 1); i++)
         {
             offset += suma[i];
         }
@@ -412,6 +413,10 @@ void PrefixsumCpu(int* x, int N)
         delete[] suma;
     }
 }
+
+void PrefixsumCpu(int* x, int N) { PrefixsumCpuImpl(x, N); }
+
+void PrefixsumCpu(slice_ptr_t* x, int N) { PrefixsumCpuImpl(x, N); }
 
 //////////////////////// Optimize Problem /////////////////////////////////////
 /*
@@ -807,7 +812,7 @@ void CreateSellPermCpu(SparseMatrix& A)
         local_int_t in_slice_id = i % slice_size;
 
         local_int_t nnz_counter = 0;
-        local_int_t ext_nnz_index = A.csrExtOffsets[i];
+        slice_ptr_t ext_nnz_index = A.csrExtOffsets[i];
         for (local_int_t j = 0; j < A.nonzerosInRow[originalRow]; j++)
         {
             local_int_t col = A.mtxIndL[originalRow][j];
@@ -1378,9 +1383,9 @@ void ExtSpMVCpu(const SparseMatrix& A, const local_int_t n, const double alpha, 
     for (local_int_t i = 0; i < n; i++)
     {
         double sum = 0.0;
-        local_int_t first = A.csrExtOffsets[i];
-        local_int_t last = A.csrExtOffsets[i + 1];
-        for (local_int_t j = first; j < last; j++)
+        slice_ptr_t first = A.csrExtOffsets[i];
+        slice_ptr_t last = A.csrExtOffsets[i + 1];
+        for (slice_ptr_t j = first; j < last; j++)
         {
             local_int_t col = A.csrExtColumns[j];
             double val = A.csrExtValues[j];
