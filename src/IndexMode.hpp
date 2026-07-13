@@ -49,6 +49,8 @@
 #include <cstddef>
 
 #ifdef USE_CUDA
+#include <cstdio>
+#include <cstdlib>
 #include <cusparse.h>
 #endif
 
@@ -143,6 +145,47 @@ inline cusparseIndexType_t columnCusparseIndexType(IndexMode mode)
 {
     return columnsAre64(mode) ? CUSPARSE_INDEX_64I : CUSPARSE_INDEX_32I;
 }
+
+/*!
+  Validate a cuSPARSE status from a Sliced-ELL setup call against the selected
+  index mode, and fail fast if the linked cuSPARSE cannot honor the request.
+
+  Not every cuSPARSE build supports every index-width combination for
+  Sliced-ELL (for example, SpSV with 64-bit offsets and 32-bit columns is
+  unsupported on some releases). When such a call returns
+  CUSPARSE_STATUS_NOT_SUPPORTED for a non-default mode, emit an actionable
+  message pointing the user at the always-supported default (--mi 0) rather
+  than the opaque generic cuSPARSE error. Any other failure is reported
+  generically. `op` is a short label such as "SpMV" or "SpSV".
+
+  Prefer the CHECK_CUSPARSE_MODE macro so file/line are captured automatically.
+ */
+inline void checkCusparseIndexModeStatus(
+    cusparseStatus_t status, IndexMode mode, const char* op, const char* file, int line)
+{
+    if (status == CUSPARSE_STATUS_SUCCESS)
+    {
+        return;
+    }
+    if (status == CUSPARSE_STATUS_NOT_SUPPORTED && mode != IndexMode::I32_I32)
+    {
+        fprintf(stderr,
+            "HPCG: the linked cuSPARSE does not support %s on Sliced-ELL with the selected GPU index "
+            "mode (--mi %d: %s). Re-run with --mi 0 (int32 offsets / int32 columns, always supported) "
+            "or link a cuSPARSE build that supports this index mode. [%s:%d]\n",
+            op, (int) mode, toString(mode), file, line);
+    }
+    else
+    {
+        fprintf(stderr, "CUSPARSE: %s = %d (%s) at (%s:%d)\n", op, (int) status, cusparseGetErrorString(status), file,
+            line);
+    }
+    exit(1);
+}
+
+//! Wrap a cuSPARSE Sliced-ELL setup call whose validity depends on the index
+//! mode; reports an actionable error for unsupported non-default modes.
+#define CHECK_CUSPARSE_MODE(x, mode, op) checkCusparseIndexModeStatus((x), (mode), (op), __FILE__, __LINE__)
 #endif
 
 /*!
