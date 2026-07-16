@@ -1151,7 +1151,7 @@ __global__ void __launch_bounds__(128)
         return;
 
     const global_int_t col = csrExtColumns[i];
-    const local_int_t off = ext2csrOffsets[i];
+    const slice_ptr_t off = ext2csrOffsets[i]; // 64-bit: flat column offset can exceed INT_MAX at 512^3
     const local_int_t rankIdOfColumnEntry = -columns[off] - 1;
     if (neighborId == rankIdOfColumnEntry)
     {
