@@ -93,7 +93,7 @@ void GenerateProblem_Gpu(SparseMatrix& A, Vector* b, Vector* x, Vector* xexact)
 
     GenerateProblemCuda(A, b, x, xexact);
 
-    local_int_t localNumberOfNonzeros = A.localNumberOfNonzeros;
+    const slice_ptr_t localNumberOfNonzeros = A.localNumberOfNonzeros;
     global_int_t totalNumberOfNonzeros = 27LL * ((gnx - 2LL) * (gny - 2LL) * (gnz - 2LL))
         + 18LL
             * (2LL * ((gnx - 2LL) * (gny - 2LL)) + 2LL * ((gnx - 2LL) * (gnz - 2LL))
@@ -201,20 +201,22 @@ void GenerateProblem_Cpu(SparseMatrix& A, Vector* b, Vector* x, Vector* xexact)
     }
 
     // Now allocate the arrays pointed to
-    mtxIndL[0] = new local_int_t[localNumberOfRows * numberOfNonzerosPerRow];
-    matrixValues[0] = new double[localNumberOfRows * numberOfNonzerosPerRow];
-    mtxIndG[0] = new global_int_t[localNumberOfRows * numberOfNonzerosPerRow];
+    // Use size_t: localNumberOfRows * 27 overflows int32 for large local problems (e.g. 512^3 x 320).
+    const size_t rowNnzBudget = (size_t) localNumberOfRows * (size_t) numberOfNonzerosPerRow;
+    mtxIndL[0] = new local_int_t[rowNnzBudget];
+    matrixValues[0] = new double[rowNnzBudget];
+    mtxIndG[0] = new global_int_t[rowNnzBudget];
 
-    local_int_t localNumberOfNonzeros = 0;
-    local_int_t ext_nnz = 0;
+    slice_ptr_t localNumberOfNonzeros = 0;
+    slice_ptr_t ext_nnz = 0;
 #ifndef HPCG_NO_OPENMP
 #pragma omp parallel for reduction(+ : localNumberOfNonzeros) reduction(+ : ext_nnz)
 #endif
     for (local_int_t i = 0; i < localNumberOfRows; i++)
     {
-        mtxIndL[i] = mtxIndL[0] + i * numberOfNonzerosPerRow;
-        matrixValues[i] = matrixValues[0] + i * numberOfNonzerosPerRow;
-        mtxIndG[i] = mtxIndG[0] + i * numberOfNonzerosPerRow;
+        mtxIndL[i] = mtxIndL[0] + (size_t) i * numberOfNonzerosPerRow;
+        matrixValues[i] = matrixValues[0] + (size_t) i * numberOfNonzerosPerRow;
+        mtxIndG[i] = mtxIndG[0] + (size_t) i * numberOfNonzerosPerRow;
 
         const local_int_t iz = (i / (nx * ny));
         const local_int_t iy = (i - iz * nx * ny) / nx;

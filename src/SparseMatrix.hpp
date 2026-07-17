@@ -173,7 +173,7 @@ struct SparseMatrix_STRUCT
     global_int_t totalNumberOfNonzeros;         //!< total number of matrix nonzeros across all processes
     local_int_t localNumberOfRows;              //!< number of rows local to this process
     local_int_t localNumberOfColumns;           //!< number of columns local to this process
-    local_int_t localNumberOfNonzeros;          //!< number of nonzeros local to this process
+    slice_ptr_t localNumberOfNonzeros; //!< nnz local to this process (64-bit; can exceed 2^31)
     local_int_t* nonzerosInRow;                 //!< The number of nonzeros in a row will always be 27 or fewer
     global_int_t** mtxIndG;                     //!< matrix indices as global values
     local_int_t** mtxIndL;                      //!< matrix indices as local values
@@ -201,7 +201,7 @@ struct SparseMatrix_STRUCT
     local_int_t* receiveLength; //!< lenghts of messages received from neighboring processes
     local_int_t* sendLength;    //!< lenghts of messages sent to neighboring processes
     double* sendBuffer;         //!< send buffer for non-blocking sends
-    local_int_t extNnz;
+    slice_ptr_t extNnz; //!< external (halo) nnz; 64-bit like localNumberOfNonzeros
 #endif
 
     // Optmization Data common between CPU and GPU
@@ -212,8 +212,12 @@ struct SparseMatrix_STRUCT
     local_int_t* f2cPerm;
 
     // Sliced EllPACK
-    local_int_t *sellASliceMrl, *sellLSliceMrl, *sellUSliceMrl;
-    local_int_t *sellAPermColumns, *sellLPermColumns, *sellUPermColumns;
+    // aarch64 host slice offsets and columns are width-agnostic (void*), sized by
+    // --mi like GPU sellDev: offsets are int32 for --mi 0 and int64 for --mi 1/2;
+    // columns are int32 for --mi 0/1 and int64 for --mi 2. Typed access is
+    // confined to dispatchIndexMode() call sites in CpuKernels.
+    void *sellASliceMrl, *sellLSliceMrl, *sellUSliceMrl;
+    void *sellAPermColumns, *sellLPermColumns, *sellUPermColumns;
     double *sellAPermValues, *sellLPermValues, *sellUPermValues;
     double* diagonal;
 
@@ -235,11 +239,14 @@ struct SparseMatrix_STRUCT
     int* sdispls;
     int* rdispls;
 
+    // Runtime Sliced-ELL index widths (--mi). Used by GPU (cuSPARSE) and
+    // aarch64 CPU (NVPL Sparse). Coarse levels inherit this in AllocateMem*.
+    IndexMode index_mode = IndexMode::I32_I32;
+
 #ifdef USE_CUDA
     CUSPARSE_STRUCT cusparseOpt;
     GPU_AUX_STRUCT gpuAux;
-    IndexMode index_mode = IndexMode::I32_I32; // GPU Sliced-ELL index widths (--mi)
-    SellDeviceArrays sellDev;                  // Width-agnostic SELL offset/column device arrays
+    SellDeviceArrays sellDev; // Width-agnostic SELL offset/column device arrays
 #endif
 
 #ifdef USE_GRACE
@@ -291,6 +298,7 @@ inline void InitializeSparseMatrix(SparseMatrix& A, Geometry* geom)
     A.receiveLength = 0;
     A.sendLength = 0;
     A.sendBuffer = 0;
+    A.extNnz = 0;
 #endif
     A.mgData = 0; // Fine-to-coarse grid transfer initially not defined.
 

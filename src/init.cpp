@@ -408,8 +408,21 @@ int HPCG_Init(int* argc_p, char*** argv_p, HPCG_Params& params)
     // (i.e. refMaxIters iterations) when the flag is absent or set to 0.
     params.benchmark_overhead_iters = iparams[19] > 0 ? iparams[19] : 0;
 
-    // --mi: GPU Sliced-ELL index-width mode (0 int32/int32, 1 int64 offsets/int32 columns,
+    // --mi: Sliced-ELL index-width mode (0 int32/int32, 1 int64 offsets/int32 columns,
     // 2 int64/int64). Runtime-selectable; defaults to legacy int32/int32.
+    // GPU: cuSPARSE (support depends on linked build). aarch64/NVPL: all of mi 0/1/2
+    // are supported (offset and column widths follow the mode).
+    // Only 0/1/2 are valid --mi values; reject anything else with a hard error
+    // rather than silently falling back to a different index layout.
+    if (iparams[20] < 0 || iparams[20] > 2)
+    {
+        if (params.comm_rank == 0)
+            fprintf(stderr, "Error: invalid --mi=%d (valid values are 0, 1, 2). Exiting ...\n", iparams[20]);
+#ifndef HPCG_NO_MPI
+        MPI_Finalize();
+#endif
+        exit(1);
+    }
     params.index_mode = indexModeFromInt(iparams[20]);
 
     if (params.comm_rank == 0)

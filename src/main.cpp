@@ -176,8 +176,8 @@ int main(int argc, char* argv[])
 #endif
         printf("\nStart of application (%s) ...\n",
             params.exec_mode == GPUONLY       ? "GPU-Only"
-                : params.exec_mode == CPUONLY ? "Grace-Only"
-                                              : "GPU+Grace");
+                : params.exec_mode == CPUONLY ? "CPU(aarch64)-Only"
+                                              : "GPU+CPU(aarch64)");
 
         if (benchmark_mode)
             printf(" | Benchmark Mode !!!! CPU reference code is not performed \n"
@@ -195,7 +195,9 @@ int main(int argc, char* argv[])
             printf(" | Using INT64 Indexing \n");
         #endif
         if (params.exec_mode == GPUONLY || params.exec_mode == GPUCPU)
-            printf(" | GPU Sliced-ELL index mode (--mi %d): %s\n", (int) Index_Mode, toString(Index_Mode));
+            printf(" | Index mode (--mi %d): %s\n", (int) Index_Mode, toString(Index_Mode));
+        if (params.exec_mode == CPUONLY || params.exec_mode == GPUCPU)
+            printf(" | Index mode (--mi %d): %s\n", (int) Index_Mode, toString(Index_Mode));
     }
 
     // Check P2P comm mode
@@ -442,6 +444,7 @@ int main(int argc, char* argv[])
 #ifdef USE_GRACE
         A.rankType = CPU;
         A.slice_size = params.cpu_slice_size;
+        A.index_mode = Index_Mode; // Propagated to coarse levels in AllocateMemCpu.
         // Use this array for collecting timing information
         double setup_time = mytimer();
         GenerateProblem(A, &b, &x, &xexact);

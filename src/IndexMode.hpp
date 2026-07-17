@@ -32,13 +32,14 @@
 /*!
  @file IndexMode.hpp
 
- Runtime-selectable index-width support for the GPU Sliced-ELL operator.
+ Runtime-selectable index-width support for the Sliced-ELL operator (GPU via
+ cuSPARSE, aarch64 CPU via NVPL Sparse).
 
  A single binary can choose, at run time (via the --mi flag), how wide the
- Sliced-ELL slice-offset and column-index device arrays are, without a
- recompile. This module is the ONE place that maps an IndexMode to concrete
- element types, byte sizes and cuSPARSE index-type enums, and provides the
- single dispatch helper that turns a runtime mode into compile-time template
+ Sliced-ELL slice-offset and column-index arrays are, without a recompile.
+ This module is the ONE place that maps an IndexMode to concrete element
+ types, byte sizes and library index-type enums, and provides the single
+ dispatch helper that turns a runtime mode into compile-time template
  parameters. Keep all mode->type decisions here so the rest of the codebase
  never open-codes a switch over IndexMode.
  */
@@ -59,9 +60,9 @@
 
   The two independent widths are the slice-offset width and the column-index
   width. Only the combinations that are useful in practice are exposed:
-   - I32_I32: 32-bit offsets, 32-bit columns (legacy behavior; default).
-   - I64_I32: 64-bit offsets, 32-bit columns (mixed indexing).
-   - I64_I64: 64-bit offsets, 64-bit columns.
+   - I32_I32: 32-bit offsets, 32-bit columns (legacy; nnz must fit in int32).
+   - I64_I32: 64-bit offsets / nnz, 32-bit columns (mixed; nnz may exceed 2^31).
+   - I64_I64: 64-bit offsets / nnz, 64-bit columns.
  */
 enum class IndexMode : int
 {
@@ -95,10 +96,10 @@ inline const char* toString(IndexMode mode)
 {
     switch (mode)
     {
-    case IndexMode::I64_I32: return "int64 offsets / int32 columns (mixed)";
-    case IndexMode::I64_I64: return "int64 offsets / int64 columns";
+    case IndexMode::I64_I32: return "int64 nnz/offsets / int32 columns (mixed)";
+    case IndexMode::I64_I64: return "int64 nnz/offsets / int64 columns";
     case IndexMode::I32_I32:
-    default: return "int32 offsets / int32 columns";
+    default: return "int32 nnz/offsets / int32 columns";
     }
 }
 
@@ -186,6 +187,22 @@ inline void checkCusparseIndexModeStatus(
 //! Wrap a cuSPARSE Sliced-ELL setup call whose validity depends on the index
 //! mode; reports an actionable error for unsupported non-default modes.
 #define CHECK_CUSPARSE_MODE(x, mode, op) checkCusparseIndexModeStatus((x), (mode), (op), __FILE__, __LINE__)
+#endif
+
+#ifdef USE_GRACE
+#include <nvpl_sparse.h>
+
+//! NVPL Sparse index type for the slice-offset arrays.
+inline nvpl_sparse_index_type_t offsetNvplIndexType(IndexMode mode)
+{
+    return offsetsAre64(mode) ? NVPL_SPARSE_INDEX_64I : NVPL_SPARSE_INDEX_32I;
+}
+
+//! NVPL Sparse index type for the column-index arrays.
+inline nvpl_sparse_index_type_t columnNvplIndexType(IndexMode mode)
+{
+    return columnsAre64(mode) ? NVPL_SPARSE_INDEX_64I : NVPL_SPARSE_INDEX_32I;
+}
 #endif
 
 /*!

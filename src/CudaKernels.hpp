@@ -41,7 +41,7 @@ void SetupHaloCuda(SparseMatrix& A, local_int_t sendbufld, local_int_t* sendlen,
     local_int_t* tot_to_send, int* nneighs, int* neighs_h, local_int_t* sendlen_h, local_int_t** elem_to_send_d);
 void ExtToLocMapCuda(
     local_int_t localNumberOfRows, local_int_t str, local_int_t end, local_int_t* extToLocMap, local_int_t* eltsToRecv);
-void ExtTolocCuda(local_int_t localNumberOfRows, int neighborId, local_int_t ext_nnz, local_int_t* csr_ext_columns,
+void ExtTolocCuda(local_int_t localNumberOfRows, int neighborId, slice_ptr_t ext_nnz, local_int_t* csr_ext_columns,
     double* csr_ext_values, slice_ptr_t* ext2csr_offsets, local_int_t* extToLocMap, local_int_t* csrColumns);
 void PackSendBufferCuda(const SparseMatrix& A, Vector& x, bool cpu_data, cudaStream_t stream1);
 void ExchangeHaloCuda(const SparseMatrix& A, Vector& x, cudaStream_t stream1, int use_ibarrier = 0);

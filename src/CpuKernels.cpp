@@ -32,15 +32,19 @@ static constexpr int kCpuOptInitialTotalColors = 2 * 2 * 2;
     Hard-coding is used only when Use_Hpcg_Mem_Reduction is set
      to true in src/main. Other wise we use an estimation div-
      isor for L and U matrices.
+
+    Return type is slice_ptr_t so large SELL L/U value-array sizes do not
+    wrap when --mi uses 64-bit slice offsets.
 */
-static local_int_t EstimateCpuLUmem(size_t nrow, size_t padded_nrow, int level)
+static slice_ptr_t EstimateCpuLUmem(size_t nrow, size_t padded_nrow, int level)
 {
     bool power_two = (nrow & (nrow - 1)) == 0;
-    float divisor = nrow < 8192 ? 1.0 : (power_two ? 1.85 : 1.60);
-    local_int_t estimated_size = (padded_nrow * HPCG_MAX_ROW_LEN * 1.0f) / divisor;
-    local_int_t v288x512x512[] = {1057190464, 132276512, 16615072, 2074384};
-    local_int_t v296x512x512[] = {1095636608, 136618560, 16967616, 2883872};
-    local_int_t* v = nrow == 288 * 512 * 512 ? v288x512x512
+    double divisor = nrow < 8192 ? 1.0 : (power_two ? 1.85 : 1.60);
+    slice_ptr_t estimated_size = (slice_ptr_t) ((double) padded_nrow * HPCG_MAX_ROW_LEN / divisor);
+    // Keep as slice_ptr_t literals; these are SELL value-array lengths.
+    slice_ptr_t v288x512x512[] = {1057190464LL, 132276512LL, 16615072LL, 2074384LL};
+    slice_ptr_t v296x512x512[] = {1095636608LL, 136618560LL, 16967616LL, 2883872LL};
+    slice_ptr_t* v = nrow == 288 * 512 * 512 ? v288x512x512
         : nrow == 296 * 512 * 512            ? v296x512x512
         : nullptr;
     if (v != nullptr)
@@ -57,10 +61,49 @@ static local_int_t EstimateCpuLUmem(size_t nrow, size_t padded_nrow, int level)
     return estimated_size;
 }
 
+static void* AllocSellSliceMrl(size_t nEntries, IndexMode mode)
+{
+    if (offsetsAre64(mode))
+        return new idx64_t[nEntries]();
+    return new idx32_t[nEntries]();
+}
+
+static void FreeSellSliceMrl(void*& p, IndexMode mode)
+{
+    if (!p)
+        return;
+    if (offsetsAre64(mode))
+        delete[] static_cast<idx64_t*>(p);
+    else
+        delete[] static_cast<idx32_t*>(p);
+    p = nullptr;
+}
+
+// SELL column arrays follow the --mi column width: int32 for mi 0/1, int64 for
+// mi 2. Storage is void* in SparseMatrix; typed access is confined to the
+// dispatchIndexMode() call sites below and to these alloc/free helpers.
+static void* AllocSellColumns(size_t nEntries, IndexMode mode)
+{
+    if (columnsAre64(mode))
+        return new idx64_t[nEntries];
+    return new idx32_t[nEntries];
+}
+
+static void FreeSellColumns(void*& p, IndexMode mode)
+{
+    if (!p)
+        return;
+    if (columnsAre64(mode))
+        delete[] static_cast<idx64_t*>(p);
+    else
+        delete[] static_cast<idx32_t*>(p);
+    p = nullptr;
+}
+
 // Bytes allocated by one AllocateMemCpu multigrid level. Keep in sync with
 // AllocateMemCpu below.
 static void AccumulateCpuOptMemAllocateCpuLevel(
-    size_t& opt_mem, size_t nrow, size_t ncol, size_t extNnz, int slice_size, int level)
+    size_t& opt_mem, size_t nrow, size_t ncol, size_t extNnz, int slice_size, int level, IndexMode mode)
 {
     opt_mem += nrow * sizeof(double); // diagonal
     opt_mem += nrow * sizeof(double); // tempBuffer
@@ -73,16 +116,17 @@ static void AccumulateCpuOptMemAllocateCpuLevel(
 
     size_t num_slices = (nrow + slice_size - 1) / slice_size;
     size_t padded_nrow = num_slices * slice_size;
-    local_int_t estimated_size = EstimateCpuLUmem(nrow, padded_nrow, level);
+    slice_ptr_t estimated_size = EstimateCpuLUmem(nrow, padded_nrow, level);
+    const size_t offBytes = offsetIndexBytes(mode);
 
-    opt_mem += 3 * (num_slices + 1) * sizeof(local_int_t); // sell{A,L,U}SliceMrl
-    opt_mem += padded_nrow * HPCG_MAX_ROW_LEN * sizeof(local_int_t); // sellAPermColumns
-    opt_mem += 2 * estimated_size * sizeof(local_int_t); // sell{L,U}PermColumns
+    opt_mem += 3 * (num_slices + 1) * offBytes; // sell{A,L,U}SliceMrl
+    opt_mem += padded_nrow * HPCG_MAX_ROW_LEN * columnIndexBytes(mode); // sellAPermColumns
+    opt_mem += 2 * (size_t) estimated_size * columnIndexBytes(mode); // sell{L,U}PermColumns
     opt_mem += padded_nrow * HPCG_MAX_ROW_LEN * sizeof(double); // sellAPermValues
     if (Use_Hpcg_Mem_Reduction)
-        opt_mem += estimated_size * sizeof(double); // sell{L,U}PermValues alias
+        opt_mem += (size_t) estimated_size * sizeof(double); // sell{L,U}PermValues alias
     else
-        opt_mem += 2 * estimated_size * sizeof(double);
+        opt_mem += 2 * (size_t) estimated_size * sizeof(double);
 
     if (Use_Hpcg_Mem_Reduction && nrow % 8 == 0)
         opt_mem += 2048 + 8 * sizeof(local_int_t) * nrow; // bufferSvL/U (shared)
@@ -100,7 +144,7 @@ size_t EstimateCpuOptMem(const SparseMatrix& A_in)
     for (int level = 0; level < numberOfMgLevels; ++level)
     {
         AccumulateCpuOptMemAllocateCpuLevel(
-            opt_mem, A->localNumberOfRows, A->localNumberOfColumns, A->extNnz, slice_size, level);
+            opt_mem, A->localNumberOfRows, A->localNumberOfColumns, A->extNnz, slice_size, level, A_in.index_mode);
         A = A->Ac;
     }
     return opt_mem;
@@ -116,6 +160,7 @@ void AllocateMemCpu(SparseMatrix& A_in)
     {
         A->level = level;
         A->slice_size = slice_size;
+        A->index_mode = A_in.index_mode;
         size_t nrow = A->localNumberOfRows;
         size_t ncol = A->localNumberOfColumns;
 
@@ -136,15 +181,15 @@ void AllocateMemCpu(SparseMatrix& A_in)
 
         size_t num_slices = (nrow + slice_size - 1) / slice_size;
         size_t padded_nrow = num_slices * slice_size;
-        local_int_t estimated_size = EstimateCpuLUmem(nrow, padded_nrow, level);
+        slice_ptr_t estimated_size = EstimateCpuLUmem(nrow, padded_nrow, level);
 
-        A->sellASliceMrl = new local_int_t[num_slices + 1];
-        A->sellLSliceMrl = new local_int_t[num_slices + 1];
-        A->sellUSliceMrl = new local_int_t[num_slices + 1];
+        A->sellASliceMrl = AllocSellSliceMrl(num_slices + 1, A->index_mode);
+        A->sellLSliceMrl = AllocSellSliceMrl(num_slices + 1, A->index_mode);
+        A->sellUSliceMrl = AllocSellSliceMrl(num_slices + 1, A->index_mode);
 
-        A->sellAPermColumns = new local_int_t[padded_nrow * HPCG_MAX_ROW_LEN];
-        A->sellLPermColumns = new local_int_t[estimated_size]; // Should be much less
-        A->sellUPermColumns = new local_int_t[estimated_size]; // Should be much less
+        A->sellAPermColumns = AllocSellColumns(padded_nrow * HPCG_MAX_ROW_LEN, A->index_mode);
+        A->sellLPermColumns = AllocSellColumns(estimated_size, A->index_mode); // May grow in CreateSellPermCpu
+        A->sellUPermColumns = AllocSellColumns(estimated_size, A->index_mode);
 
         A->sellAPermValues = new double[padded_nrow * HPCG_MAX_ROW_LEN];
         A->sellLPermValues = new double[estimated_size];
@@ -223,18 +268,15 @@ void DeleteMatrixCpu(SparseMatrix& A)
 #endif
 
         if (AA->sellASliceMrl)
-            delete[] AA->sellASliceMrl;
+            FreeSellSliceMrl(AA->sellASliceMrl, AA->index_mode);
         if (AA->sellLSliceMrl)
-            delete[] AA->sellLSliceMrl;
+            FreeSellSliceMrl(AA->sellLSliceMrl, AA->index_mode);
         if (AA->sellUSliceMrl)
-            delete[] AA->sellUSliceMrl;
+            FreeSellSliceMrl(AA->sellUSliceMrl, AA->index_mode);
 
-        if (AA->sellAPermColumns)
-            delete[] AA->sellAPermColumns;
-        if (AA->sellLPermColumns)
-            delete[] AA->sellLPermColumns;
-        if (AA->sellUPermColumns)
-            delete[] AA->sellUPermColumns;
+        FreeSellColumns(AA->sellAPermColumns, AA->index_mode);
+        FreeSellColumns(AA->sellLPermColumns, AA->index_mode);
+        FreeSellColumns(AA->sellUPermColumns, AA->index_mode);
 
         if (AA->sellAPermValues)
             delete[] AA->sellAPermValues;
@@ -264,6 +306,10 @@ void DeleteMatrixCpu(SparseMatrix& A)
 
         if (AA->bufferSvL)
             delete[] AA->bufferSvL;
+        if (AA->bufferSvU && AA->bufferSvU != AA->bufferSvL)
+            delete[] AA->bufferSvU;
+        AA->bufferSvL = nullptr;
+        AA->bufferSvU = nullptr;
         if (AA->nvplSparseOpt.vecX)
             nvpl_sparse_destroy_dn_vec(AA->nvplSparseOpt.vecX);
         if (AA->nvplSparseOpt.vecY)
@@ -792,144 +838,190 @@ void CreateSellPermCpu(SparseMatrix& A)
     local_int_t num_threads = omp_get_max_threads();
     local_int_t rows_per_thread = (nrow + num_threads - 1) / num_threads;
 
+    // Slice-offset width follows --mi (same as GPU). Columns stay local_int_t for mi 0/1.
+    dispatchIndexMode(A.index_mode,
+        [&](auto offTag, auto colTag)
+        {
+            using OffsetT = decltype(offTag);
+            using ColT = decltype(colTag);
+            OffsetT* sellASliceMrl = static_cast<OffsetT*>(A.sellASliceMrl);
+            OffsetT* sellLSliceMrl = static_cast<OffsetT*>(A.sellLSliceMrl);
+            OffsetT* sellUSliceMrl = static_cast<OffsetT*>(A.sellUSliceMrl);
+            ColT* sellAPermColumns = static_cast<ColT*>(A.sellAPermColumns);
+            ColT* sellLPermColumns = static_cast<ColT*>(A.sellLPermColumns);
+            ColT* sellUPermColumns = static_cast<ColT*>(A.sellUPermColumns);
+
 #pragma omp parallel for
-    for (auto slice = 0; slice < num_slices + 1; slice++)
-    {
-        A.sellASliceMrl[slice] = (slice) *HPCG_MAX_ROW_LEN * slice_size;
-        A.sellLSliceMrl[slice] = 0;
-        A.sellUSliceMrl[slice] = 0;
-    }
+            for (auto slice = 0; slice < num_slices + 1; slice++)
+            {
+                // Promote before multiply: padded_nrow * 27 can exceed INT_MAX for --mi 1.
+                sellASliceMrl[slice] = (OffsetT) ((slice_ptr_t) slice * HPCG_MAX_ROW_LEN * slice_size);
+                sellLSliceMrl[slice] = 0;
+                sellUSliceMrl[slice] = 0;
+            }
 
 // Create A in SELL
 #pragma omp parallel for
-    for (local_int_t i = 0; i < nrow; i++)
-    {
-        local_int_t l_nnz = 0;
-        local_int_t u_nnz = 0;
-        local_int_t ext_nnz = 0;
-        local_int_t originalRow = A.opt2ref[i];
-        local_int_t slice_id = i / slice_size;
-        local_int_t in_slice_id = i % slice_size;
-
-        local_int_t nnz_counter = 0;
-        slice_ptr_t ext_nnz_index = A.csrExtOffsets[i];
-        for (local_int_t j = 0; j < A.nonzerosInRow[originalRow]; j++)
-        {
-            local_int_t col = A.mtxIndL[originalRow][j];
-            double val = A.matrixValues[originalRow][j];
-            local_int_t new_col = A.ref2opt[col];
-            if (col < nrow)
+            for (local_int_t i = 0; i < nrow; i++)
             {
-                // Locality is bad, consider blocking
-                auto index = slice_id * slice_size * HPCG_MAX_ROW_LEN + nnz_counter * slice_size + in_slice_id;
-                A.sellAPermColumns[index] = new_col;
-                A.sellAPermValues[index] = val;
-                nnz_counter++;
+                local_int_t l_nnz = 0;
+                local_int_t u_nnz = 0;
+                local_int_t originalRow = A.opt2ref[i];
+                local_int_t slice_id = i / slice_size;
+                local_int_t in_slice_id = i % slice_size;
 
-                if (col == originalRow)
-                { // diagonal
-                    A.diagonal[i] = val;
+                local_int_t nnz_counter = 0;
+                slice_ptr_t ext_nnz_index = A.csrExtOffsets[i];
+                for (local_int_t j = 0; j < A.nonzerosInRow[originalRow]; j++)
+                {
+                    local_int_t col = A.mtxIndL[originalRow][j];
+                    double val = A.matrixValues[originalRow][j];
+                    local_int_t new_col = A.ref2opt[col];
+                    if (col < nrow)
+                    {
+                        // Locality is bad, consider blocking
+                        const slice_ptr_t index = (slice_ptr_t) slice_id * slice_size * HPCG_MAX_ROW_LEN
+                            + (slice_ptr_t) nnz_counter * slice_size + in_slice_id;
+                        sellAPermColumns[index] = (ColT) new_col;
+                        A.sellAPermValues[index] = val;
+                        nnz_counter++;
+
+                        if (col == originalRow)
+                        { // diagonal
+                            A.diagonal[i] = val;
+                        }
+                        else if (new_col < i)
+                        { // lower diagonal
+                            l_nnz++;
+                        }
+                        else if (new_col > i)
+                        { // upper diagonal
+                            u_nnz++;
+                        }
+                    }
+                    else
+                    {
+                        A.csrExtColumns[ext_nnz_index] = col;
+                        A.csrExtValues[ext_nnz_index] = val;
+                        ext_nnz_index++;
+                    }
                 }
-                else if (new_col < i)
-                { // lower diagonal
-                    l_nnz++;
+
+                for (; nnz_counter < HPCG_MAX_ROW_LEN; nnz_counter++)
+                {
+                    const slice_ptr_t index = (slice_ptr_t) slice_id * slice_size * HPCG_MAX_ROW_LEN
+                        + (slice_ptr_t) nnz_counter * slice_size + in_slice_id;
+                    sellAPermColumns[index] = (ColT) -1;
+                    A.sellAPermValues[index] = 0.0f;
                 }
-                else if (new_col > i)
-                { // upper diagonal
-                    u_nnz++;
+
+                local_int_t thread_slice0 = (slice_id * slice_size) / rows_per_thread;
+                local_int_t thread_slice1 = ((slice_id + 1) * slice_size - 1) / rows_per_thread;
+
+                if (thread_slice0 == thread_slice1 && rows_per_thread > slice_size)
+                {
+                    sellLSliceMrl[slice_id + 1] = std::max(sellLSliceMrl[slice_id + 1], (OffsetT) (l_nnz * slice_size));
+                    sellUSliceMrl[slice_id + 1] = std::max(sellUSliceMrl[slice_id + 1], (OffsetT) (u_nnz * slice_size));
                 }
+                else
+                {
+#pragma omp critical
+                    {
+                        sellLSliceMrl[slice_id + 1]
+                            = std::max(sellLSliceMrl[slice_id + 1], (OffsetT) (l_nnz * slice_size));
+                        sellUSliceMrl[slice_id + 1]
+                            = std::max(sellUSliceMrl[slice_id + 1], (OffsetT) (u_nnz * slice_size));
+                    }
+                }
+            }
+
+            // Next Prefix-Sum
+            for (auto slice = 0; slice < num_slices; slice++)
+            {
+                sellLSliceMrl[slice + 1] += sellLSliceMrl[slice];
+                sellUSliceMrl[slice + 1] += sellUSliceMrl[slice];
+            }
+
+            // Exact L/U SELL lengths are known now. Grow past the initial estimate if needed
+            // (64-bit offsets make large-local problems exceed the old int32-era tables).
+            const slice_ptr_t need_l = (slice_ptr_t) sellLSliceMrl[num_slices];
+            const slice_ptr_t need_u = (slice_ptr_t) sellUSliceMrl[num_slices];
+            const slice_ptr_t need_lu = std::max(need_l, need_u);
+
+            FreeSellColumns(A.sellLPermColumns, A.index_mode);
+            FreeSellColumns(A.sellUPermColumns, A.index_mode);
+            if (Use_Hpcg_Mem_Reduction)
+            {
+                delete[] A.sellLPermValues;
+                A.sellLPermValues = new double[need_lu];
+                A.sellUPermValues = A.sellLPermValues;
             }
             else
             {
-                A.csrExtColumns[ext_nnz_index] = col;
-                A.csrExtValues[ext_nnz_index] = val;   
-                ext_nnz_index++;
+                delete[] A.sellLPermValues;
+                delete[] A.sellUPermValues;
+                A.sellLPermValues = new double[need_l];
+                A.sellUPermValues = new double[need_u];
             }
-        }
-
-        for (; nnz_counter < HPCG_MAX_ROW_LEN; nnz_counter++)
-        {
-            auto index = slice_id * slice_size * HPCG_MAX_ROW_LEN + nnz_counter * slice_size + in_slice_id;
-            A.sellAPermColumns[index] = -1;
-            A.sellAPermValues[index] = 0.0f;
-        }
-
-        local_int_t thread_slice0 = (slice_id * slice_size) / rows_per_thread;
-        local_int_t thread_slice1 = ((slice_id + 1) * slice_size - 1) / rows_per_thread;
-
-        if (thread_slice0 == thread_slice1 && rows_per_thread > slice_size)
-        {
-            A.sellLSliceMrl[slice_id + 1] = std::max(A.sellLSliceMrl[slice_id + 1], l_nnz * slice_size);
-            A.sellUSliceMrl[slice_id + 1] = std::max(A.sellUSliceMrl[slice_id + 1], u_nnz * slice_size);
-        }
-        else
-        {
-#pragma omp critical
-            {
-                A.sellLSliceMrl[slice_id + 1] = std::max(A.sellLSliceMrl[slice_id + 1], l_nnz * slice_size);
-                A.sellUSliceMrl[slice_id + 1] = std::max(A.sellUSliceMrl[slice_id + 1], u_nnz * slice_size);
-            }
-        }
-    }
-
-    // Next Pefix-Sum
-    for (auto slice = 0; slice < num_slices; slice++)
-    {
-        A.sellLSliceMrl[slice + 1] += A.sellLSliceMrl[slice];
-        A.sellUSliceMrl[slice + 1] += A.sellUSliceMrl[slice];
-    }
+            A.sellLPermColumns = AllocSellColumns(need_l, A.index_mode);
+            A.sellUPermColumns = AllocSellColumns(need_u, A.index_mode);
+            sellLPermColumns = static_cast<ColT*>(A.sellLPermColumns);
+            sellUPermColumns = static_cast<ColT*>(A.sellUPermColumns);
 
 // Create lower and upper SELL formats
 #pragma omp parallel for
-    for (auto i = 0; i < nrow; i++)
-    {
-        local_int_t row_inblock_id = i % slice_size;
-        local_int_t row_block_id = i / slice_size;
-
-        local_int_t row_start_index = row_block_id * HPCG_MAX_ROW_LEN * slice_size + row_inblock_id;
-        local_int_t row_end_index = row_start_index + HPCG_MAX_ROW_LEN * slice_size;
-
-        local_int_t l_row_start = A.sellLSliceMrl[row_block_id] + row_inblock_id;
-        local_int_t u_row_start = A.sellUSliceMrl[row_block_id] + row_inblock_id;
-
-        local_int_t l_len = (A.sellLSliceMrl[row_block_id + 1] - A.sellLSliceMrl[row_block_id]) / slice_size;
-        local_int_t u_len = (A.sellUSliceMrl[row_block_id + 1] - A.sellUSliceMrl[row_block_id]) / slice_size;
-
-        local_int_t l_row_end = l_row_start + l_len * slice_size;
-        local_int_t u_row_end = u_row_start + u_len * slice_size;
-
-        for (local_int_t j = row_start_index; j < row_end_index; j += slice_size)
-        {
-            local_int_t col = A.sellAPermColumns[j];
-            double val = A.sellAPermValues[j];
-            if (col != -1 && col < i)
+            for (auto i = 0; i < nrow; i++)
             {
-                A.sellLPermColumns[l_row_start] = col;
-                A.sellLPermValues[l_row_start] = -1;
-                l_row_start += slice_size;
-            }
-            else if (col != -1 && col > i)
-            {
-                A.sellUPermColumns[u_row_start] = col;
-                A.sellUPermValues[u_row_start] = -1;
-                u_row_start += slice_size;
-            }
-        }
+                local_int_t row_inblock_id = i % slice_size;
+                local_int_t row_block_id = i / slice_size;
 
-        // Padd lower
-        for (local_int_t j = l_row_start; j < l_row_end; j += slice_size)
-        {
-            A.sellLPermColumns[j] = -1;
-            A.sellLPermValues[j] = -1;
-        }
+                const slice_ptr_t row_start_index
+                    = (slice_ptr_t) row_block_id * HPCG_MAX_ROW_LEN * slice_size + row_inblock_id;
+                const slice_ptr_t row_end_index = row_start_index + (slice_ptr_t) HPCG_MAX_ROW_LEN * slice_size;
 
-        // Padd upper
-        for (local_int_t j = u_row_start; j < u_row_end; j += slice_size)
-        {
-            A.sellUPermColumns[j] = -1;
-            A.sellUPermValues[j] = -1;
-        }
-    }
+                OffsetT l_row_start = sellLSliceMrl[row_block_id] + row_inblock_id;
+                OffsetT u_row_start = sellUSliceMrl[row_block_id] + row_inblock_id;
+
+                local_int_t l_len
+                    = (local_int_t) ((sellLSliceMrl[row_block_id + 1] - sellLSliceMrl[row_block_id]) / slice_size);
+                local_int_t u_len
+                    = (local_int_t) ((sellUSliceMrl[row_block_id + 1] - sellUSliceMrl[row_block_id]) / slice_size);
+
+                OffsetT l_row_end = l_row_start + (OffsetT) l_len * slice_size;
+                OffsetT u_row_end = u_row_start + (OffsetT) u_len * slice_size;
+
+                for (slice_ptr_t j = row_start_index; j < row_end_index; j += slice_size)
+                {
+                    local_int_t col = (local_int_t) sellAPermColumns[j];
+                    if (col != -1 && col < i)
+                    {
+                        sellLPermColumns[l_row_start] = (ColT) col;
+                        A.sellLPermValues[l_row_start] = -1;
+                        l_row_start += slice_size;
+                    }
+                    else if (col != -1 && col > i)
+                    {
+                        sellUPermColumns[u_row_start] = (ColT) col;
+                        A.sellUPermValues[u_row_start] = -1;
+                        u_row_start += slice_size;
+                    }
+                }
+
+                // Padd lower
+                for (OffsetT j = l_row_start; j < l_row_end; j += slice_size)
+                {
+                    sellLPermColumns[j] = (ColT) -1;
+                    A.sellLPermValues[j] = -1;
+                }
+
+                // Padd upper
+                for (OffsetT j = u_row_start; j < u_row_end; j += slice_size)
+                {
+                    sellUPermColumns[j] = (ColT) -1;
+                    A.sellUPermValues[j] = -1;
+                }
+            }
+        });
 }
 
 /*
@@ -966,24 +1058,32 @@ void F2cPermCpu(local_int_t nrow_c, local_int_t* f2c, local_int_t* f2cPerm, loca
 */
 void ReplaceMatrixDiagonalCpu(SparseMatrix& A, Vector diagonal)
 {
-#pragma omp parallel for
-    for (local_int_t i = 0; i < A.localNumberOfRows; i++)
-    {
-        local_int_t slice_id = i / A.slice_size;
-        local_int_t in_slice_id = i % A.slice_size;
-        local_int_t slice_start = A.sellASliceMrl[slice_id];
-        local_int_t slice_len = A.sellASliceMrl[slice_id + 1] - slice_start;
-        local_int_t start = slice_start + in_slice_id;
-        local_int_t end = start + slice_len;
-        for (local_int_t offset = start; offset < end; offset += A.slice_size)
+    dispatchIndexMode(A.index_mode,
+        [&](auto offTag, auto colTag)
         {
-            local_int_t col = A.sellAPermColumns[offset];
-            if (col == i)
-                A.sellAPermValues[offset] = diagonal.values[i];
-        }
+            using OffsetT = decltype(offTag);
+            using ColT = decltype(colTag);
+            OffsetT* sellASliceMrl = static_cast<OffsetT*>(A.sellASliceMrl);
+            ColT* sellAPermColumns = static_cast<ColT*>(A.sellAPermColumns);
+#pragma omp parallel for
+            for (local_int_t i = 0; i < A.localNumberOfRows; i++)
+            {
+                local_int_t slice_id = i / A.slice_size;
+                local_int_t in_slice_id = i % A.slice_size;
+                OffsetT slice_start = sellASliceMrl[slice_id];
+                OffsetT slice_len = sellASliceMrl[slice_id + 1] - slice_start;
+                OffsetT start = slice_start + in_slice_id;
+                OffsetT end = start + slice_len;
+                for (OffsetT offset = start; offset < end; offset += A.slice_size)
+                {
+                    local_int_t col = (local_int_t) sellAPermColumns[offset];
+                    if (col == i)
+                        A.sellAPermValues[offset] = diagonal.values[i];
+                }
 
-        A.diagonal[i] = diagonal.values[i];
-    }
+                A.diagonal[i] = diagonal.values[i];
+            }
+        });
 }
 
 //////////////////////// CG Support Kernels ///////////////////////////////////

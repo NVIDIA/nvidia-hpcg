@@ -299,27 +299,35 @@ size_t OptimizeProblemCpu(SparseMatrix& A_in, CGData& data, Vector& b, Vector& x
 
         local_int_t numberOfNonzerosPerRow = HPCG_MAX_ROW_LEN;
         local_int_t nrow = A->localNumberOfRows;
-        local_int_t half_nnz = (A->localNumberOfNonzeros - nrow - A->extNnz) / 2;
+        // --mi 1: nnz counters are 64-bit (slice_ptr_t); keep half_nnz in 64-bit for NVPL.
+        const slice_ptr_t half_nnz = (A->localNumberOfNonzeros - (slice_ptr_t) nrow - A->extNnz) / 2;
         local_int_t num_slices = (nrow + slice_size - 1) / slice_size;
-        local_int_t sell_l_nnz = A->sellLSliceMrl[num_slices];
-        local_int_t sell_u_nnz = A->sellUSliceMrl[num_slices];
-        local_int_t sell_nnz = num_slices * slice_size * numberOfNonzerosPerRow;
 
-        auto INDEX_TYPE = NVPL_SPARSE_INDEX_32I;
-#ifdef INDEX_64 // In src/Geometry
-        INDEX_TYPE = NVPL_SPARSE_INDEX_64I;
-#endif
+        const IndexMode mode = A->index_mode;
+        const nvpl_sparse_index_type_t offsetType = offsetNvplIndexType(mode);
+        const nvpl_sparse_index_type_t colType = columnNvplIndexType(mode);
+
+        // Read L/U/A SELL value-array lengths with the --mi offset width.
+        slice_ptr_t sell_l_nnz = 0, sell_u_nnz = 0;
+        dispatchIndexMode(mode,
+            [&](auto offTag, auto /*colTag*/)
+            {
+                using OffsetT = decltype(offTag);
+                sell_l_nnz = (slice_ptr_t) static_cast<OffsetT*>(A->sellLSliceMrl)[num_slices];
+                sell_u_nnz = (slice_ptr_t) static_cast<OffsetT*>(A->sellUSliceMrl)[num_slices];
+            });
+        const slice_ptr_t sell_nnz = (slice_ptr_t) num_slices * slice_size * numberOfNonzerosPerRow;
 
         nvpl_sparse_create_sliced_ell(&(A->nvplSparseOpt.matL), nrow, nrow, half_nnz, sell_l_nnz, slice_size,
-            A->sellLSliceMrl, A->sellLPermColumns, A->sellLPermValues, INDEX_TYPE, INDEX_TYPE,
+            A->sellLSliceMrl, A->sellLPermColumns, A->sellLPermValues, offsetType, colType,
             NVPL_SPARSE_INDEX_BASE_ZERO, NVPL_SPARSE_R_64F);
 
         nvpl_sparse_create_sliced_ell(&(A->nvplSparseOpt.matU), nrow, nrow, half_nnz, sell_u_nnz, slice_size,
-            A->sellUSliceMrl, A->sellUPermColumns, A->sellUPermValues, INDEX_TYPE, INDEX_TYPE,
+            A->sellUSliceMrl, A->sellUPermColumns, A->sellUPermValues, offsetType, colType,
             NVPL_SPARSE_INDEX_BASE_ZERO, NVPL_SPARSE_R_64F);
 
         nvpl_sparse_create_sliced_ell(&(A->nvplSparseOpt.matA), nrow, nrow, A->localNumberOfNonzeros, sell_nnz,
-            slice_size, A->sellASliceMrl, A->sellAPermColumns, A->sellAPermValues, INDEX_TYPE, INDEX_TYPE,
+            slice_size, A->sellASliceMrl, A->sellAPermColumns, A->sellAPermValues, offsetType, colType,
             NVPL_SPARSE_INDEX_BASE_ZERO, NVPL_SPARSE_R_64F);
 
         double alpha = 1.0, beta = 0.0;
@@ -366,9 +374,26 @@ size_t OptimizeProblemCpu(SparseMatrix& A_in, CGData& data, Vector& b, Vector& x
         InitializeVector(origDiagA, A->localNumberOfRows, CPU);
         CopyMatrixDiagonal(*A, origDiagA);
 
+        // The HPCG mem-reduction SpSV workspace heuristic is sized for int32
+        // index layouts. With --mi 1/2 (64-bit slice offsets) always query and
+        // allocate the real NVPL analysis buffer to avoid heap corruption.
+        const bool use_prealloc_spsv_workspace
+            = Use_Hpcg_Mem_Reduction && A->localNumberOfRows % 8 == 0 && !offsetsAre64(mode);
+
         // Pass strictly L, and then update the diagonal
-        if (!Use_Hpcg_Mem_Reduction || A->localNumberOfRows % 8 != 0)
+        if (!use_prealloc_spsv_workspace)
         {
+            // Drop the int32-era preallocation from AllocateMemCpu if present.
+            if (A->bufferSvL)
+            {
+                // EstimateCpuOptMem already counted this heuristic buffer; uncount it
+                // now that it is discarded for the real NVPL SpSV workspaces below,
+                // otherwise Optimization Memory Use is overstated.
+                mem -= (size_t) 2048 + 8 * sizeof(local_int_t) * (size_t) nrow;
+                delete[] A->bufferSvL;
+                A->bufferSvL = nullptr;
+                A->bufferSvU = nullptr;
+            }
             nvpl_sparse_sp_mat_set_attribute(
                 A->nvplSparseOpt.matA, NVPL_SPARSE_SPMAT_FILL_MODE, &(fillmode_l), sizeof(fillmode_l));
             nvpl_sparse_spsv_buffer_size(nvpl_sparse_handle, NVPL_SPARSE_OPERATION_NON_TRANSPOSE, &alpha,
@@ -393,7 +418,7 @@ size_t OptimizeProblemCpu(SparseMatrix& A_in, CGData& data, Vector& b, Vector& x
         // Pass strctly U, and then update diagonal
         nvpl_sparse_sp_mat_set_attribute(
             A->nvplSparseOpt.matU, NVPL_SPARSE_SPMAT_FILL_MODE, &(fillmode_u), sizeof(fillmode_u));
-        if (!Use_Hpcg_Mem_Reduction || A->localNumberOfRows % 8 != 0)
+        if (!use_prealloc_spsv_workspace)
         {
             nvpl_sparse_sp_mat_set_attribute(
                 A->nvplSparseOpt.matA, NVPL_SPARSE_SPMAT_FILL_MODE, &(fillmode_u), sizeof(fillmode_u));

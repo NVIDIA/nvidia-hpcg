@@ -43,9 +43,10 @@ Alternatively to input file accepts the following parameters:
 --bi       in benchmarking mode, the number of overhead optimized-CG iterations
            added on top of refMaxIters (50). The optimized solver runs
            50 + --bi iterations per CG set (default 0, i.e. 50 iterations)
---mi       GPU Sliced-ELL index width, selectable at run time without a
+--mi       Sliced-ELL index width, selectable at run time without a
            rebuild: 0 int32 offsets/int32 columns (default), 1 int64 offsets/
-           int32 columns (mixed), 2 int64 offsets/int64 columns
+           int32 columns, 2 int64 offsets/int64 columns. All modes are
+           supported on both GPU (cuSPARSE) and aarch64 CPU (NVPL Sparse).
 --wt       number of seconds to run the warmup phase before the timed benchmark
            (default 0, i.e. no warmup)
 --l2cmp    activates compression in GPU L2 cache when set to one (--l2cmp=1)

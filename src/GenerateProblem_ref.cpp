@@ -123,19 +123,21 @@ void GenerateProblem_ref(SparseMatrix& A, Vector* b, Vector* x, Vector* xexact)
 
 #else
     // Now allocate the arrays pointed to
-    mtxIndL[0] = new local_int_t[localNumberOfRows * numberOfNonzerosPerRow];
-    matrixValues[0] = new double[localNumberOfRows * numberOfNonzerosPerRow];
-    mtxIndG[0] = new global_int_t[localNumberOfRows * numberOfNonzerosPerRow];
+    // size_t: localNumberOfRows * 27 overflows int32 for large local problems.
+    const size_t rowNnzBudget = (size_t) localNumberOfRows * (size_t) numberOfNonzerosPerRow;
+    mtxIndL[0] = new local_int_t[rowNnzBudget];
+    matrixValues[0] = new double[rowNnzBudget];
+    mtxIndG[0] = new global_int_t[rowNnzBudget];
 
     for (local_int_t i = 1; i < localNumberOfRows; ++i)
     {
-        mtxIndL[i] = mtxIndL[0] + i * numberOfNonzerosPerRow;
-        matrixValues[i] = matrixValues[0] + i * numberOfNonzerosPerRow;
-        mtxIndG[i] = mtxIndG[0] + i * numberOfNonzerosPerRow;
+        mtxIndL[i] = mtxIndL[0] + (size_t) i * numberOfNonzerosPerRow;
+        matrixValues[i] = matrixValues[0] + (size_t) i * numberOfNonzerosPerRow;
+        mtxIndG[i] = mtxIndG[0] + (size_t) i * numberOfNonzerosPerRow;
     }
 #endif
 
-    local_int_t localNumberOfNonzeros = 0;
+    slice_ptr_t localNumberOfNonzeros = 0;
     // TODO:  This triply nested loop could be flattened or use nested parallelism
 #ifndef HPCG_NO_OPENMP
 #pragma omp parallel for
@@ -219,14 +221,12 @@ void GenerateProblem_ref(SparseMatrix& A, Vector* b, Vector* x, Vector* xexact)
 
     global_int_t totalNumberOfNonzeros = 0;
 #ifndef HPCG_NO_MPI
-    // Use MPI's reduce function to sum all nonzeros
-#ifdef HPCG_NO_LONG_LONG
-    MPI_Allreduce(&localNumberOfNonzeros, &totalNumberOfNonzeros, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
-#else
+    // Use MPI's reduce function to sum all nonzeros. localNumberOfNonzeros is
+    // slice_ptr_t (64-bit) and can exceed 2^31, so always reduce as 64-bit
+    // regardless of HPCG_NO_LONG_LONG (which only governs global_int_t width).
     long long lnnz = localNumberOfNonzeros, gnnz = 0; // convert to 64 bit for MPI call
     MPI_Allreduce(&lnnz, &gnnz, 1, MPI_LONG_LONG_INT, MPI_SUM, MPI_COMM_WORLD);
     totalNumberOfNonzeros = gnnz; // Copy back
-#endif
 #else
     totalNumberOfNonzeros = localNumberOfNonzeros;
 #endif

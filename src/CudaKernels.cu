@@ -904,10 +904,12 @@ void GenerateProblemCuda(SparseMatrix& A, Vector* b, Vector* x, Vector* xexact)
     slice_ptr_t extNnz_tmp = 0;
     CHECK_CUDART(cudaMemcpy(
         &extNnz_tmp, &(A.csrExtOffsets[A.gpuAux.compressNumberOfRows]), sizeof(slice_ptr_t), cudaMemcpyDeviceToHost));
-    A.extNnz = (local_int_t) extNnz_tmp;
-    local_int_t localNumberOfNonzeros = 0;
-    CHECK_CUDART(cudaMemcpy(
-        &localNumberOfNonzeros, &(A.gpuAux.nnzPerRow[localNumberOfRows]), sizeof(local_int_t), cudaMemcpyDeviceToHost));
+    A.extNnz = extNnz_tmp;
+    // Device nnzPerRow scan is still int32; host field is slice_ptr_t for --mi nnz > 2^31.
+    // OptimizeProblemCuda derives true nnz from 64-bit CSR offsets when this wraps.
+    local_int_t localNumberOfNonzeros32 = 0;
+    CHECK_CUDART(cudaMemcpy(&localNumberOfNonzeros32, &(A.gpuAux.nnzPerRow[localNumberOfRows]), sizeof(local_int_t),
+        cudaMemcpyDeviceToHost));
 
     CHECK_CUDART(cudaMalloc((void**) &(A.csrExtColumns), sizeof(local_int_t) * A.extNnz));
     CHECK_CUDART(cudaMalloc((void**) &(A.csrExtValues), sizeof(double) * A.extNnz));
@@ -916,7 +918,7 @@ void GenerateProblemCuda(SparseMatrix& A, Vector* b, Vector* x, Vector* xexact)
     if (A.level == 0)
         cub::DeviceScan::InclusiveSum(temp, temp_storage_bytes, ranktoId, ranktoId, A.geom->size);
 
-    A.localNumberOfNonzeros = localNumberOfNonzeros;
+    A.localNumberOfNonzeros = (slice_ptr_t) localNumberOfNonzeros32;
     CHECK_CUDART(cudaFree(temp));
 }
 
@@ -1142,11 +1144,11 @@ __global__ void __launch_bounds__(128) extToLocMap_kernel(
     Sets the extranl values to -1.0
 */
 __global__ void __launch_bounds__(128)
-    extToloc_kernel(local_int_t localNumberOfRows, int neighborId, local_int_t ext_nnz, local_int_t* csrExtColumns,
+    extToloc_kernel(local_int_t localNumberOfRows, int neighborId, slice_ptr_t ext_nnz, local_int_t* csrExtColumns,
         double* csrExtValues, slice_ptr_t* ext2csrOffsets, local_int_t* extToLocMap, local_int_t* columns)
 {
 
-    const local_int_t i = blockIdx.x * 128 + threadIdx.x;
+    const slice_ptr_t i = (slice_ptr_t) blockIdx.x * 128 + threadIdx.x;
     if (i >= ext_nnz)
         return;
 
@@ -1256,11 +1258,11 @@ void ExtToLocMapCuda(
 /*
     Calls extToLoc_kernel
 */
-void ExtTolocCuda(local_int_t localNumberOfRows, int neighborId, local_int_t ext_nnz, local_int_t* csrExtColumns,
+void ExtTolocCuda(local_int_t localNumberOfRows, int neighborId, slice_ptr_t ext_nnz, local_int_t* csrExtColumns,
     double* csrExtValues, slice_ptr_t* ext2csrOffsets, local_int_t* extToLocMap, local_int_t* columns)
 {
 
-    const local_int_t grid = (ext_nnz + 128 - 1) / 128;
+    const int grid = (int) ((ext_nnz + 127) / 128);
     extToloc_kernel<<<grid, 128, 0, stream>>>(
         localNumberOfRows, neighborId, ext_nnz, csrExtColumns, csrExtValues, ext2csrOffsets, extToLocMap, columns);
 }
