@@ -130,8 +130,6 @@ void GenerateProblem_Cpu(SparseMatrix& A, Vector* b, Vector* x, Vector* xexact)
     global_int_t gix0 = A.geom->gix0;
     global_int_t giy0 = A.geom->giy0;
     global_int_t giz0 = A.geom->giz0;
-    int npx = A.geom->npx;
-    int npy = A.geom->npy;
 
     local_int_t localNumberOfRows = nx * ny * nz; // This is the size of our subblock
     // If this assert fails, it most likely means that the local_int_t is set to int and should be set to long long
@@ -230,99 +228,71 @@ void GenerateProblem_Cpu(SparseMatrix& A, Vector* b, Vector* x, Vector* xexact)
 
         A.localToGlobalMap[currentLocalRow] = currentGlobalRow;
 
+        // Fast path: points strictly interior to this rank's subdomain have all 27
+        // neighbors valid and local, so we emit their global column indices and values
+        // directly and skip the per-neighbor owner-rank test. Produces results identical
+        // to the slow path (every row for a single rank, ~all rows otherwise).
+        if (IsInteriorRowCpu(ix, iy, iz, nx, ny, nz))
+        {
+            global_int_t* idxG = mtxIndG[currentLocalRow];
+            double* vals = matrixValues[currentLocalRow];
+            for (int k = 0; k < 27; k++)
+            {
+                idxG[k] = (gix + tid2indCpu[k][0]) + (giy + tid2indCpu[k][1]) * gnx
+                    + (giz + tid2indCpu[k][2]) * gnx * gny;
+                vals[k] = (k == 13) ? 26.0 : -1.0;
+            }
+            matrixDiagonal[currentLocalRow] = vals + 13;
+            nonzerosInRow[currentLocalRow] = 27;
+            localNumberOfNonzeros += 27;
+            if (b != 0)
+                bv[currentLocalRow] = 0.0; // 26.0 - (27 - 1)
+            if (x != 0)
+                xv[currentLocalRow] = 0.0;
+            if (xexact != 0)
+                xexactv[currentLocalRow] = 1.0;
+            continue;
+        }
+
+        // Boundary rows: classify each neighbor systematically (valid / owner rank).
         char numberOfNonzerosInRow = 0;
         double* currentValuePointer = matrixValues[currentLocalRow];
         global_int_t* currentIndexPointerG = mtxIndG[currentLocalRow];
-        global_int_t curcol;
         double* diagonalPointer = nullptr;
-        // Go through all the neighbors around a 3D point to decide
-        //  which one is a halo and which one is local to the rank
         for (int k = 0; k < 27; k++)
         {
-            // Neibor global Ids
-            long long int cgix = gix + tid2indCpu[k][0];
-            long long int cgiy = giy + tid2indCpu[k][1];
-            long long int cgiz = giz + tid2indCpu[k][2];
+            const StencilNeighborCpu nb = ClassifyStencilNeighborCpu(*A.geom, ix, iy, iz, k);
+            if (!nb.valid)
+                continue;
 
-            // These used when the point is local to the rank
-            local_int_t zi = (cgiz) % nz;
-            local_int_t yi = (cgiy) % ny;
-            local_int_t xi = (cgix) % nx;
-            // local column Id
-            local_int_t lcol = zi * ny * nx + yi * nx + xi;
-
-            // Is the global 3D point inside the global problem?
-            int ok = cgiz > -1 && cgiz < gnz && cgiy > -1 && cgiy < gny && cgix > -1 && cgix < gnx;
-
-            if (ok /*Yes this a valid point globally*/)
+            *currentIndexPointerG++ = nb.globalCol;
+            if (k == 13)
             {
-                *currentIndexPointerG++ = cgix + cgiy * gnx + cgiz * gnx * gny;
-                ;
-                if (k == 13)
-                {
-                    *currentValuePointer = 26.0;
-                    diagonalPointer = currentValuePointer;
-                }
-                else
-                {
-                    *currentValuePointer = -1.0;
-                }
-
-                // Rank Id in the global domain
-                int ipz = cgiz / nz;
-                int ipy = cgiy / ny;
-                int ipx = cgix / nx;
-
-                // For GPUCPU exec mode, when the CPU and GPU have diff dims in a direction,
-                //  we need to find the point rank manually, not based on its local dimension
-                //  but based on its physical location to the local problem
-                //  Note the halo size is always 1
-                if (A.geom->different_dim == Z)
-                {
-                    long long int local = cgiz - giz0;
-                    if (local >= 0 && local < nz)
-                        ipz = A.geom->ipz;
-                    else if (local < 0)
-                        ipz = A.geom->ipz - 1;
-                    else if (local >= nz)
-                        ipz = A.geom->ipz + 1;
-                }
-                else if (A.geom->different_dim == Y)
-                {
-                    long long int local = cgiy - giy0;
-                    if (local >= 0 && local < ny)
-                        ipy = A.geom->ipy;
-                    else if (local < 0)
-                        ipy = A.geom->ipy - 1;
-                    else if (local >= ny)
-                        ipy = A.geom->ipy + 1;
-                }
-                else if (A.geom->different_dim == X)
-                {
-                    long long int local = cgix - gix0;
-                    if (local >= 0 && local < nx)
-                        ipx = A.geom->ipx;
-                    else if (local < 0)
-                        ipx = A.geom->ipx - 1;
-                    else if (local >= nx)
-                        ipx = A.geom->ipx + 1;
-                }
-
-                // Now, after find the point rank from the location
-                //  in the 3D grid (ranks domain NPXxNPYxNPZ)
-                int col_rank = ipx + ipy * npx + ipz * npy * npx;
-
-                // The neighbor point rank is diff than the current point rank
-                if (A.geom->logical_rank != col_rank)
-                {
-                    if (global_steps == 2)
-                        rankToId_h[col_rank + 1] = 1; // To find its sequential Id (will be prefix summed later)
-                    ext_nnz++;
-                }
-
-                currentValuePointer++;
-                numberOfNonzerosInRow++;
+                *currentValuePointer = 26.0;
+                diagonalPointer = currentValuePointer;
             }
+            else
+            {
+                *currentValuePointer = -1.0;
+            }
+
+            if (!nb.isLocal)
+            {
+                if (global_steps == 2)
+                {
+                    // Deliberate benign race: several threads may mark the same ownerRank from
+                    // the parallel boundary-row loop, but every writer stores the identical
+                    // constant 1 to a naturally-aligned int, so the store never tears and the
+                    // result is deterministically 1 regardless of interleaving. The array is
+                    // read only after this loop's implicit barrier (PrefixsumCpu below), so
+                    // there is no concurrent reader. No atomic is needed.
+                    rankToId_h[nb.ownerRank + 1] = 1; // sequential Id assigned later via prefix sum
+                }
+                ext_nnz++;
+            }
+
+            currentValuePointer++;
+            numberOfNonzerosInRow++;
         }
 
         matrixDiagonal[currentLocalRow] = diagonalPointer;

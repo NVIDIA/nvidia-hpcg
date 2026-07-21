@@ -295,18 +295,12 @@ void SetupHalo_Gpu(SparseMatrix& A)
 #ifdef USE_GRACE
 void SetupHalo_Cpu(SparseMatrix& A)
 {
-    // Extract Matrix pieces
+    // Extract Matrix pieces. Neighbor classification (owner rank, global/local column
+    // indices, different_dim handling) lives in ClassifyStencilNeighborCpu, so only the
+    // local subdomain dims are needed directly here.
     global_int_t nx = A.geom->nx;
     global_int_t ny = A.geom->ny;
     global_int_t nz = A.geom->nz;
-    global_int_t gnx = A.geom->gnx;
-    global_int_t gny = A.geom->gny;
-    global_int_t gnz = A.geom->gnz;
-    global_int_t gix0 = A.geom->gix0;
-    global_int_t giy0 = A.geom->giy0;
-    global_int_t giz0 = A.geom->giz0;
-    int npx = A.geom->npx;
-    int npy = A.geom->npy;
 
     local_int_t localNumberOfRows = A.localNumberOfRows;
     local_int_t* nonzerosInRow = A.nonzerosInRow;
@@ -353,101 +347,55 @@ void SetupHalo_Cpu(SparseMatrix& A)
         const local_int_t iz = (i / (nx * ny));
         const local_int_t iy = (i - iz * nx * ny) / nx;
         const local_int_t ix = i - (iz * ny + iy) * nx;
-        const global_int_t gix = ix + gix0;
-        const global_int_t giy = iy + giy0;
-        const global_int_t giz = iz + giz0;
-        global_int_t curcol;
 
+        // Fast path: interior rows have all 27 neighbors local; compute local column
+        // indices directly and skip the per-neighbor owner-rank test (divisions,
+        // different_dim logic, atomics). Identical results to the slow path; this is
+        // every row for a single rank and the subdomain interior (~all rows) otherwise.
+        if (IsInteriorRowCpu(ix, iy, iz, nx, ny, nz))
+        {
+            has_external[i] = 0;
+            for (int k = 0; k < 27; k++)
+                mtxIndL[i][k] = (iz + tid2indCpu[k][2]) * ny * nx + (iy + tid2indCpu[k][1]) * nx
+                    + (ix + tid2indCpu[k][0]);
+            continue;
+        }
+
+        // Boundary rows: classify each neighbor; local -> local matrix, external -> send list.
         int nnz_c = 0;
         bool rank_set[27];
         for (int j = 0; j < 27; j++)
-        {
             rank_set[j] = false;
-        }
         has_external[i] = 0;
         for (int k = 0; k < 27; k++)
         {
-            long long int cgix = gix + tid2indCpu[k][0];
-            long long int cgiy = giy + tid2indCpu[k][1];
-            long long int cgiz = giz + tid2indCpu[k][2];
-            int ok = cgiz > -1 && cgiz < gnz && cgiy > -1 && cgiy < gny && cgix > -1 && cgix < gnx;
-            if (ok)
+            const StencilNeighborCpu nb = ClassifyStencilNeighborCpu(*A.geom, ix, iy, iz, k);
+            if (!nb.valid)
+                continue;
+
+            if (!nb.isLocal)
             {
-                int ipz = cgiz / nz;
-                int ipy = cgiy / ny;
-                int ipx = cgix / nx;
-
-                // For GPUCPU exec mode, find the 3D rank coordinates.
-                //  For diff dim between CPU and GPU, we cannot
-                //  just divide on the local dim to find ipx/ipy/ipz
-                //  We must find it manually based on neighbor 3d coordinates
-                //  Note the halo size is always 1
-                if (A.geom->different_dim == Z)
+                has_external[i] = 1;
+                int rankId = rankToId_h[nb.ownerRank];
+                local_int_t* p = &(sendcounter[rankId]);
+                // Add the row to this neighbor's send buffer once (on its first external nnz).
+                if (!rank_set[rankId])
                 {
-                    long long int local = cgiz - giz0;
-                    if (local >= 0 && local < nz)
-                        ipz = A.geom->ipz;
-                    else if (local < 0)
-                        ipz = A.geom->ipz - 1;
-                    else if (local >= nz)
-                        ipz = A.geom->ipz + 1;
-                }
-                else if (A.geom->different_dim == Y)
-                {
-                    long long int local = cgiy - giy0;
-                    if (local >= 0 && local < ny)
-                        ipy = A.geom->ipy;
-                    else if (local < 0)
-                        ipy = A.geom->ipy - 1;
-                    else if (local >= ny)
-                        ipy = A.geom->ipy + 1;
-                }
-                else if (A.geom->different_dim == X)
-                {
-                    long long int local = cgix - gix0;
-                    if (local >= 0 && local < nx)
-                        ipx = A.geom->ipx;
-                    else if (local < 0)
-                        ipx = A.geom->ipx - 1;
-                    else if (local >= nx)
-                        ipx = A.geom->ipx + 1;
-                }
-
-                // Global rank Id
-                int col_rank = ipx + ipy * npx + ipz * npy * npx;
-
-                // The neighbor point rank is diff than the current point rank
-                if (A.geom->logical_rank != col_rank)
-                {
-                    has_external[i] = 1;
-                    int rankId = rankToId_h[col_rank];
-                    local_int_t* p = &(sendcounter[rankId]);
-                    // Add the halo point atomically to send_buffer
-                    // For all the cols in a row that has the same rank,
-                    //  we add the row once to the rank buffer
-                    if (!rank_set[rankId])
-                    {
-                        rank_set[rankId] = true;
-                        local_int_t t;
+                    rank_set[rankId] = true;
+                    local_int_t t;
 #pragma omp atomic capture
-                        {
-                            t = *p;
-                            *p += 1;
-                        }
-                        send_buffer[rankId * sendbufld + t] = i;
+                    {
+                        t = *p;
+                        *p += 1;
                     }
+                    send_buffer[rankId * sendbufld + t] = i;
                 }
-                else
-                {
-                    // local neighbor, add it to the local matrix
-                    local_int_t zi = cgiz - giz0;
-                    local_int_t yi = cgiy - giy0;
-                    local_int_t xi = cgix - gix0;
-                    local_int_t lcol = zi * ny * nx + yi * nx + xi;
-                    mtxIndL[i][nnz_c] = lcol;
-                }
-                nnz_c++;
             }
+            else
+            {
+                mtxIndL[i][nnz_c] = nb.localCol;
+            }
+            nnz_c++;
         }
     }
 
@@ -573,105 +521,24 @@ void SetupHalo_Cpu(SparseMatrix& A)
                 const local_int_t iz = (i / (nx * ny));
                 const local_int_t iy = (i - iz * nx * ny) / nx;
                 const local_int_t ix = i - (iz * ny + iy) * nx;
-                const global_int_t gix = ix + gix0;
-                const global_int_t giy = iy + giy0;
-                const global_int_t giz = iz + giz0;
                 int nnz_c = 0;
-                
+
                 for (int k = 0; k < 27; k++)
                 {
-                    long long int cgix = gix + tid2indCpu[k][0];
-                    long long int cgiy = giy + tid2indCpu[k][1];
-                    long long int cgiz = giz + tid2indCpu[k][2];
+                    // Classify the neighbor; for external neighbors nb.ownerRank / nb.ownerCol
+                    // give the owner rank and the column index in the owner's local numbering
+                    // (handling hybrid different_dim), which is the key into externalToLocalMap.
+                    const StencilNeighborCpu nb = ClassifyStencilNeighborCpu(*A.geom, ix, iy, iz, k);
+                    if (!nb.valid)
+                        continue;
 
-                    local_int_t zi = (cgiz) % nz;
-                    local_int_t yi = (cgiy) % ny;
-                    local_int_t xi = (cgix) % nx;
-                    int ok = cgiz > -1 && cgiz < gnz && cgiy > -1 && cgiy < gny && cgix > -1 && cgix < gnx;
-                    int ipz = cgiz / nz;
-                    int ipy = cgiy / ny;
-                    int ipx = cgix / nx;
-
-                    // The indices sent by the neighbor uses the neighbor's nx, ny, and nz which can
-                    // be deffirent than the current neighbor's dims. Thus, based on neighor location
-                    // and the diffrent_dim we adjust the indices if needed.
-                    // Also, the ipx, ipy, and ipz must be updated accordingly
-                    global_int_t new_nx = A.geom->nx;
-                    global_int_t new_ny = A.geom->ny;
-
-                    if (A.geom->different_dim == Z)
+                    auto it = externalToLocalMap.find(nb.ownerRank);
+                    if (it != externalToLocalMap.end())
                     {
-                        long long int local = cgiz - giz0;
-                        if (local >= 0 && local < nz)
-                        {
-                            ipz = A.geom->ipz;
-                            zi = local;
-                        }
-                        else if (local < 0)
-                        {
-                            ipz = A.geom->ipz - 1;
-                            zi = A.geom->previous_neighbor_dim - 1;
-                        }
-                        else if (local >= nz)
-                        {
-                            ipz = A.geom->ipz + 1;
-                            zi = 0;
-                        }
+                        mtxIndL[i][nnz_c] = it->second[nb.ownerCol];
+                        nnz_ext++;
                     }
-                    else if (A.geom->different_dim == Y)
-                    {
-                        long long int local = cgiy - giy0;
-                        if (local >= 0 && local < ny)
-                        {
-                            ipy = A.geom->ipy;
-                            yi = local;
-                        }
-                        else if (local < 0)
-                        {
-                            ipy = A.geom->ipy - 1;
-                            yi = A.geom->previous_neighbor_dim - 1;
-                            new_ny = A.geom->previous_neighbor_dim;
-                        }
-                        else if (local >= ny)
-                        {
-                            ipy = A.geom->ipy + 1;
-                            yi = 0;
-                            new_ny = A.geom->next_neighbor_dim;
-                        }
-                    }
-                    else if (A.geom->different_dim == X)
-                    {
-                        long long int local = cgix - gix0;
-                        if (local >= 0 && local < nx)
-                        {
-                            ipx = A.geom->ipx;
-                            xi = local;
-                        }
-                        else if (local < 0)
-                        {
-                            ipx = A.geom->ipx - 1;
-                            xi = A.geom->previous_neighbor_dim - 1;
-                            new_nx = A.geom->previous_neighbor_dim;
-                        }
-                        else if (local >= nx)
-                        {
-                            ipx = A.geom->ipx + 1;
-                            xi = 0;
-                            new_nx = A.geom->next_neighbor_dim;
-                        }
-                    }
-                    local_int_t lcol = zi * new_ny * new_nx + yi * new_nx + xi;
-                    int row_rank = ipx + ipy * npx + ipz * npy * npx;
-
-                    if (ok)
-                    {
-                        if (externalToLocalMap.find(row_rank) != externalToLocalMap.end())
-                        {
-                            mtxIndL[i][nnz_c] = externalToLocalMap[row_rank][lcol];
-                            nnz_ext++;
-                        }
-                        nnz_c++;
-                    }
+                    nnz_c++;
                 }
             }
              extTemp[i] = nnz_ext;
