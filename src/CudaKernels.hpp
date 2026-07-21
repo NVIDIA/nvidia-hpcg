@@ -58,8 +58,7 @@ void PermElemToSendCuda(local_int_t totalToBeSent, local_int_t* elementsToSend, 
 void EllPermColumnsValuesCuda(local_int_t localNumberOfRows, local_int_t* nnzPerRow, local_int_t* csrColumns,
     double* csrValues, slice_ptr_t* permOffsets, void* permColumns, double* permValues, local_int_t* opt2ref,
     local_int_t* ref2opt, slice_ptr_t* diagonalIdx, slice_ptr_t* permLOffsets, slice_ptr_t* permUOffsets, bool diag,
-    IndexMode mode);
-void TransposeCuda(local_int_t n, local_int_t slice_size, void* sellCollIndex, double* sellValues, IndexMode mode);
+    local_int_t slice_size, IndexMode mode);
 void EllMaxRowLenPerBlockCuda(local_int_t nrow, int sliceSize, slice_ptr_t* sellLPermOffsets,
     slice_ptr_t* sellUPermOffsets, void* sellLSliceMrl, void* sellUSliceMrl, IndexMode mode);
 void PrefixsumCuda(local_int_t localNumberOfRows, void* arr, IndexMode mode);

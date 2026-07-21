@@ -91,20 +91,14 @@ size_t OptimizeProblemGpu(SparseMatrix& A_in, CGData& data, Vector& b, Vector& x
 
         // Runtime-selected SELL index widths for this matrix (see IndexMode.hpp).
         const IndexMode mode = A->index_mode;
-        const size_t colBytes = columnIndexBytes(mode);
         const size_t offBytes = offsetIndexBytes(mode);
 
-        // Create (S)ELL
-        local_int_t TranslateIndex = slice_size * HPCG_MAX_ROW_LEN;
-        void* translated_ell_col_index = byteOffset(A->sellDev.aColumns, (size_t) TranslateIndex, colBytes);
-        double* translated_ell_values = A->sellAPermValues + TranslateIndex;
-
+        // Create the permuted matrix directly in column-major sliced-ELLPACK
+        // layout. The gather kernel now emits the transposed layout in place, so
+        // the previous separate TransposeCuda pass is no longer needed.
         EllPermColumnsValuesCuda(nrow, A->gpuAux.nnzPerRow, A->gpuAux.columns, A->gpuAux.values,
-            A->gpuAux.csrAPermOffsets, translated_ell_col_index, translated_ell_values, A->opt2ref, A->ref2opt,
-            A->gpuAux.sellADiagonalIdx, A->gpuAux.csrLPermOffsets, A->gpuAux.csrUPermOffsets, false, mode);
-
-        // Coloumn mojor blocked/sliced ellpack
-        TransposeCuda(nrow, slice_size, A->sellDev.aColumns, A->sellAPermValues, mode);
+            A->gpuAux.csrAPermOffsets, A->sellDev.aColumns, A->sellAPermValues, A->opt2ref, A->ref2opt,
+            A->gpuAux.sellADiagonalIdx, A->gpuAux.csrLPermOffsets, A->gpuAux.csrUPermOffsets, false, slice_size, mode);
 
         // Per block max row len
         local_int_t num_slices = (nrow + slice_size - 1) / slice_size;

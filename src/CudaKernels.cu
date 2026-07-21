@@ -1580,7 +1580,8 @@ template <int BLOCK_SIZE, int GROUP_SIZE, bool DIAG, class ColT>
 __global__ void __launch_bounds__(BLOCK_SIZE) ellPermColumnsValues_kernel(local_int_t localNumberOfRows,
     local_int_t* nnzPerRow, local_int_t* columns, double* values, slice_ptr_t* csr_perm_offsets,
     ColT* csr_perm_columns, double* csr_perm_values, local_int_t* opt2ref, local_int_t* ref2opt,
-    slice_ptr_t* ell_diagonal_idx, slice_ptr_t* csrLPermOffsets, slice_ptr_t* csrUPermOffsets)
+    slice_ptr_t* ell_diagonal_idx, slice_ptr_t* csrLPermOffsets, slice_ptr_t* csrUPermOffsets,
+    local_int_t slice_size)
 {
 
     int lx = threadIdx.x % GROUP_SIZE;
@@ -1605,27 +1606,32 @@ __global__ void __launch_bounds__(BLOCK_SIZE) ellPermColumnsValues_kernel(local_
     const slice_ptr_t str = (slice_ptr_t) perm_row * HPCG_MAX_ROW_LEN;
     const local_int_t nnz = nnzPerRow[perm_row];
     columns += str;
-    slice_ptr_t perm_str = (slice_ptr_t) row * HPCG_MAX_ROW_LEN;
-    csr_perm_columns += perm_str;
+
+    // Fused transpose: write directly in column-major sliced-ELL layout instead
+    // of row-major (which previously required a separate TransposeCuda pass).
+    //   offset(row, i) = (row/slice_size)*slice_size*HPCG_MAX_ROW_LEN
+    //                    + (row % slice_size) + i*slice_size
+    const local_int_t row_block_id = row / slice_size;
+    const local_int_t row_inblock_id = row - row_block_id * slice_size;
+    const slice_ptr_t row_start_index
+        = (slice_ptr_t) row_block_id * HPCG_MAX_ROW_LEN * slice_size + row_inblock_id;
+
     local_int_t l_nnz = 0, u_nnz = 0;
 #pragma unroll 9
     for (auto i = lx; i < HPCG_MAX_ROW_LEN; i += GROUP_SIZE)
     {
+        const slice_ptr_t dst = row_start_index + (slice_ptr_t) i * slice_size;
         local_int_t orig_col = i < nnz ? columns[i] : localNumberOfRows;
         if (orig_col < localNumberOfRows)
         {
             local_int_t col = ref2opt[orig_col];
-            csr_perm_columns[i] = col;
+            csr_perm_columns[dst] = col;
             if (col == row)
             {
-                csr_perm_values[perm_str + i] = 26.0;
+                csr_perm_values[dst] = 26.0;
+                if (DIAG)
+                    ell_diagonal_idx[row] = dst;
             }
-
-            if (DIAG)
-                if (col == row)
-                {
-                    ell_diagonal_idx[row] = perm_str + i;
-                }
             if (col < row)
                 l_nnz++;
             if (col > row)
@@ -1633,67 +1639,12 @@ __global__ void __launch_bounds__(BLOCK_SIZE) ellPermColumnsValues_kernel(local_
         }
         else
         {
-            csr_perm_columns[i] = -1;
+            csr_perm_columns[dst] = -1;
         }
     }
 
     atomic_add(&(csrLPermOffsets[row]), (slice_ptr_t) l_nnz);
     atomic_add(&(csrUPermOffsets[row]), (slice_ptr_t) u_nnz);
-}
-
-/*
-    GPU Kernel
-    Transpose a block of values, for HPCG using sliced size of A = slice_size x 27
-*/
-template <class ColT>
-__device__ void transposeBlock_device_kernel(
-    local_int_t n, int stride, double* outd, ColT* outi, double* ind, ColT* ini, local_int_t block_id)
-{
-    __shared__ double scratchd[16][16];
-    __shared__ ColT scratchi[16][16];
-    local_int_t tx = threadIdx.x;
-    local_int_t ty = threadIdx.y;
-    
-    for(local_int_t i = 0; i < stride; i += blockDim.x * gridDim.x) {
-
-        local_int_t row_index_in = ty + blockDim.x * blockIdx.x + i;
-        local_int_t col_index_in = tx + blockDim.y * blockIdx.y;
-        if (row_index_in < stride && col_index_in < HPCG_MAX_ROW_LEN)
-        {
-            local_int_t in_id = col_index_in + HPCG_MAX_ROW_LEN * row_index_in;
-            scratchd[ty][tx] = ind[in_id];
-            scratchi[ty][tx] = ini[in_id];
-        }
-        __syncthreads();
-
-        local_int_t row_index_out = tx + blockDim.x * blockIdx.x + i;
-        local_int_t col_index_out = ty + blockDim.y * blockIdx.y;
-        if (row_index_out < stride && col_index_out < HPCG_MAX_ROW_LEN)
-        {
-            local_int_t out_id = row_index_out + stride * col_index_out;
-            outd[out_id] = scratchd[tx][ty];
-            outi[out_id] = scratchi[tx][ty];
-        }
-    }
-}
-
-
-template <class ColT>
-__global__ void transpose_kernel(local_int_t n, ColT* sellCollIndex, double* sellValues, local_int_t slice_size)
-{
-    using namespace cooperative_groups;
-    cooperative_groups::grid_group grid = cooperative_groups::this_grid();
-
-    for (local_int_t i = 0; i < n; i += slice_size)
-    {
-        // Element offsets can exceed 2^31 for large problems: compute in 64-bit.
-        const size_t base = (size_t) i * HPCG_MAX_ROW_LEN;
-        const size_t next = (size_t) (i + slice_size) * HPCG_MAX_ROW_LEN;
-        transposeBlock_device_kernel<ColT>(n, slice_size, sellValues + base, sellCollIndex + base,
-            sellValues + next, sellCollIndex + next, i / slice_size);
-
-        grid.sync();
-    }
 }
 
 /*
@@ -2022,12 +1973,29 @@ void PermElemToSendCuda(local_int_t totalToBeSent, local_int_t* elementsToSend, 
 void EllPermColumnsValuesCuda(local_int_t localNumberOfRows, local_int_t* nnzPerRow, local_int_t* columns,
     double* values, slice_ptr_t* csr_perm_offsets, void* csr_perm_columns, double* csr_perm_values,
     local_int_t* opt2ref, local_int_t* ref2opt, slice_ptr_t* diagonalIdx, slice_ptr_t* csrLPermOffsets,
-    slice_ptr_t* csrUPermOffsets, bool find_diag, IndexMode mode)
+    slice_ptr_t* csrUPermOffsets, bool find_diag, local_int_t slice_size, IndexMode mode)
 {
-    const size_t nnz_out = (size_t) localNumberOfRows * HPCG_MAX_ROW_LEN;
+    // The build kernel now emits the column-major sliced-ELL layout directly, so
+    // the value buffer must be initialized to -1 over the full padded slice range
+    // (the kernel only overwrites the diagonal; off-diagonal/pad values stay -1).
+    const local_int_t num_slices = (localNumberOfRows + slice_size - 1) / slice_size;
+    const local_int_t paddedRowLen = num_slices * slice_size;
+    const size_t nnz_out = (size_t) paddedRowLen * HPCG_MAX_ROW_LEN;
 
     const size_t grid_nnz = (nnz_out + 128 - 1) / 128;
     setMinusOne_kernel<<<grid_nnz, 128, 0, stream>>>(nnz_out, csr_perm_values);
+
+    // For a partial final slice, the padded rows beyond localNumberOfRows are not
+    // visited by the kernel; pre-fill that slice's column indices with -1 so the
+    // pad entries are skipped downstream. (No-op for slice-size-divisible sizes.)
+    if (paddedRowLen > localNumberOfRows)
+    {
+        const size_t colBytes = columnIndexBytes(mode);
+        const size_t last_slice_base = (size_t) (num_slices - 1) * slice_size * HPCG_MAX_ROW_LEN;
+        const size_t last_slice_bytes = (size_t) slice_size * HPCG_MAX_ROW_LEN * colBytes;
+        CHECK_CUDART(cudaMemsetAsync(
+            byteOffset(csr_perm_columns, last_slice_base, colBytes), 0xFF, last_slice_bytes, stream));
+    }
 
     const int BLOCK_SIZE = 128;
     const int GROUP_SIZE = 8; // Number of threads per row
@@ -2044,46 +2012,11 @@ void EllPermColumnsValuesCuda(local_int_t localNumberOfRows, local_int_t* nnzPer
             if (find_diag)
                 ellPermColumnsValues_kernel<BLOCK_SIZE, GROUP_SIZE, true, ColT><<<grid, BLOCK_SIZE, 0, stream>>>(
                     localNumberOfRows, nnzPerRow, columns, values, csr_perm_offsets, cols, csr_perm_values, opt2ref,
-                    ref2opt, diagonalIdx, csrLPermOffsets, csrUPermOffsets);
+                    ref2opt, diagonalIdx, csrLPermOffsets, csrUPermOffsets, slice_size);
             else
                 ellPermColumnsValues_kernel<BLOCK_SIZE, GROUP_SIZE, false, ColT><<<grid, BLOCK_SIZE, 0, stream>>>(
                     localNumberOfRows, nnzPerRow, columns, values, csr_perm_offsets, cols, csr_perm_values, opt2ref,
-                    ref2opt, diagonalIdx, csrLPermOffsets, csrUPermOffsets);
-        });
-}
-
-/*
-    Transpose a slice of (sliced-)ELLPACK matrix
-*/
-void TransposeCuda(local_int_t n, local_int_t slice_size, void* sellCollIndex, double* sellValues, IndexMode mode)
-{
-    // Only the column-index element type varies with the index mode here.
-    dispatchIndexMode(mode,
-        [&](auto /*offTag*/, auto colTag)
-        {
-            using ColT = decltype(colTag);
-            ColT* cols = static_cast<ColT*>(sellCollIndex);
-
-            int dev;
-            cudaDeviceProp deviceProp;
-            int numBlocksPerSm = 0;
-            dim3 block(16, 16, 1);
-            int numThreadsPerBlock = block.x * block.y;
-
-            CHECK_CUDART(cudaGetDevice(&dev));
-            CHECK_CUDART(cudaGetDeviceProperties(&deviceProp, dev));
-            CHECK_CUDART(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-                &numBlocksPerSm, transpose_kernel<ColT>, numThreadsPerBlock, 0));
-
-            size_t blocksInY = (HPCG_MAX_ROW_LEN + block.y - 1) / block.y;
-            size_t blocksInX = deviceProp.multiProcessorCount * numBlocksPerSm / blocksInY; // In x direction
-            size_t blocksInXNeeded = (slice_size + block.x - 1) / block.x;
-            blocksInXNeeded = blocksInXNeeded > blocksInX ? blocksInX : blocksInXNeeded;
-
-            dim3 grid(blocksInXNeeded, blocksInY, 1);
-            void* args[] = {(void*) &n, (void*) &cols, (void*) &sellValues, (void*) &slice_size};
-            CHECK_CUDART(
-                cudaLaunchCooperativeKernel((void*) transpose_kernel<ColT>, grid, block, args, 0, stream));
+                    ref2opt, diagonalIdx, csrLPermOffsets, csrUPermOffsets, slice_size);
         });
 }
 
