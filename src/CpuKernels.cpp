@@ -878,15 +878,39 @@ void CreateSellPermCpu(SparseMatrix& A)
                 local_int_t slice_id = i / slice_size;
                 local_int_t in_slice_id = i % slice_size;
 
+                // Base pointers for this row's columns/values. With HPCG_CONTIGUOUS_ARRAYS
+                // the per-row storage is one contiguous block, so index the base directly and
+                // skip the jagged pointer-array dereference. Without it the rows are separately
+                // allocated buffers, so the row pointer must be used or the fixed-stride base
+                // indexing would read past a row's buffer.
+#ifdef HPCG_CONTIGUOUS_ARRAYS
+                const local_int_t* rowCols = &A.mtxIndL[0][(size_t) originalRow * HPCG_MAX_ROW_LEN];
+                const double* rowVals = &A.matrixValues[0][(size_t) originalRow * HPCG_MAX_ROW_LEN];
+#else
+                const local_int_t* rowCols = A.mtxIndL[originalRow];
+                const double* rowVals = A.matrixValues[originalRow];
+#endif
+                const local_int_t rowNnz = A.nonzerosInRow[originalRow];
+
+                // A.ref2opt[col] is a random gather into an nrow-sized array that misses cache
+                // on nearly every nonzero and sits on the loop's critical path. Issue all of a
+                // row's lookups as prefetches up front so their memory latencies overlap.
+                for (local_int_t j = 0; j < rowNnz; j++)
+                {
+                    local_int_t col = rowCols[j];
+                    if (col < nrow)
+                        __builtin_prefetch(&A.ref2opt[col], 0, 1);
+                }
+
                 local_int_t nnz_counter = 0;
                 slice_ptr_t ext_nnz_index = A.csrExtOffsets[i];
-                for (local_int_t j = 0; j < A.nonzerosInRow[originalRow]; j++)
+                for (local_int_t j = 0; j < rowNnz; j++)
                 {
-                    local_int_t col = A.mtxIndL[originalRow][j];
-                    double val = A.matrixValues[originalRow][j];
-                    local_int_t new_col = A.ref2opt[col];
+                    local_int_t col = rowCols[j];
+                    double val = rowVals[j];
                     if (col < nrow)
                     {
+                        local_int_t new_col = A.ref2opt[col];
                         // Locality is bad, consider blocking
                         const slice_ptr_t index = (slice_ptr_t) slice_id * slice_size * HPCG_MAX_ROW_LEN
                             + (slice_ptr_t) nnz_counter * slice_size + in_slice_id;
