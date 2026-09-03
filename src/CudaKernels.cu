@@ -168,6 +168,16 @@ slice_ptr_t EstimateLUmem(local_int_t n, local_int_t padded_n, local_int_t level
             estimated_size = v[3];
     }
 
+    // Round up to 8 elements so the estimate is a safe *alignment* as well as a
+    // safe size. With 32-bit columns L and U share one buffer and U's base is
+    // gpuAux.columns + estimated_size, so an estimate that is not a multiple of
+    // 8 leaves U misaligned for the 128-/256-bit column loads the vectorised
+    // kernels issue (8 * sizeof(int32) == 32 bytes covers the widest). The raw
+    // estimate is a float division, so its low bits are otherwise arbitrary and
+    // the divisor value ends up deciding alignment by luck.
+    constexpr slice_ptr_t kWideLoadAlign = 8;
+    estimated_size = (estimated_size + kWideLoadAlign - 1) / kWideLoadAlign * kWideLoadAlign;
+
     return estimated_size;
 }
 /*
