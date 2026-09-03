@@ -97,4 +97,48 @@ void ExtSpMVCuda(SparseMatrix& A, double alpha, double* x, double* y);
 
 // Transfer Problem to CPU
 size_t CopyDataToHostCuda(SparseMatrix& A, Vector* b, Vector* x, Vector* xexact);
+
+#ifdef EXPLICIT_KERNELS
+///////// Explicit Sliced-ELL SpMV / SpSV (LDG family) //
+// Which triangle of the permuted Sliced-ELL operator a call addresses: the full
+// matrix, the strict lower part, or the strict upper part.
+enum DIR
+{
+    Forward = 0,
+    Backward = 1,
+    General = 2
+};
+
+// Launch shape of the explicit kernels. Overridable per run through the
+// matching environment variables; InitKernelConfig() installs the defaults.
+struct KernelConfig
+{
+    int SV_UNROLL;
+    int MV_UNROLL;
+    int SV_BLOCK_SIZE;
+    int MV_BLOCK_SIZE;
+};
+
+extern KernelConfig g_config;
+
+void InitKernelConfig();
+
+/*
+  Whether this SpMV/SpSV should run on the explicit kernels rather than
+  cuSPARSE.
+
+  False unless HPCG_EXPLICIT_MV / HPCG_EXPLICIT_SV is set to a nonzero value,
+  so a default run of an EXPLICIT_KERNELS build takes exactly the same code
+  path as a build without it. Also false, with a one-time warning, when the
+  matrix uses an index mode the explicit kernels are not instantiated for.
+
+  Takes the whole matrix rather than a flag so that the per-level selection the
+  autotuner will drive lands here without touching the call sites.
+*/
+bool UseExplicitSpMV(const SparseMatrix& A);
+bool UseExplicitSpSV(const SparseMatrix& A);
+
+void mv_sell(DIR d, const SparseMatrix& A, double alpha, double beta, double* x, double* y);
+void sv_sell(DIR d, const SparseMatrix& A, double* rv, double* xv);
+#endif
 #endif

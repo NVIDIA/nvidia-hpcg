@@ -73,10 +73,19 @@ int ComputeSPMV(const SparseMatrix& A, Vector& x, Vector& y)
         PackSendBufferCuda(A, x, false, copy_stream);
 #endif
 
-        CHECK_CUSPARSE(cusparseDnVecSetValues(A.cusparseOpt.vecX, x.values_d));
-        CHECK_CUSPARSE(cusparseDnVecSetValues(A.cusparseOpt.vecY, y.values_d));
-        CHECK_CUSPARSE(cusparseSpMV(cusparsehandle, CUSPARSE_OPERATION_NON_TRANSPOSE, &one, A.cusparseOpt.matA,
-            A.cusparseOpt.vecX, &zero, A.cusparseOpt.vecY, CUDA_R_64F, CUSPARSE_SPMV_ALG_DEFAULT, A.bufferMvA));
+#ifdef EXPLICIT_KERNELS
+        if (UseExplicitSpMV(A))
+        {
+            mv_sell(General, A, one, zero, x.values_d, y.values_d);
+        }
+        else
+#endif
+        {
+            CHECK_CUSPARSE(cusparseDnVecSetValues(A.cusparseOpt.vecX, x.values_d));
+            CHECK_CUSPARSE(cusparseDnVecSetValues(A.cusparseOpt.vecY, y.values_d));
+            CHECK_CUSPARSE(cusparseSpMV(cusparsehandle, CUSPARSE_OPERATION_NON_TRANSPOSE, &one, A.cusparseOpt.matA,
+                A.cusparseOpt.vecX, &zero, A.cusparseOpt.vecY, CUDA_R_64F, CUSPARSE_SPMV_ALG_DEFAULT, A.bufferMvA));
+        }
 
 #ifndef HPCG_NO_MPI
         if (A.totalToBeSent > 0)

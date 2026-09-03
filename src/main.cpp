@@ -672,6 +672,10 @@ int main(int argc, char* argv[])
 
     MPI_Barrier(MPI_COMM_WORLD);
 
+#if defined(USE_CUDA) && defined(EXPLICIT_KERNELS)
+    InitKernelConfig();
+#endif
+
 //////////////////////////////
 // Validation Testing Phase //
 //////////////////////////////

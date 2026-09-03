@@ -6,3 +6,6 @@ bin/xhpcg
 bin/xhpcg-cpu
 bin/hpcg20*.txt
 .DS_Store
+
+# Out-of-source build tree created by hpcg-lab/harness/build-hpcg.sh
+build/

@@ -221,6 +221,10 @@ struct SparseMatrix_STRUCT
     double *sellAPermValues, *sellLPermValues, *sellUPermValues;
     double* diagonal;
 
+    // Stored (padded) Sliced-ELL element counts for A/L/U, i.e. the last slice
+    // offset of each operator. 64-bit like localNumberOfNonzeros.
+    slice_ptr_t sellALocalNumberOfNonzeros, sellLLocalNumberOfNonzeros, sellULocalNumberOfNonzeros;
+
     char* bufferSvL = nullptr;
     char* bufferSvU = nullptr;
     char* bufferMvA = nullptr;

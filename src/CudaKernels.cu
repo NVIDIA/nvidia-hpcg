@@ -32,6 +32,7 @@
 #include <cub/cub.cuh>
 
 #include "Cuda.hpp"
+#include "CudaKernels.hpp"
 #include "SparseMatrix.hpp"
 #include "mytimer.hpp"
 
@@ -2748,4 +2749,457 @@ size_t CopyDataToHostCuda(SparseMatrix& A_in, Vector* b, Vector* x, Vector* xexa
 
     return fnbytes;
 }
+
+//////////////////////// Explicit Sliced-ELL SpMV / SpSV ///////////////////////
+#ifdef EXPLICIT_KERNELS
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <type_traits>
+
+KernelConfig g_config;
+
+void InitKernelConfig()
+{
+    g_config.SV_UNROLL = 8;
+    g_config.MV_UNROLL = 8;
+    g_config.SV_BLOCK_SIZE = 64;
+    g_config.MV_BLOCK_SIZE = 256;
+
+    if (const char* env = std::getenv("SV_UNROLL"))
+        g_config.SV_UNROLL = std::atoi(env);
+    if (const char* env = std::getenv("MV_UNROLL"))
+        g_config.MV_UNROLL = std::atoi(env);
+    if (const char* env = std::getenv("SV_BLOCK_SIZE"))
+        g_config.SV_BLOCK_SIZE = std::atoi(env);
+    if (const char* env = std::getenv("MV_BLOCK_SIZE"))
+        g_config.MV_BLOCK_SIZE = std::atoi(env);
+}
+
+/*
+    Runs `fn` with a value-initialized tag of the concrete slice-offset element
+    type for `mode`, exactly as dispatchIndexMode does, but instantiates only
+    the widths the explicit kernels are built for. Today that is
+    IndexMode::I32_I32 alone; adding IndexMode::I64_I32 means widening the
+    if constexpr, not touching the kernels. Callers see an unsupported mode as
+    `fn` never being invoked.
+*/
+template <class Fn>
+static void dispatchSellOffsetType(IndexMode mode, Fn&& fn)
+{
+    dispatchIndexMode(mode,
+        [&](auto offTag, auto colTag)
+        {
+            using OffsetT = decltype(offTag);
+            using ColT = decltype(colTag);
+            if constexpr (std::is_same<OffsetT, idx32_t>::value && std::is_same<ColT, idx32_t>::value)
+                fn(offTag);
+        });
+}
+
+/*
+    GPU Kernel
+    Accumulates one Sliced-ELL row: the sum over its stored entries of
+    value * d_X[column]. Padding entries carry column -1 and are skipped.
+
+    Software pipelined -- each iteration multiplies the block of Unroll entries
+    it already holds while prefetching the next -- so loads stay Unroll deep.
+*/
+template <class OffsetT, int Unroll>
+__device__ __forceinline__ double sellRowGather(local_int_t row_original_id, local_int_t slice_size,
+    const OffsetT* d_sell_offsets, const idx32_t* d_columns, const double* d_values, const double* d_X)
+{
+    const local_int_t row_in_slice_id = row_original_id % slice_size;
+    const local_int_t row_slice_id = row_original_id / slice_size;
+    // Flat element offsets into the column/value arrays exceed 2^31 for large
+    // local problems, so widen before they enter the pointer arithmetic even
+    // when OffsetT itself is 32-bit.
+    const slice_ptr_t row_start_index = (slice_ptr_t) d_sell_offsets[row_slice_id] + row_in_slice_id;
+    // Per-slice nnz is bounded by slice_size * HPCG_MAX_ROW_LEN and so fits in
+    // int. Narrowing before the divide keeps this a 32-bit idiv instead of the
+    // emulated 64-bit one a wider OffsetT would otherwise force.
+    const int slice_nnz = (int) (d_sell_offsets[row_slice_id + 1] - d_sell_offsets[row_slice_id]);
+    int max_row_len = slice_nnz / slice_size;
+    const int unroll_nz = (max_row_len + Unroll - 1) / Unroll;
+
+    const idx32_t* cols = d_columns + row_start_index;
+    const double* vals = d_values + row_start_index;
+
+    idx32_t col[Unroll];
+    double a_val[Unroll];
+    double sell_sum = 0.0;
+
+#pragma unroll Unroll
+    for (int K = 0; K < Unroll; K++)
+    {
+        if (K < max_row_len)
+        {
+            col[K] = __ldcs(cols);
+            a_val[K] = __ldcs(vals);
+        }
+        else
+        {
+            col[K] = -1;
+            a_val[K] = 0.0;
+        }
+        cols += slice_size;
+        vals += slice_size;
+    }
+    max_row_len -= Unroll;
+
+#pragma unroll 1
+    for (int q = 1; q < unroll_nz - 1; q++)
+    {
+#pragma unroll Unroll
+        for (int K = 0; K < Unroll; K++)
+        {
+            if (col[K] >= 0)
+                sell_sum = a_val[K] * d_X[col[K]] + sell_sum;
+
+            col[K] = __ldcs(cols);
+            a_val[K] = __ldcs(vals);
+            cols += slice_size;
+            vals += slice_size;
+        }
+        max_row_len -= Unroll;
+    }
+    if (1 < unroll_nz)
+    {
+#pragma unroll Unroll
+        for (int K = 0; K < Unroll; K++)
+        {
+            if (col[K] >= 0)
+                sell_sum = a_val[K] * d_X[col[K]] + sell_sum;
+            a_val[K] = 0.0;
+            if (0 < max_row_len)
+            {
+                col[K] = __ldcs(cols);
+                a_val[K] = __ldcs(vals);
+            }
+            max_row_len--;
+            cols += slice_size;
+            vals += slice_size;
+        }
+    }
+#pragma unroll Unroll
+    for (int K = 0; K < Unroll; K++)
+    {
+        if (col[K] >= 0)
+            sell_sum = a_val[K] * d_X[col[K]] + sell_sum;
+    }
+    return sell_sum;
+}
+
+__device__ __forceinline__ void sellmvStore(
+    local_int_t row_original_id, double alpha, double beta, double sell_sum, double* d_Y)
+{
+    if (beta == 0.0)
+        d_Y[row_original_id] = alpha * sell_sum;
+    else
+        d_Y[row_original_id] = beta * d_Y[row_original_id] + alpha * sell_sum;
+}
+
+/*
+    GPU Kernel
+    Sliced-ELL SpMV, y = alpha * A * x + beta * y, over a 2D grid: eight column
+    stripes of m/8 rows each on blockIdx.x, row tiles on blockIdx.y, one row per
+    thread. Requires m % 8 == 0; the launcher uses the 1D kernel otherwise.
+
+    Keep the stripes on blockIdx.x. cuSPARSE, which ships this same kernel,
+    measured a 13.3% regression from putting the row tiles there instead.
+
+    With Strided the kernel walks the row-tile axis in gridDim.y strides, for
+    launches whose natural tile count does not fit under the hardware cap on
+    gridDim.y (see mvSellLaunch). The loop predicate is block-uniform, and when
+    the launch does fit the body runs exactly once.
+*/
+template <class OffsetT, int BlockSize, int Unroll, bool Strided = false>
+__global__ void __launch_bounds__(BlockSize) sellmv_v1_2D_kernel(local_int_t m, double alpha, double beta,
+    local_int_t slice_size, const OffsetT* __restrict__ d_sell_offsets, const idx32_t* __restrict__ d_columns,
+    const double* __restrict__ d_values, const double* __restrict__ d_X, double* __restrict__ d_Y)
+{
+    const local_int_t tx = threadIdx.x;
+    const local_int_t stripe = blockIdx.x;
+    local_int_t by = blockIdx.y;
+
+    do
+    {
+        local_int_t row_original_id = tx + (local_int_t) blockDim.x * by;
+        if (row_original_id < m / 8)
+        {
+            row_original_id += stripe * (m / 8);
+            const double sell_sum = sellRowGather<OffsetT, Unroll>(
+                row_original_id, slice_size, d_sell_offsets, d_columns, d_values, d_X);
+            sellmvStore(row_original_id, alpha, beta, sell_sum, d_Y);
+        }
+        if constexpr (Strided)
+        {
+            by += gridDim.y;
+        }
+    } while (Strided && by * (local_int_t) blockDim.x < m / 8);
+}
+
+/*
+    GPU Kernel
+    Sliced-ELL SpMV over a 1D grid, one row per thread. Handles the m % 8 != 0
+    shapes the 2D kernel cannot, which coarse MG levels can produce.
+*/
+template <class OffsetT, int BlockSize, int Unroll>
+__global__ void __launch_bounds__(BlockSize) sellmv_v1_kernel(local_int_t m, double alpha, double beta,
+    local_int_t slice_size, const OffsetT* __restrict__ d_sell_offsets, const idx32_t* __restrict__ d_columns,
+    const double* __restrict__ d_values, const double* __restrict__ d_X, double* __restrict__ d_Y)
+{
+    const local_int_t row_original_id = threadIdx.x + (local_int_t) blockDim.x * blockIdx.x;
+    if (row_original_id < m)
+    {
+        const double sell_sum = sellRowGather<OffsetT, Unroll>(
+            row_original_id, slice_size, d_sell_offsets, d_columns, d_values, d_X);
+        sellmvStore(row_original_id, alpha, beta, sell_sum, d_Y);
+    }
+}
+
+/*
+    GPU Kernel
+    Sliced-ELL triangular solve for the rows of a single color, one row per
+    thread. Rows of one color have no dependence on each other, so the host
+    serializes the colors and each launch is a plain SpMV plus a diagonal
+    division. x is both the source and the destination: the entries it gathers
+    belong to earlier colors, already solved by earlier launches.
+*/
+template <class OffsetT, int ThreadsPerCTA, int Unroll>
+__global__ void __launch_bounds__(ThreadsPerCTA) ex_spsv_sell_single_color_v1_kernel(local_int_t slice_size,
+    local_int_t color_str, local_int_t color_end, double* x, const double* __restrict__ y,
+    const OffsetT* __restrict__ slice_offsets, const idx32_t* __restrict__ col_idx,
+    const double* __restrict__ values, const double* diagonal, double alpha)
+{
+    const local_int_t row_original_id = blockIdx.x * ThreadsPerCTA + threadIdx.x + color_str;
+    if (row_original_id < color_end)
+    {
+        const double sell_sum
+            = sellRowGather<OffsetT, Unroll>(row_original_id, slice_size, slice_offsets, col_idx, values, x);
+        const double diag = __ldcs(&diagonal[row_original_id]);
+        x[row_original_id] = ((alpha * y[row_original_id]) - sell_sum) / diag;
+    }
+}
+
+// CUDA caps gridDim.y at 65535 on every architecture HPCG targets; gridDim.x
+// has no such cap, so only the 2D SpMV grid needs the clamp.
+constexpr unsigned int kMaxGridDimY = 65535u;
+
+template <class OffsetT, int BlockSize, int Unroll>
+static void mvSellLaunch(const SparseMatrix& A, double alpha, double beta, const double* x, double* y, local_int_t m,
+    const OffsetT* offsets, const idx32_t* columns, const double* values)
+{
+    if (m % 8 != 0)
+    {
+        const local_int_t grid = (m + BlockSize - 1) / BlockSize;
+        sellmv_v1_kernel<OffsetT, BlockSize, Unroll><<<grid, BlockSize, 0, stream>>>(
+            m, alpha, beta, A.slice_size, offsets, columns, values, x, y);
+        return;
+    }
+
+    // The requested block size is always honored. When the natural row-tile
+    // count does not fit under the gridDim.y cap, gridDim.y is clamped to the
+    // cap and the kernel walks the axis in gridDim.y strides instead.
+    const slice_ptr_t needed_y = ((slice_ptr_t) m / 8 + BlockSize - 1) / BlockSize;
+    if (needed_y <= (slice_ptr_t) kMaxGridDimY)
+    {
+        dim3 grid2D(8, (unsigned int) needed_y, 1);
+        sellmv_v1_2D_kernel<OffsetT, BlockSize, Unroll, false><<<grid2D, BlockSize, 0, stream>>>(
+            m, alpha, beta, A.slice_size, offsets, columns, values, x, y);
+    }
+    else
+    {
+        dim3 grid2D(8, kMaxGridDimY, 1);
+        sellmv_v1_2D_kernel<OffsetT, BlockSize, Unroll, true><<<grid2D, BlockSize, 0, stream>>>(
+            m, alpha, beta, A.slice_size, offsets, columns, values, x, y);
+    }
+}
+
+template <class OffsetT, int ThreadsPerCTA, int Unroll>
+static void svSellLaunch(DIR d, const SparseMatrix& A, const double* rv, double* xv, local_int_t color_size,
+    local_int_t rows, const OffsetT* offsets, const idx32_t* columns, const double* values)
+{
+    const local_int_t grid = (color_size + ThreadsPerCTA - 1) / ThreadsPerCTA;
+    const local_int_t first = d == Forward ? 0 : A.totalColors - 1;
+    const local_int_t step = d == Forward ? 1 : -1;
+    for (local_int_t i = 0; i < A.totalColors; i++)
+    {
+        const local_int_t color = first + i * step;
+        const local_int_t color_str = color * color_size;
+        const local_int_t color_end = std::min<local_int_t>((color + 1) * color_size, rows);
+        ex_spsv_sell_single_color_v1_kernel<OffsetT, ThreadsPerCTA, Unroll><<<grid, ThreadsPerCTA, 0, stream>>>(
+            A.slice_size, color_str, color_end, xv, rv, offsets, columns, values, A.diagonal, 1.0);
+    }
+}
+
+/*
+    Turn the runtime MV_BLOCK_SIZE / MV_UNROLL knobs into the matching kernel
+    instantiation. Returns false when the pair is not one of the instantiated
+    ones, so the caller can say so rather than skip the multiply.
+*/
+template <class OffsetT>
+static bool mvSellDispatch(int blk, int unroll, const SparseMatrix& A, double alpha, double beta, const double* x,
+    double* y, local_int_t m, const OffsetT* offsets, const idx32_t* columns, const double* values)
+{
+#define HPCG_MV_CASE(B, U)                                                                                             \
+    if (blk == (B) && unroll == (U))                                                                                   \
+    {                                                                                                                  \
+        mvSellLaunch<OffsetT, B, U>(A, alpha, beta, x, y, m, offsets, columns, values);                                 \
+        return true;                                                                                                   \
+    }
+    HPCG_MV_CASE(64, 1) HPCG_MV_CASE(64, 4) HPCG_MV_CASE(64, 6) HPCG_MV_CASE(64, 7) HPCG_MV_CASE(64, 8)
+        HPCG_MV_CASE(64, 10) HPCG_MV_CASE(64, 12) HPCG_MV_CASE(64, 14) HPCG_MV_CASE(64, 16)
+    HPCG_MV_CASE(128, 1) HPCG_MV_CASE(128, 4) HPCG_MV_CASE(128, 6) HPCG_MV_CASE(128, 7) HPCG_MV_CASE(128, 8)
+        HPCG_MV_CASE(128, 10) HPCG_MV_CASE(128, 12) HPCG_MV_CASE(128, 14) HPCG_MV_CASE(128, 16)
+    HPCG_MV_CASE(256, 1) HPCG_MV_CASE(256, 4) HPCG_MV_CASE(256, 6) HPCG_MV_CASE(256, 7) HPCG_MV_CASE(256, 8)
+        HPCG_MV_CASE(256, 10) HPCG_MV_CASE(256, 12) HPCG_MV_CASE(256, 14) HPCG_MV_CASE(256, 16)
+    HPCG_MV_CASE(512, 1) HPCG_MV_CASE(512, 4) HPCG_MV_CASE(512, 6) HPCG_MV_CASE(512, 7) HPCG_MV_CASE(512, 8)
+    HPCG_MV_CASE(1024, 1) HPCG_MV_CASE(1024, 4) HPCG_MV_CASE(1024, 6) HPCG_MV_CASE(1024, 7) HPCG_MV_CASE(1024, 8)
+#undef HPCG_MV_CASE
+    return false;
+}
+
+template <class OffsetT>
+static bool svSellDispatch(int blk, int unroll, DIR d, const SparseMatrix& A, const double* rv, double* xv,
+    local_int_t color_size, local_int_t rows, const OffsetT* offsets, const idx32_t* columns, const double* values)
+{
+#define HPCG_SV_CASE(B, U)                                                                                             \
+    if (blk == (B) && unroll == (U))                                                                                   \
+    {                                                                                                                  \
+        svSellLaunch<OffsetT, B, U>(d, A, rv, xv, color_size, rows, offsets, columns, values);                          \
+        return true;                                                                                                   \
+    }
+    HPCG_SV_CASE(64, 4) HPCG_SV_CASE(64, 6) HPCG_SV_CASE(64, 7) HPCG_SV_CASE(64, 8) HPCG_SV_CASE(64, 10)
+        HPCG_SV_CASE(64, 12) HPCG_SV_CASE(64, 14) HPCG_SV_CASE(64, 16)
+    HPCG_SV_CASE(128, 4) HPCG_SV_CASE(128, 6) HPCG_SV_CASE(128, 7) HPCG_SV_CASE(128, 8) HPCG_SV_CASE(128, 10)
+        HPCG_SV_CASE(128, 12) HPCG_SV_CASE(128, 14) HPCG_SV_CASE(128, 16)
+    HPCG_SV_CASE(256, 4) HPCG_SV_CASE(256, 6) HPCG_SV_CASE(256, 7) HPCG_SV_CASE(256, 8) HPCG_SV_CASE(256, 10)
+        HPCG_SV_CASE(256, 12) HPCG_SV_CASE(256, 14) HPCG_SV_CASE(256, 16)
+#undef HPCG_SV_CASE
+    return false;
+}
+
+namespace
+{
+bool ExplicitEnvEnabled(const char* var)
+{
+    const char* value = std::getenv(var);
+    return value != NULL && std::atoi(value) != 0;
+}
+
+/*
+    The explicit kernels are instantiated for 32-bit slice offsets and 32-bit
+    columns only, so there is nothing to run under --mi 1 / --mi 2. Say so once
+    and let the caller keep the operator on cuSPARSE.
+*/
+bool ExplicitIndexModeUsable(const SparseMatrix& A, const char* op, const char* var, bool& warned)
+{
+    if (A.index_mode == IndexMode::I32_I32)
+        return true;
+    if (!warned)
+    {
+        warned = true;
+        fprintf(stderr,
+            "HPCG: %s was requested through %s, but the explicit Sliced-ELL kernels are built for 32-bit slice "
+            "offsets and 32-bit columns only and cannot serve --mi %d (%s). Re-run with --mi 0 to use them; "
+            "using cuSPARSE for this run.\n",
+            op, var, (int) A.index_mode, toString(A.index_mode));
+    }
+    return false;
+}
+} // namespace
+
+bool UseExplicitSpMV(const SparseMatrix& A)
+{
+    static const bool enabled = ExplicitEnvEnabled("HPCG_EXPLICIT_MV");
+    static bool warned = false;
+    return enabled && ExplicitIndexModeUsable(A, "the explicit SpMV", "HPCG_EXPLICIT_MV", warned);
+}
+
+bool UseExplicitSpSV(const SparseMatrix& A)
+{
+    static const bool enabled = ExplicitEnvEnabled("HPCG_EXPLICIT_SV");
+    static bool warned = false;
+    return enabled && ExplicitIndexModeUsable(A, "the explicit SpSV", "HPCG_EXPLICIT_SV", warned);
+}
+
+/*
+    y = alpha * op(A) * x + beta * y, where op is the whole permuted matrix
+    (General), its strict lower part (Forward) or its strict upper part
+    (Backward).
+*/
+void mv_sell(DIR d, const SparseMatrix& A, double alpha, double beta, double* x, double* y)
+{
+    const local_int_t m = A.localNumberOfRows;
+
+    const void* offsets = A.sellDev.aSliceOffsets;
+    const void* columns = A.sellDev.aColumns;
+    const double* values = A.sellAPermValues;
+    if (d == Forward)
+    {
+        offsets = A.sellDev.lSliceOffsets;
+        columns = A.sellDev.lColumns;
+        values = A.sellLPermValues;
+    }
+    else if (d == Backward)
+    {
+        offsets = A.sellDev.uSliceOffsets;
+        columns = A.sellDev.uColumns;
+        values = A.sellUPermValues;
+    }
+
+    bool launched = false;
+    dispatchSellOffsetType(A.index_mode,
+        [&](auto offTag)
+        {
+            using OffsetT = decltype(offTag);
+            launched = mvSellDispatch<OffsetT>(g_config.MV_BLOCK_SIZE, g_config.MV_UNROLL, A, alpha, beta, x, y, m,
+                static_cast<const OffsetT*>(offsets), static_cast<const idx32_t*>(columns), values);
+        });
+    if (!launched)
+    {
+        fprintf(stderr,
+            "HPCG: no explicit SpMV kernel for MV_BLOCK_SIZE=%d MV_UNROLL=%d with --mi %d. Exiting ...\n",
+            g_config.MV_BLOCK_SIZE, g_config.MV_UNROLL, (int) A.index_mode);
+        exit(1);
+    }
+}
+
+/*
+    Solves op(A) * xv = rv by colors, where op is the strict lower part plus the
+    diagonal (Forward) or the strict upper part plus the diagonal (Backward).
+*/
+void sv_sell(DIR d, const SparseMatrix& A, double* rv, double* xv)
+{
+    const local_int_t rows = A.localNumberOfRows;
+    const local_int_t color_size = (rows + A.totalColors - 1) / A.totalColors;
+
+    const void* offsets = A.sellDev.uSliceOffsets;
+    const void* columns = A.sellDev.uColumns;
+    const double* values = A.sellUPermValues;
+    if (d == Forward)
+    {
+        offsets = A.sellDev.lSliceOffsets;
+        columns = A.sellDev.lColumns;
+        values = A.sellLPermValues;
+    }
+
+    bool launched = false;
+    dispatchSellOffsetType(A.index_mode,
+        [&](auto offTag)
+        {
+            using OffsetT = decltype(offTag);
+            launched = svSellDispatch<OffsetT>(g_config.SV_BLOCK_SIZE, g_config.SV_UNROLL, d, A, rv, xv, color_size,
+                rows, static_cast<const OffsetT*>(offsets), static_cast<const idx32_t*>(columns), values);
+        });
+    if (!launched)
+    {
+        fprintf(stderr,
+            "HPCG: no explicit SpSV kernel for SV_BLOCK_SIZE=%d SV_UNROLL=%d with --mi %d. Exiting ...\n",
+            g_config.SV_BLOCK_SIZE, g_config.SV_UNROLL, (int) A.index_mode);
+        exit(1);
+    }
+}
+#endif // EXPLICIT_KERNELS
 #endif

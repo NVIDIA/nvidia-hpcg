@@ -147,6 +147,11 @@ size_t OptimizeProblemGpu(SparseMatrix& A_in, CGData& data, Vector& b, Vector& x
 
         // Padded A storage size can exceed 2^31: compute in 64-bit.
         const long long sell_nnz = (long long) sell_slices * slice_size * HPCG_MAX_ROW_LEN;
+
+        A->sellALocalNumberOfNonzeros = (slice_ptr_t) sell_nnz;
+        A->sellLLocalNumberOfNonzeros = (slice_ptr_t) sell_l_nnz;
+        A->sellULocalNumberOfNonzeros = (slice_ptr_t) sell_u_nnz;
+
         CHECK_CUSPARSE_MODE(cusparseCreateSlicedEll(&(A->cusparseOpt.matA), nrow, nrow, matA_nnz, sell_nnz, slice_size,
                                 A->sellDev.aSliceOffsets, A->sellDev.aColumns, A->sellAPermValues, offsetType, colType,
                                 CUSPARSE_INDEX_BASE_ZERO, CUDA_R_64F),
