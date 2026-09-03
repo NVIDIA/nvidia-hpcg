@@ -2761,10 +2761,24 @@ KernelConfig g_config;
 
 void InitKernelConfig()
 {
-    g_config.SV_UNROLL = 8;
-    g_config.MV_UNROLL = 8;
+    g_config.SV_KIND = SELL_KIND_LDG;
+    g_config.MV_KIND = SELL_KIND_LDG;
+    if (const char* env = std::getenv("HPCG_EXPLICIT_SV_KIND"))
+        g_config.SV_KIND = std::atoi(env);
+    if (const char* env = std::getenv("HPCG_EXPLICIT_MV_KIND"))
+        g_config.MV_KIND = std::atoi(env);
+
+    // The unroll depth is not instantiated over the same range in both
+    // families: LDG counts single entries and goes to 16, LDG_V2 counts blocks
+    // of W rows and goes to 4. The default therefore has to follow the family,
+    // or one of the two starts with no kernel to run.
+    g_config.SV_UNROLL = g_config.SV_KIND == SELL_KIND_LDGV2 ? 4 : 8;
+    g_config.MV_UNROLL = g_config.MV_KIND == SELL_KIND_LDGV2 ? 4 : 8;
     g_config.SV_BLOCK_SIZE = 64;
     g_config.MV_BLOCK_SIZE = 256;
+    g_config.SV_W = 4;
+    g_config.MV_W = 4;
+    g_config.MV_PARTS = 1;
 
     if (const char* env = std::getenv("SV_UNROLL"))
         g_config.SV_UNROLL = std::atoi(env);
@@ -2774,6 +2788,12 @@ void InitKernelConfig()
         g_config.SV_BLOCK_SIZE = std::atoi(env);
     if (const char* env = std::getenv("MV_BLOCK_SIZE"))
         g_config.MV_BLOCK_SIZE = std::atoi(env);
+    if (const char* env = std::getenv("SV_W"))
+        g_config.SV_W = std::atoi(env);
+    if (const char* env = std::getenv("MV_W"))
+        g_config.MV_W = std::atoi(env);
+    if (const char* env = std::getenv("MV_PARTS"))
+        g_config.MV_PARTS = std::atoi(env);
 }
 
 /*
@@ -3108,20 +3128,46 @@ bool ExplicitIndexModeUsable(const SparseMatrix& A, const char* op, const char* 
     }
     return false;
 }
+
+/*
+    Only two of the six numbered families are built here. A request for one of
+    the others is refused rather than served by whichever family happens to be
+    present, so that a measurement can never be attributed to the wrong kernel.
+*/
+bool ExplicitKindUsable(int kind, const char* op, const char* var, bool& warned)
+{
+    if (kind == SELL_KIND_LDG || kind == SELL_KIND_LDGV2)
+        return true;
+    if (!warned)
+    {
+        warned = true;
+        fprintf(stderr,
+            "HPCG: %s=%d selects a Sliced-ELL kernel family this build does not contain. This build supports "
+            "%d (LDG) and %d (LDG_V2); using cuSPARSE for %s.\n",
+            var, kind, (int) SELL_KIND_LDG, (int) SELL_KIND_LDGV2, op);
+    }
+    return false;
+}
 } // namespace
 
 bool UseExplicitSpMV(const SparseMatrix& A)
 {
     static const bool enabled = ExplicitEnvEnabled("HPCG_EXPLICIT_MV");
-    static bool warned = false;
-    return enabled && ExplicitIndexModeUsable(A, "the explicit SpMV", "HPCG_EXPLICIT_MV", warned);
+    static bool kind_warned = false;
+    static bool mode_warned = false;
+    return enabled
+        && ExplicitKindUsable(g_config.MV_KIND, "the explicit SpMV", "HPCG_EXPLICIT_MV_KIND", kind_warned)
+        && ExplicitIndexModeUsable(A, "the explicit SpMV", "HPCG_EXPLICIT_MV", mode_warned);
 }
 
 bool UseExplicitSpSV(const SparseMatrix& A)
 {
     static const bool enabled = ExplicitEnvEnabled("HPCG_EXPLICIT_SV");
-    static bool warned = false;
-    return enabled && ExplicitIndexModeUsable(A, "the explicit SpSV", "HPCG_EXPLICIT_SV", warned);
+    static bool kind_warned = false;
+    static bool mode_warned = false;
+    return enabled
+        && ExplicitKindUsable(g_config.SV_KIND, "the explicit SpSV", "HPCG_EXPLICIT_SV_KIND", kind_warned)
+        && ExplicitIndexModeUsable(A, "the explicit SpSV", "HPCG_EXPLICIT_SV", mode_warned);
 }
 
 /*
@@ -3154,14 +3200,22 @@ void mv_sell(DIR d, const SparseMatrix& A, double alpha, double beta, double* x,
         [&](auto offTag)
         {
             using OffsetT = decltype(offTag);
-            launched = mvSellDispatch<OffsetT>(g_config.MV_BLOCK_SIZE, g_config.MV_UNROLL, A, alpha, beta, x, y, m,
-                static_cast<const OffsetT*>(offsets), static_cast<const idx32_t*>(columns), values);
+            const OffsetT* off = static_cast<const OffsetT*>(offsets);
+            const idx32_t* col = static_cast<const idx32_t*>(columns);
+            if (g_config.MV_KIND == SELL_KIND_LDGV2)
+                launched = MvLdgV2SellCfg<OffsetT>(A, alpha, beta, x, y, off, col, values, stream,
+                    g_config.MV_BLOCK_SIZE, g_config.MV_UNROLL, g_config.MV_W, g_config.MV_PARTS);
+            else
+                launched = mvSellDispatch<OffsetT>(
+                    g_config.MV_BLOCK_SIZE, g_config.MV_UNROLL, A, alpha, beta, x, y, m, off, col, values);
         });
     if (!launched)
     {
         fprintf(stderr,
-            "HPCG: no explicit SpMV kernel for MV_BLOCK_SIZE=%d MV_UNROLL=%d with --mi %d. Exiting ...\n",
-            g_config.MV_BLOCK_SIZE, g_config.MV_UNROLL, (int) A.index_mode);
+            "HPCG: no explicit SpMV kernel for HPCG_EXPLICIT_MV_KIND=%d MV_BLOCK_SIZE=%d MV_UNROLL=%d MV_W=%d "
+            "MV_PARTS=%d at level %d with --mi %d. Exiting ...\n",
+            g_config.MV_KIND, g_config.MV_BLOCK_SIZE, g_config.MV_UNROLL, g_config.MV_W, g_config.MV_PARTS, A.level,
+            (int) A.index_mode);
         exit(1);
     }
 }
@@ -3190,14 +3244,22 @@ void sv_sell(DIR d, const SparseMatrix& A, double* rv, double* xv)
         [&](auto offTag)
         {
             using OffsetT = decltype(offTag);
-            launched = svSellDispatch<OffsetT>(g_config.SV_BLOCK_SIZE, g_config.SV_UNROLL, d, A, rv, xv, color_size,
-                rows, static_cast<const OffsetT*>(offsets), static_cast<const idx32_t*>(columns), values);
+            const OffsetT* off = static_cast<const OffsetT*>(offsets);
+            const idx32_t* col = static_cast<const idx32_t*>(columns);
+            if (g_config.SV_KIND == SELL_KIND_LDGV2)
+                launched = SpsvLdgV2SellCfg<OffsetT>(d == Forward, A, rv, xv, off, col, values, stream,
+                    g_config.SV_BLOCK_SIZE, g_config.SV_UNROLL, g_config.SV_W);
+            else
+                launched = svSellDispatch<OffsetT>(
+                    g_config.SV_BLOCK_SIZE, g_config.SV_UNROLL, d, A, rv, xv, color_size, rows, off, col, values);
         });
     if (!launched)
     {
         fprintf(stderr,
-            "HPCG: no explicit SpSV kernel for SV_BLOCK_SIZE=%d SV_UNROLL=%d with --mi %d. Exiting ...\n",
-            g_config.SV_BLOCK_SIZE, g_config.SV_UNROLL, (int) A.index_mode);
+            "HPCG: no explicit SpSV kernel for HPCG_EXPLICIT_SV_KIND=%d SV_BLOCK_SIZE=%d SV_UNROLL=%d SV_W=%d at "
+            "level %d with --mi %d. Exiting ...\n",
+            g_config.SV_KIND, g_config.SV_BLOCK_SIZE, g_config.SV_UNROLL, g_config.SV_W, A.level,
+            (int) A.index_mode);
         exit(1);
     }
 }

@@ -99,7 +99,7 @@ void ExtSpMVCuda(SparseMatrix& A, double alpha, double* x, double* y);
 size_t CopyDataToHostCuda(SparseMatrix& A, Vector* b, Vector* x, Vector* xexact);
 
 #ifdef EXPLICIT_KERNELS
-///////// Explicit Sliced-ELL SpMV / SpSV (LDG family) //
+///////// Explicit Sliced-ELL SpMV / SpSV //
 // Which triangle of the permuted Sliced-ELL operator a call addresses: the full
 // matrix, the strict lower part, or the strict upper part.
 enum DIR
@@ -109,14 +109,41 @@ enum DIR
     General = 2
 };
 
-// Launch shape of the explicit kernels. Overridable per run through the
-// matching environment variables; InitKernelConfig() installs the defaults.
+/*
+  The project-wide Sliced-ELL kernel family numbering, selected per operator by
+  HPCG_EXPLICIT_MV_KIND / HPCG_EXPLICIT_SV_KIND. The numbering is fixed so that
+  a family keeps the same number as it lands; this build implements LDG and
+  LDG_V2, and refuses the rest rather than serving a substitute.
+*/
+enum SellKernelKind
+{
+    SELL_KIND_LDG = 0,
+    SELL_KIND_TMA = 1,
+    SELL_KIND_LDGV2 = 2,
+    SELL_KIND_TMA2D = 3,
+    SELL_KIND_LDGV3 = 4,
+    SELL_KIND_TMAEX = 5
+};
+
+// Family and launch shape of the explicit kernels. Overridable per run through
+// the matching environment variables; InitKernelConfig() installs the defaults,
+// which depend on the family because the families are not instantiated over the
+// same grid of block sizes and unroll depths.
 struct KernelConfig
 {
+    int SV_KIND;
+    int MV_KIND;
     int SV_UNROLL;
     int MV_UNROLL;
     int SV_BLOCK_SIZE;
     int MV_BLOCK_SIZE;
+    // Rows each thread owns. LDG_V2 only; the scalar LDG family is one row per
+    // thread by construction and ignores it.
+    int SV_W;
+    int MV_W;
+    // Number of equal row partitions the LDG_V2 SpMV grid is split into, one per
+    // blockIdx.x. 1 is the flat 1D grid. LDG_V2 SpMV only.
+    int MV_PARTS;
 };
 
 extern KernelConfig g_config;
@@ -130,7 +157,8 @@ void InitKernelConfig();
   False unless HPCG_EXPLICIT_MV / HPCG_EXPLICIT_SV is set to a nonzero value,
   so a default run of an EXPLICIT_KERNELS build takes exactly the same code
   path as a build without it. Also false, with a one-time warning, when the
-  matrix uses an index mode the explicit kernels are not instantiated for.
+  matrix uses an index mode the explicit kernels are not instantiated for, or
+  when the requested family is not one this build contains.
 
   Takes the whole matrix rather than a flag so that the per-level selection the
   autotuner will drive lands here without touching the call sites.
@@ -140,5 +168,20 @@ bool UseExplicitSpSV(const SparseMatrix& A);
 
 void mv_sell(DIR d, const SparseMatrix& A, double alpha, double beta, double* x, double* y);
 void sv_sell(DIR d, const SparseMatrix& A, double* rv, double* xv);
+
+/*
+  LDG_V2 launchers, defined in mv-ldg-v2.cu / spsv-ldg-v2.cu and instantiated
+  there for the 32-bit-offset case alone. Both return false when the requested
+  block size / unroll / W triple, or the launch shape it implies for this
+  matrix, is not one the family can serve; nothing is launched in that case.
+*/
+template <class OffsetT>
+bool MvLdgV2SellCfg(const SparseMatrix& A, double alpha, double beta, const double* x, double* y,
+    const OffsetT* slice_offsets, const idx32_t* columns, const double* values, cudaStream_t stream, int blk,
+    int unroll, int w, int parts);
+
+template <class OffsetT>
+bool SpsvLdgV2SellCfg(bool forward, const SparseMatrix& A, const double* rv, double* xv, const OffsetT* slice_offsets,
+    const idx32_t* columns, const double* values, cudaStream_t stream, int blk, int unroll, int w);
 #endif
 #endif

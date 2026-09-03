@@ -69,6 +69,8 @@ HPCG_DEPS = src/CG.o \
 	    src/init.o \
 	    src/finalize.o \
 	    src/CudaKernels.o \
+	    src/mv-ldg-v2.o \
+	    src/spsv-ldg-v2.o \
 		src/CpuKernels.o
 
 # These header files are included in many source files, so we recompile every file if one or more of these header is modified.
@@ -218,4 +220,12 @@ src/CpuKernels.o: HPCG_SRC_PATH/src/CpuKernels.cpp HPCG_SRC_PATH/src/CpuKernels.
 	$(CXX) -c $(CXXFLAGS) -IHPCG_SRC_PATH/src $< -o $@
 
 src/CudaKernels.o: HPCG_SRC_PATH/src/CudaKernels.cu
+	nvcc -c -O3 $(CUDA_ARCH) $(HPCG_DEFS) -IHPCG_SRC_PATH/src -I$(CUDA_HOME)/include -I$(CUBLASROOT)/include -I$(MPdir)/include $< -o $@
+
+# The explicit kernel families each compile to an empty object without
+# -DEXPLICIT_KERNELS, so they stay in HPCG_DEPS for both configurations.
+src/mv-ldg-v2.o: HPCG_SRC_PATH/src/mv-ldg-v2.cu HPCG_SRC_PATH/src/ldg-loads.cuh
+	nvcc -c -O3 $(CUDA_ARCH) $(HPCG_DEFS) -IHPCG_SRC_PATH/src -I$(CUDA_HOME)/include -I$(CUBLASROOT)/include -I$(MPdir)/include $< -o $@
+
+src/spsv-ldg-v2.o: HPCG_SRC_PATH/src/spsv-ldg-v2.cu HPCG_SRC_PATH/src/ldg-loads.cuh
 	nvcc -c -O3 $(CUDA_ARCH) $(HPCG_DEFS) -IHPCG_SRC_PATH/src -I$(CUDA_HOME)/include -I$(CUBLASROOT)/include -I$(MPdir)/include $< -o $@
