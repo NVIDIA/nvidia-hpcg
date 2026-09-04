@@ -2773,10 +2773,24 @@ void InitKernelConfig()
     // count blocks of W rows and stop at 4 for the W the default picks. The
     // default therefore has to follow the family, or one of them starts with no
     // kernel to run.
-    const bool sv_blocked = g_config.SV_KIND == SELL_KIND_LDGV2 || g_config.SV_KIND == SELL_KIND_LDGV3;
-    const bool mv_blocked = g_config.MV_KIND == SELL_KIND_LDGV2 || g_config.MV_KIND == SELL_KIND_LDGV3;
-    g_config.SV_UNROLL = sv_blocked ? 4 : 8;
-    g_config.MV_UNROLL = mv_blocked ? 4 : 8;
+    //
+    // TMA gives it a third meaning: unroll is the depth of one of the two
+    // shared-memory buffers, so the CTA's footprint is
+    // 2 * UNROLL * BLOCK_SIZE * W * (4 + 8) bytes and the launcher refuses
+    // anything past the device's opt-in maximum. 2 is the depth the family's own
+    // recorded default ran at, is instantiated at every block size it offers,
+    // and leaves the default 256/4 SpMV at 48 KiB -- enough headroom that
+    // raising W by hand does not immediately turn into a refusal.
+    auto default_unroll = [](int kind)
+    {
+        if (kind == SELL_KIND_TMA)
+            return 2;
+        if (kind == SELL_KIND_LDGV2 || kind == SELL_KIND_LDGV3)
+            return 4;
+        return 8;
+    };
+    g_config.SV_UNROLL = default_unroll(g_config.SV_KIND);
+    g_config.MV_UNROLL = default_unroll(g_config.MV_KIND);
     g_config.SV_BLOCK_SIZE = 64;
     g_config.MV_BLOCK_SIZE = 256;
     g_config.SV_W = 4;
@@ -3152,21 +3166,21 @@ bool ExplicitIndexModeUsable(const SparseMatrix& A, const char* op, const char* 
 }
 
 /*
-    Only three of the six numbered families are built here. A request for one of
+    Only four of the six numbered families are built here. A request for one of
     the others is refused rather than served by whichever family happens to be
     present, so that a measurement can never be attributed to the wrong kernel.
 */
 bool ExplicitKindUsable(int kind, const char* op, const char* var, bool& warned)
 {
-    if (kind == SELL_KIND_LDG || kind == SELL_KIND_LDGV2 || kind == SELL_KIND_LDGV3)
+    if (kind == SELL_KIND_LDG || kind == SELL_KIND_TMA || kind == SELL_KIND_LDGV2 || kind == SELL_KIND_LDGV3)
         return true;
     if (!warned)
     {
         warned = true;
         fprintf(stderr,
             "HPCG: %s=%d selects a Sliced-ELL kernel family this build does not contain. This build supports "
-            "%d (LDG), %d (LDG_V2) and %d (LDG3); using cuSPARSE for %s.\n",
-            var, kind, (int) SELL_KIND_LDG, (int) SELL_KIND_LDGV2, (int) SELL_KIND_LDGV3, op);
+            "%d (LDG), %d (TMA), %d (LDG_V2) and %d (LDG3); using cuSPARSE for %s.\n",
+            var, kind, (int) SELL_KIND_LDG, (int) SELL_KIND_TMA, (int) SELL_KIND_LDGV2, (int) SELL_KIND_LDGV3, op);
     }
     return false;
 }
@@ -3224,7 +3238,10 @@ void mv_sell(DIR d, const SparseMatrix& A, double alpha, double beta, double* x,
             using OffsetT = decltype(offTag);
             const OffsetT* off = static_cast<const OffsetT*>(offsets);
             const idx32_t* col = static_cast<const idx32_t*>(columns);
-            if (g_config.MV_KIND == SELL_KIND_LDGV2)
+            if (g_config.MV_KIND == SELL_KIND_TMA)
+                launched = MvTmaSellCfg<OffsetT>(A, alpha, beta, x, y, off, col, values, stream,
+                    g_config.MV_BLOCK_SIZE, g_config.MV_UNROLL, g_config.MV_W);
+            else if (g_config.MV_KIND == SELL_KIND_LDGV2)
                 launched = MvLdgV2SellCfg<OffsetT>(A, alpha, beta, x, y, off, col, values, stream,
                     g_config.MV_BLOCK_SIZE, g_config.MV_UNROLL, g_config.MV_W, g_config.MV_PARTS);
             else if (g_config.MV_KIND == SELL_KIND_LDGV3)
@@ -3275,7 +3292,10 @@ void sv_sell(DIR d, const SparseMatrix& A, double* rv, double* xv)
             using OffsetT = decltype(offTag);
             const OffsetT* off = static_cast<const OffsetT*>(offsets);
             const idx32_t* col = static_cast<const idx32_t*>(columns);
-            if (g_config.SV_KIND == SELL_KIND_LDGV2)
+            if (g_config.SV_KIND == SELL_KIND_TMA)
+                launched = SpsvTmaSellCfg<OffsetT>(d == Forward, A, rv, xv, off, col, values, stream,
+                    g_config.SV_BLOCK_SIZE, g_config.SV_UNROLL, g_config.SV_W);
+            else if (g_config.SV_KIND == SELL_KIND_LDGV2)
                 launched = SpsvLdgV2SellCfg<OffsetT>(d == Forward, A, rv, xv, off, col, values, stream,
                     g_config.SV_BLOCK_SIZE, g_config.SV_UNROLL, g_config.SV_W);
             else if (g_config.SV_KIND == SELL_KIND_LDGV3)

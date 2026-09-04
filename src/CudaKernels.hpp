@@ -112,7 +112,7 @@ enum DIR
 /*
   The project-wide Sliced-ELL kernel family numbering, selected per operator by
   HPCG_EXPLICIT_MV_KIND / HPCG_EXPLICIT_SV_KIND. The numbering is fixed so that
-  a family keeps the same number as it lands; this build implements LDG,
+  a family keeps the same number as it lands; this build implements LDG, TMA,
   LDG_V2 and LDG3, and refuses the rest rather than serving a substitute.
 */
 enum SellKernelKind
@@ -143,8 +143,11 @@ struct KernelConfig
     int MV_UNROLL;
     int SV_BLOCK_SIZE;
     int MV_BLOCK_SIZE;
-    // Rows each thread owns. LDG_V2 and LDG3; the scalar LDG family is one row
-    // per thread by construction and ignores it.
+    // Rows each thread owns. LDG_V2, LDG3 and TMA; the scalar LDG family is one
+    // row per thread by construction and ignores it. TMA calls it rpt and takes
+    // it for the same quantity, with the added consequence that BLOCK_SIZE * W
+    // is the length of each bulk transfer, so the pair also has to divide the
+    // slice size there.
     int SV_W;
     int MV_W;
     // Number of equal row partitions the SpMV grid is split into, one per
@@ -227,5 +230,28 @@ template <class OffsetT>
 bool SpsvLdgV3SellCfg(bool forward, const SparseMatrix& A, const double* rv, double* xv, const OffsetT* slice_offsets,
     const idx32_t* columns, const double* values, cudaStream_t stream, int blk, int unroll, int w, bool wide,
     bool cached);
+
+/*
+  TMA launchers, defined in mv-tma.cu / spsv-tma.cu and instantiated there for
+  both slice-offset widths with 32-bit columns. `rpt` is rows per thread, which
+  is what MV_W / SV_W carry for the register families; there is no width or
+  cache-policy knob, because the matrix stream reaches shared memory through the
+  bulk copy engine and never through the threads' own load path.
+
+  Both return false when the requested combination, or the launch shape it
+  implies for this matrix, is not one the family can serve; nothing is launched
+  in that case. The refusals particular to this family are a row block that does
+  not fit inside one slice, a shared-memory footprint above the device's opt-in
+  maximum, and a device below compute capability 9.0, which has no bulk copy
+  instruction at all.
+*/
+template <class OffsetT>
+bool MvTmaSellCfg(const SparseMatrix& A, double alpha, double beta, const double* x, double* y,
+    const OffsetT* slice_offsets, const idx32_t* columns, const double* values, cudaStream_t stream, int blk,
+    int unroll, int rpt);
+
+template <class OffsetT>
+bool SpsvTmaSellCfg(bool forward, const SparseMatrix& A, const double* rv, double* xv, const OffsetT* slice_offsets,
+    const idx32_t* columns, const double* values, cudaStream_t stream, int blk, int unroll, int rpt);
 #endif
 #endif

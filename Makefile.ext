@@ -73,6 +73,8 @@ HPCG_DEPS = src/CG.o \
 	    src/spsv-ldg-v2.o \
 	    src/mv-ldg-v3.o \
 	    src/spsv-ldg-v3.o \
+	    src/mv-tma.o \
+	    src/spsv-tma.o \
 		src/CpuKernels.o
 
 # These header files are included in many source files, so we recompile every file if one or more of these header is modified.
@@ -236,4 +238,12 @@ src/mv-ldg-v3.o: HPCG_SRC_PATH/src/mv-ldg-v3.cu HPCG_SRC_PATH/src/ldg-loads.cuh 
 	nvcc -c -O3 $(CUDA_ARCH) $(HPCG_DEFS) -IHPCG_SRC_PATH/src -I$(CUDA_HOME)/include -I$(CUBLASROOT)/include -I$(MPdir)/include $< -o $@
 
 src/spsv-ldg-v3.o: HPCG_SRC_PATH/src/spsv-ldg-v3.cu HPCG_SRC_PATH/src/ldg-loads.cuh HPCG_SRC_PATH/src/intdiv.hh
+	nvcc -c -O3 $(CUDA_ARCH) $(HPCG_DEFS) -IHPCG_SRC_PATH/src -I$(CUDA_HOME)/include -I$(CUBLASROOT)/include -I$(MPdir)/include $< -o $@
+
+# The TMA family stages the matrix through shared memory with the bulk copy
+# engine and so needs no ldg-loads.cuh.
+src/mv-tma.o: HPCG_SRC_PATH/src/mv-tma.cu HPCG_SRC_PATH/src/intdiv.hh
+	nvcc -c -O3 $(CUDA_ARCH) $(HPCG_DEFS) -IHPCG_SRC_PATH/src -I$(CUDA_HOME)/include -I$(CUBLASROOT)/include -I$(MPdir)/include $< -o $@
+
+src/spsv-tma.o: HPCG_SRC_PATH/src/spsv-tma.cu HPCG_SRC_PATH/src/intdiv.hh
 	nvcc -c -O3 $(CUDA_ARCH) $(HPCG_DEFS) -IHPCG_SRC_PATH/src -I$(CUDA_HOME)/include -I$(CUBLASROOT)/include -I$(MPdir)/include $< -o $@
