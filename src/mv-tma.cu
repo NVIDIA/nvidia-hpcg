@@ -141,7 +141,12 @@ __global__ __launch_bounds__(BLKDIM) void mv_sell_tma(int m, double alpha, doubl
     // Flat element offsets into the column/value arrays exceed 2^31 for large
     // local problems, so widen before they enter the pointer arithmetic even
     // when OffsetT itself is 32-bit.
-    const size_t block_base = (size_t) slice_offsets[slice] + (size_t) in_slice_base;
+    // 64-bit only when the slice offsets are; see FlatOffsetT. The source tree
+    // reads 64-bit offsets unconditionally and so computes this in size_t, but
+    // this instantiation may be reading 32-bit ones, and widening those costs a
+    // sign-extension and the registers to hold the result.
+    const FlatOffsetT<OffsetT> block_base
+        = (FlatOffsetT<OffsetT>) slice_offsets[slice] + (FlatOffsetT<OffsetT>) in_slice_base;
     // Per-slice nnz is bounded by slice_size * HPCG_MAX_ROW_LEN and so fits in
     // int32. Narrowing the difference before dividing keeps this in the 32-bit
     // reciprocal above instead of the 64-bit form a wider OffsetT would force.

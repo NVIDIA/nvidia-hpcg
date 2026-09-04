@@ -2871,10 +2871,10 @@ __device__ __forceinline__ double sellRowGather(local_int_t row_original_id, loc
 {
     const local_int_t row_in_slice_id = row_original_id % slice_size;
     const local_int_t row_slice_id = row_original_id / slice_size;
-    // Flat element offsets into the column/value arrays exceed 2^31 for large
-    // local problems, so widen before they enter the pointer arithmetic even
-    // when OffsetT itself is 32-bit.
-    const slice_ptr_t row_start_index = (slice_ptr_t) d_sell_offsets[row_slice_id] + row_in_slice_id;
+    // 64-bit only when the slice offsets are, since a flat offset is bounded by
+    // the same padded nonzero count those offsets hold -- see FlatOffsetT.
+    const FlatOffsetT<OffsetT> row_start_index
+        = (FlatOffsetT<OffsetT>) d_sell_offsets[row_slice_id] + row_in_slice_id;
     // Per-slice nnz is bounded by slice_size * HPCG_MAX_ROW_LEN and so fits in
     // int. Narrowing before the divide keeps this a 32-bit idiv instead of the
     // emulated 64-bit one a wider OffsetT would otherwise force.

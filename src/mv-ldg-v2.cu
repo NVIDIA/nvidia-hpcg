@@ -159,10 +159,9 @@ __global__ __launch_bounds__(BLKDIM) void mv_sell_ldgv2(local_int_t m, int parts
     // magic-number reciprocal rather than a hardware divide.
     int slice, in_slice;
     intdiv32_divmod((int32_t) base_row, (int32_t) slice_size, slice_size_div, &slice, &in_slice);
-    // Flat element offsets into the column/value arrays exceed 2^31 for large
-    // local problems, so widen before they enter the pointer arithmetic even
-    // when OffsetT itself is 32-bit.
-    const slice_ptr_t row_start = (slice_ptr_t) slice_offsets[slice] + in_slice;
+    // 64-bit only when the slice offsets are, since a flat offset is bounded by
+    // the same padded nonzero count those offsets hold -- see FlatOffsetT.
+    const FlatOffsetT<OffsetT> row_start = (FlatOffsetT<OffsetT>) slice_offsets[slice] + in_slice;
     // Per-slice nnz is bounded by slice_size * HPCG_MAX_ROW_LEN and so fits in
     // int32. Narrowing the difference before dividing keeps this in the 32-bit
     // reciprocal above instead of the 64-bit form a wider OffsetT would force.

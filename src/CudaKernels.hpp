@@ -17,6 +17,8 @@
 
 #pragma once
 #ifdef USE_CUDA
+#include <type_traits>
+
 #include "SparseMatrix.hpp"
 
 ///////// L2 Memory Compression Allocation Support Routines //
@@ -130,6 +132,28 @@ enum SellKernelKind
 // its SpMV grid out that way clamps to this and walks the axis in gridDim.y
 // strides past it, so it lives here rather than in one family's file.
 constexpr unsigned int kMaxGridDimY = 65535u;
+
+/*
+  The type a flat element offset into the columns/values arrays is computed in,
+  for an operator whose slice offsets are OffsetT.
+
+  A flat offset is a slice offset plus a row's index within its slice, so it is
+  bounded by the padded nonzero count -- which is exactly the quantity the slice
+  offset type must already hold. --mi 0 keeps the offsets 32-bit and main.cpp
+  refuses it above INT32_MAX padded nonzeros for that reason, so a 32-bit flat
+  offset cannot overflow on that path either. --mi 1 widens the offsets
+  precisely because the count does not fit, and the flat offsets follow.
+
+  Deriving the width matters because these kernels are templated on the offset
+  type where the source tree they came from is not: it reads slice_ptr_t offsets
+  unconditionally and so is uniformly 64-bit, whereas the 32-bit instantiation
+  here loads a narrow offset and, if this were size_t, would immediately widen
+  it. That pairing is the worst of both -- a sign-extension per row plus the
+  registers to hold the widened result -- and it buys nothing, since the narrow
+  offset could not have needed the range.
+*/
+template <class OffsetT>
+using FlatOffsetT = typename std::conditional<sizeof(OffsetT) == 8, slice_ptr_t, local_int_t>::type;
 
 // Family and launch shape of the explicit kernels. Overridable per run through
 // the matching environment variables; InitKernelConfig() installs the defaults,
