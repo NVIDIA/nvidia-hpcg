@@ -222,6 +222,99 @@ void mv_sell(DIR d, const SparseMatrix& A, double alpha, double beta, double* x,
 void sv_sell(DIR d, const SparseMatrix& A, double* rv, double* xv);
 
 /*
+  One fully specified Sliced-ELL configuration: the family plus every launch
+  knob any of the four families reads. This is both what the autotuner searches
+  over and what a per-level choice stores, so a configuration that was timed and
+  a configuration that is run are the same object rather than two encodings of
+  one.
+
+  Each field is a plain field. The family these kernels came from packed W, the
+  access width, the cache policy and the partition count into a single integer,
+  because its autotuner had to carry the new axes through a signature it could
+  not change; nothing here does, so nothing here is packed.
+
+  Which fields a family reads:
+    LDG     blk, unroll
+    TMA     blk, unroll, w (rows per thread, its rpt)
+    LDG_V2  blk, unroll, w, and parts for the SpMV
+    LDG3    all of them, parts for the SpMV only
+  A family ignores the rest rather than refusing them, so one struct serves all
+  four and the unread fields keep whatever the search left there.
+*/
+struct SellConfig
+{
+    int kind = SELL_KIND_LDG;
+    int blk = 0;
+    int unroll = 0;
+    // Rows per thread. TMA calls it rpt and means the same thing by it.
+    int w = 0;
+    // LDG3 only: widen the gather to the widest access the hardware offers.
+    // Refused at W of 1 and 2, which have no wide form.
+    bool wide = false;
+    // LDG3 only: keep the matrix stream in cache instead of streaming it
+    // evict-first, which is what LDG and LDG_V2 do.
+    bool cached = false;
+    // LDG_V2 / LDG3 SpMV only: equal row partitions across blockIdx.x. 1 is the
+    // flat 1D grid. Defaults to 1 rather than 0 because both launchers refuse
+    // anything below 1, so a configuration built by hand still launches.
+    int parts = 1;
+};
+
+// Levels the per-level choice arrays cover. HPCG runs 4; the slack costs two
+// small static arrays and means a deeper hierarchy loses tuning rather than
+// writing out of bounds.
+constexpr int kMaxSellLevels = 8;
+
+/*
+  Install the configuration level `level` should use. The autotuner calls these
+  once per level; mv_sell / sv_sell consult them by A.level and fall back to
+  g_config for any level that has no choice, so a run that never calls them
+  behaves exactly as it did before they existed.
+*/
+void SetMvChoice(int level, const SellConfig& c);
+void SetSvChoice(int level, const SellConfig& c);
+
+/*
+  Read back the stored per-level choice, false if that level has none. These
+  read the same arrays mv_sell / sv_sell consult and deliberately ignore any
+  pin, so a report written through them says what the dispatch will do rather
+  than what the caller believes it installed.
+*/
+bool GetMvChoiceForLevel(int level, SellConfig& c);
+bool GetSvChoiceForLevel(int level, SellConfig& c);
+
+/*
+  Run one configuration `iters` times and return the mean wall time in
+  milliseconds, or a negative value if it cannot be served here.
+
+  A search has to be able to ask for configurations that will be refused --
+  which combinations a family can serve depends on the level's row count, slice
+  size and pointer alignment, none of which are knowable from the candidate
+  list. So these reach the launchers through a path that returns failure, unlike
+  mv_sell / sv_sell, which exit(1) rather than let a run measure a kernel other
+  than the one it named.
+
+  TimeMvConfigDir times the direction ComputeSYMGS actually multiplies, with the
+  alpha and beta that call site passes: General is the whole matrix as
+  ComputeSPMV multiplies it, Forward the strict lower triangle (beta = 1,
+  accumulates) and Backward the strict upper one (beta = 0, overwrites). The
+  best configuration differs between them, and a configuration accepted on one
+  triangle can be refused on another -- LDG3's wide path checks the base
+  pointers, which are different arrays -- so the direction is a parameter rather
+  than an assumption.
+*/
+float TimeSvConfig(const SparseMatrix& A, double* rv, double* xv, const SellConfig& c, int iters);
+float TimeMvConfig(const SparseMatrix& A, double* x, double* y, const SellConfig& c, int iters);
+float TimeMvConfigDir(const SparseMatrix& A, double* x, double* y, const SellConfig& c, int iters, DIR d);
+
+/*
+  Sweep the four families over the whole multigrid hierarchy and install a
+  per-level choice for each operator. Returns immediately unless HPCG_AUTOTUNE
+  is set to a nonzero value. Defined in autotune.cpp.
+*/
+void AutotuneSymGS(const SparseMatrix& A_top);
+
+/*
   LDG_V2 launchers, defined in mv-ldg-v2.cu / spsv-ldg-v2.cu and instantiated
   there for both slice-offset widths with 32-bit columns. Both return false when the requested
   block size / unroll / W triple, or the launch shape it implies for this

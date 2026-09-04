@@ -3136,6 +3136,397 @@ static bool svSellDispatch(int blk, int unroll, DIR d, const SparseMatrix& A, co
     return false;
 }
 
+/*
+    Per-level kernel selection.
+
+    HPCG multiplies four matrices, not one: the levels of the multigrid
+    hierarchy differ in working set by orders of magnitude, and the family and
+    launch shape that win at the finest level are not the ones that win at the
+    coarsest. g_config names one configuration for the whole run, which is the
+    right thing for a run that is asking for a named kernel and the wrong thing
+    for a run that wants the best one available at each level.
+
+    So a chosen configuration is stored per level here, and mv_sell / sv_sell
+    consult it for A.level before anything else. Nothing writes these arrays
+    unless the autotuner or a pin does, and an unset level falls through to the
+    g_config code below untouched -- that is the whole of the "autotuning off
+    changes nothing" property, and it is a property of this being an early
+    return rather than a rewrite of the dispatch.
+*/
+namespace
+{
+struct LevelChoice
+{
+    bool set = false;
+    SellConfig cfg;
+};
+LevelChoice g_mv_choice[kMaxSellLevels];
+LevelChoice g_sv_choice[kMaxSellLevels];
+
+/*
+    HPCG_PIN_MV / HPCG_PIN_SV name one configuration and apply it to every
+    level, taking precedence over the autotuner.
+
+    This exists to answer a question the sweep cannot: when a kernel is edited,
+    the sweep may respond by picking a different configuration, so a
+    before/after comparison conflates the edit with the search. Pinning holds
+    the configuration fixed and isolates the edit.
+
+    The value is a comma-separated "kind,blk,unroll,w[,wide[,cached[,parts]]]",
+    and every field a candidate has can be named. The family this was ported
+    from parsed four fields only, which left parts at whatever the caller had --
+    zero -- and LDG_V2's launcher refuses parts < 1, so pinning that family
+    always failed. Hence the defaults below are the values that launch, not zero.
+*/
+struct Pin
+{
+    bool set = false;
+    SellConfig cfg;
+};
+
+Pin ParsePin(const char* name)
+{
+    Pin p;
+    const char* v = std::getenv(name);
+    if (!v || !*v)
+        return p;
+
+    // wide and cached default off and parts to 1, so the short four-field form
+    // names the same configuration it always did.
+    long field[7] = {0, 0, 0, 0, 0, 0, 1};
+    int n = 0;
+    const char* s = v;
+    while (*s && n < 7)
+    {
+        char* end = NULL;
+        const long value = std::strtol(s, &end, 10);
+        if (end == s)
+            break;
+        field[n++] = value;
+        s = end;
+        if (*s == ',')
+            ++s;
+        else
+            break;
+    }
+    if (n < 4 || *s != '\0')
+    {
+        std::fprintf(stderr,
+            "ERROR: %s must be \"kind,blk,unroll,w\" with optional \",wide,cached,parts\", got \"%s\"\n", name, v);
+        std::exit(1);
+    }
+
+    p.cfg.kind = (int) field[0];
+    p.cfg.blk = (int) field[1];
+    p.cfg.unroll = (int) field[2];
+    p.cfg.w = (int) field[3];
+    p.cfg.wide = field[4] != 0;
+    p.cfg.cached = field[5] != 0;
+    p.cfg.parts = (int) field[6];
+    p.set = true;
+    return p;
+}
+
+/*
+    A launcher returns false for a configuration it cannot serve. Under a pin
+    that is the worst kind of failure: the run still produces a plausible
+    number, but for a kernel nobody asked for. So a refused pin aborts, and the
+    pin is announced so the log can be checked against the intent.
+*/
+bool g_mv_pinned = false;
+bool g_sv_pinned = false;
+
+void AnnouncePin(const char* what, const SellConfig& c, bool& announced)
+{
+    if (announced)
+        return;
+    announced = true;
+    std::fprintf(stderr, "%s pinned to kind=%d blk=%d unroll=%d w=%d wide=%d cached=%d parts=%d on all levels\n", what,
+        c.kind, c.blk, c.unroll, c.w, (int) c.wide, (int) c.cached, c.parts);
+}
+
+void PinRefused(const char* what, int level, const SellConfig& c)
+{
+    std::fprintf(stderr,
+        "ERROR: %s was pinned to kind=%d blk=%d unroll=%d w=%d wide=%d cached=%d parts=%d,\n"
+        "       but no launcher accepts that configuration at level %d. Falling through\n"
+        "       would have measured a different kernel under the pinned name.\n",
+        what, c.kind, c.blk, c.unroll, c.w, (int) c.wide, (int) c.cached, c.parts, level);
+    std::exit(1);
+}
+
+/*
+    A configuration the autotuner timed successfully can still be refused when
+    it is run, because the choice is made on one matrix and used on three: the
+    MV winner is timed on A and then applied to the L and U triangles, whose
+    row counts match but whose base pointers do not, and LDG3's wide path checks
+    those pointers. Falling back to g_config keeps the run correct, but silently
+    doing so would hide the one thing the caller cares about, so say it once.
+*/
+void ChoiceRefused(const char* what, int level, const SellConfig& c)
+{
+    static bool warned[kMaxSellLevels] = {};
+    const int slot = (level >= 0 && level < kMaxSellLevels) ? level : 0;
+    if (warned[slot])
+        return;
+    warned[slot] = true;
+    std::fprintf(stderr,
+        "WARNING: the tuned %s configuration for level %d (kind=%d blk=%d unroll=%d w=%d wide=%d cached=%d "
+        "parts=%d) was refused here; this level falls back to the g_config kernel.\n",
+        what, level, c.kind, c.blk, c.unroll, c.w, (int) c.wide, (int) c.cached, c.parts);
+}
+} // namespace
+
+void SetMvChoice(int level, const SellConfig& c)
+{
+    if (level >= 0 && level < kMaxSellLevels)
+        g_mv_choice[level] = LevelChoice{true, c};
+}
+
+void SetSvChoice(int level, const SellConfig& c)
+{
+    if (level >= 0 && level < kMaxSellLevels)
+        g_sv_choice[level] = LevelChoice{true, c};
+}
+
+bool GetMvChoiceForLevel(int level, SellConfig& c)
+{
+    if (level < 0 || level >= kMaxSellLevels || !g_mv_choice[level].set)
+        return false;
+    c = g_mv_choice[level].cfg;
+    return true;
+}
+
+bool GetSvChoiceForLevel(int level, SellConfig& c)
+{
+    if (level < 0 || level >= kMaxSellLevels || !g_sv_choice[level].set)
+        return false;
+    c = g_sv_choice[level].cfg;
+    return true;
+}
+
+static bool GetMvChoice(int level, SellConfig& c)
+{
+    static const Pin pin = ParsePin("HPCG_PIN_MV");
+    static bool announced = false;
+    if (pin.set)
+    {
+        AnnouncePin("MV", pin.cfg, announced);
+        g_mv_pinned = true;
+        c = pin.cfg;
+        return true;
+    }
+    if (level >= 0 && level < kMaxSellLevels && g_mv_choice[level].set)
+    {
+        c = g_mv_choice[level].cfg;
+        return true;
+    }
+    return false;
+}
+
+static bool GetSvChoice(int level, SellConfig& c)
+{
+    static const Pin pin = ParsePin("HPCG_PIN_SV");
+    static bool announced = false;
+    if (pin.set)
+    {
+        AnnouncePin("SV", pin.cfg, announced);
+        g_sv_pinned = true;
+        c = pin.cfg;
+        return true;
+    }
+    if (level >= 0 && level < kMaxSellLevels && g_sv_choice[level].set)
+    {
+        c = g_sv_choice[level].cfg;
+        return true;
+    }
+    return false;
+}
+
+/*
+    Launch one named configuration, or return false without launching anything.
+
+    This is the probing path. Every refusal a family can raise arrives here as
+    false -- LDG_V2 on slice_size % W, m % W or m % parts, LDG3 on an uneven
+    partition split or a wide base pointer short of the access width, TMA on a
+    shared-memory footprint above the device's opt-in maximum or a device below
+    compute capability 9.0 -- and a search must be able to ask for those and
+    move on. mv_sell / sv_sell keep their exit(1) instead, because a run that
+    silently measured a kernel other than the one it named is exactly the
+    failure all of this exists to prevent.
+
+    A family this build does not contain is refused rather than served by
+    whichever one is present, so TMA2D and TMA_EX cannot be reached through
+    here even if their numbers are asked for.
+
+    The direction-to-array mapping mirrors mv_sell / sv_sell below, which own
+    the normal path and are left as they were.
+*/
+bool MvSellCfg(DIR d, const SparseMatrix& A, double alpha, double beta, double* x, double* y, const SellConfig& c)
+{
+    const local_int_t m = A.localNumberOfRows;
+
+    const void* offsets = A.sellDev.aSliceOffsets;
+    const void* columns = A.sellDev.aColumns;
+    const double* values = A.sellAPermValues;
+    if (d == Forward)
+    {
+        offsets = A.sellDev.lSliceOffsets;
+        columns = A.sellDev.lColumns;
+        values = A.sellLPermValues;
+    }
+    else if (d == Backward)
+    {
+        offsets = A.sellDev.uSliceOffsets;
+        columns = A.sellDev.uColumns;
+        values = A.sellUPermValues;
+    }
+
+    bool launched = false;
+    dispatchSellOffsetType(A.index_mode,
+        [&](auto offTag)
+        {
+            using OffsetT = decltype(offTag);
+            const OffsetT* off = static_cast<const OffsetT*>(offsets);
+            const idx32_t* col = static_cast<const idx32_t*>(columns);
+            if (c.kind == SELL_KIND_TMA)
+                launched = MvTmaSellCfg<OffsetT>(A, alpha, beta, x, y, off, col, values, stream, c.blk, c.unroll, c.w);
+            else if (c.kind == SELL_KIND_LDGV2)
+                launched = MvLdgV2SellCfg<OffsetT>(
+                    A, alpha, beta, x, y, off, col, values, stream, c.blk, c.unroll, c.w, c.parts);
+            else if (c.kind == SELL_KIND_LDGV3)
+                launched = MvLdgV3SellCfg<OffsetT>(
+                    A, alpha, beta, x, y, off, col, values, stream, c.blk, c.unroll, c.w, c.wide, c.cached, c.parts);
+            else if (c.kind == SELL_KIND_LDG)
+                launched = mvSellDispatch<OffsetT>(c.blk, c.unroll, A, alpha, beta, x, y, m, off, col, values);
+        });
+    return launched;
+}
+
+bool SvSellCfg(DIR d, const SparseMatrix& A, double* rv, double* xv, const SellConfig& c)
+{
+    const local_int_t rows = A.localNumberOfRows;
+    const local_int_t color_size = (rows + A.totalColors - 1) / A.totalColors;
+
+    const void* offsets = A.sellDev.uSliceOffsets;
+    const void* columns = A.sellDev.uColumns;
+    const double* values = A.sellUPermValues;
+    if (d == Forward)
+    {
+        offsets = A.sellDev.lSliceOffsets;
+        columns = A.sellDev.lColumns;
+        values = A.sellLPermValues;
+    }
+
+    bool launched = false;
+    dispatchSellOffsetType(A.index_mode,
+        [&](auto offTag)
+        {
+            using OffsetT = decltype(offTag);
+            const OffsetT* off = static_cast<const OffsetT*>(offsets);
+            const idx32_t* col = static_cast<const idx32_t*>(columns);
+            if (c.kind == SELL_KIND_TMA)
+                launched = SpsvTmaSellCfg<OffsetT>(
+                    d == Forward, A, rv, xv, off, col, values, stream, c.blk, c.unroll, c.w);
+            else if (c.kind == SELL_KIND_LDGV2)
+                launched = SpsvLdgV2SellCfg<OffsetT>(
+                    d == Forward, A, rv, xv, off, col, values, stream, c.blk, c.unroll, c.w);
+            else if (c.kind == SELL_KIND_LDGV3)
+                launched = SpsvLdgV3SellCfg<OffsetT>(
+                    d == Forward, A, rv, xv, off, col, values, stream, c.blk, c.unroll, c.w, c.wide, c.cached);
+            else if (c.kind == SELL_KIND_LDG)
+                launched = svSellDispatch<OffsetT>(
+                    c.blk, c.unroll, d, A, rv, xv, color_size, rows, off, col, values);
+        });
+    return launched;
+}
+
+/*
+    A refused configuration launches nothing, and a failed one leaves an error
+    latched on the stream. Either way the error state has to be cleared before
+    returning, or the next legitimate launch is blamed for it and a whole family
+    disappears from the sweep for a reason that belongs to one candidate.
+*/
+static float TimeFailed()
+{
+    cudaGetLastError();
+    return -1.0f;
+}
+
+static float TimeMvOneDir(const SparseMatrix& A, double* x, double* y, const SellConfig& c, int iters, DIR d,
+    double alpha, double beta)
+{
+    if (!MvSellCfg(d, A, alpha, beta, x, y, c))
+        return TimeFailed();
+    if (cudaGetLastError() != cudaSuccess || cudaStreamSynchronize(stream) != cudaSuccess)
+        return TimeFailed();
+
+    cudaEvent_t beg, end;
+    cudaEventCreate(&beg);
+    cudaEventCreate(&end);
+    cudaEventRecord(beg, stream);
+    for (int i = 0; i < iters; ++i)
+        MvSellCfg(d, A, alpha, beta, x, y, c);
+    cudaEventRecord(end, stream);
+    const cudaError_t sync = cudaEventSynchronize(end);
+    float ms = 0.0f;
+    cudaEventElapsedTime(&ms, beg, end);
+    cudaEventDestroy(beg);
+    cudaEventDestroy(end);
+    if (sync != cudaSuccess || cudaGetLastError() != cudaSuccess)
+        return TimeFailed();
+    return ms / iters;
+}
+
+float TimeMvConfig(const SparseMatrix& A, double* x, double* y, const SellConfig& c, int iters)
+{
+    return TimeMvOneDir(A, x, y, c, iters, General, 1.0, 0.0);
+}
+
+float TimeMvConfigDir(const SparseMatrix& A, double* x, double* y, const SellConfig& c, int iters, DIR d)
+{
+    // The alpha and beta each call site actually passes: ComputeSYMGS
+    // accumulates into y over the lower triangle and overwrites it over the
+    // upper one, and beta = 1 costs a read of y that beta = 0 does not.
+    if (d == Forward)
+        return TimeMvOneDir(A, x, y, c, iters, Forward, 1.0, 1.0);
+    if (d == Backward)
+        return TimeMvOneDir(A, x, y, c, iters, Backward, 1.0, 0.0);
+    return TimeMvOneDir(A, x, y, c, iters, General, 1.0, 0.0);
+}
+
+float TimeSvConfig(const SparseMatrix& A, double* rv, double* xv, const SellConfig& c, int iters)
+{
+    // Both directions are probed, not just the forward one. A solve runs both,
+    // and LDG3's wide path checks the base pointers of the triangle it is given
+    // -- L and U are different allocations -- so a configuration can be accepted
+    // forward and refused backward. Timing that pair would have measured one
+    // direction and reported a whole sweep.
+    if (!SvSellCfg(Forward, A, rv, xv, c) || !SvSellCfg(Backward, A, rv, xv, c))
+        return TimeFailed();
+    if (cudaGetLastError() != cudaSuccess || cudaStreamSynchronize(stream) != cudaSuccess)
+        return TimeFailed();
+
+    cudaEvent_t beg, end;
+    cudaEventCreate(&beg);
+    cudaEventCreate(&end);
+    cudaEventRecord(beg, stream);
+    for (int i = 0; i < iters; ++i)
+    {
+        SvSellCfg(Forward, A, rv, xv, c);
+        SvSellCfg(Backward, A, rv, xv, c);
+    }
+    cudaEventRecord(end, stream);
+    const cudaError_t sync = cudaEventSynchronize(end);
+    float ms = 0.0f;
+    cudaEventElapsedTime(&ms, beg, end);
+    cudaEventDestroy(beg);
+    cudaEventDestroy(end);
+    if (sync != cudaSuccess || cudaGetLastError() != cudaSuccess)
+        return TimeFailed();
+    return ms / iters;
+}
+
 namespace
 {
 bool ExplicitEnvEnabled(const char* var)
@@ -3213,6 +3604,22 @@ bool UseExplicitSpSV(const SparseMatrix& A)
 */
 void mv_sell(DIR d, const SparseMatrix& A, double alpha, double beta, double* x, double* y)
 {
+    // A pin, or a configuration the autotuner chose for this level, outranks
+    // g_config. With neither -- which is every run that does not set
+    // HPCG_AUTOTUNE or HPCG_PIN_MV -- this returns false and the rest of the
+    // function runs exactly as it did before per-level selection existed.
+    {
+        SellConfig chosen;
+        if (GetMvChoice(A.level, chosen))
+        {
+            if (MvSellCfg(d, A, alpha, beta, x, y, chosen))
+                return;
+            if (g_mv_pinned)
+                PinRefused("MV", A.level, chosen);
+            ChoiceRefused("SpMV", A.level, chosen);
+        }
+    }
+
     const local_int_t m = A.localNumberOfRows;
 
     const void* offsets = A.sellDev.aSliceOffsets;
@@ -3272,6 +3679,20 @@ void mv_sell(DIR d, const SparseMatrix& A, double alpha, double beta, double* x,
 */
 void sv_sell(DIR d, const SparseMatrix& A, double* rv, double* xv)
 {
+    // See mv_sell: with no pin and no tuned choice for this level, this block
+    // does nothing and the g_config path below is reached unchanged.
+    {
+        SellConfig chosen;
+        if (GetSvChoice(A.level, chosen))
+        {
+            if (SvSellCfg(d, A, rv, xv, chosen))
+                return;
+            if (g_sv_pinned)
+                PinRefused("SV", A.level, chosen);
+            ChoiceRefused("SymGS", A.level, chosen);
+        }
+    }
+
     const local_int_t rows = A.localNumberOfRows;
     const local_int_t color_size = (rows + A.totalColors - 1) / A.totalColors;
 

@@ -674,6 +674,12 @@ int main(int argc, char* argv[])
 
 #if defined(USE_CUDA) && defined(EXPLICIT_KERNELS)
     InitKernelConfig();
+    // Per-level kernel selection. Returns immediately unless HPCG_AUTOTUNE is
+    // set, so a run that does not ask for it takes the same path it always did.
+    // It has to follow InitKernelConfig, since any level it leaves untuned keeps
+    // the configuration that installs.
+    if (params.rank_type == GPU)
+        AutotuneSymGS(A);
 #endif
 
 //////////////////////////////

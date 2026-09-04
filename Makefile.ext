@@ -75,6 +75,7 @@ HPCG_DEPS = src/CG.o \
 	    src/spsv-ldg-v3.o \
 	    src/mv-tma.o \
 	    src/spsv-tma.o \
+	    src/autotune.o \
 		src/CpuKernels.o
 
 # These header files are included in many source files, so we recompile every file if one or more of these header is modified.
@@ -247,3 +248,10 @@ src/mv-tma.o: HPCG_SRC_PATH/src/mv-tma.cu HPCG_SRC_PATH/src/intdiv.hh
 
 src/spsv-tma.o: HPCG_SRC_PATH/src/spsv-tma.cu HPCG_SRC_PATH/src/intdiv.hh
 	nvcc -c -O3 $(CUDA_ARCH) $(HPCG_DEFS) -IHPCG_SRC_PATH/src -I$(CUDA_HOME)/include -I$(CUBLASROOT)/include -I$(MPdir)/include $< -o $@
+
+# The per-level autotuner. It launches no kernels of its own -- it drives the
+# families through the timing helpers in CudaKernels.cu -- so it compiles as
+# ordinary host C++, and like the families it becomes an empty object without
+# -DEXPLICIT_KERNELS.
+src/autotune.o: HPCG_SRC_PATH/src/autotune.cpp HPCG_SRC_PATH/src/CudaKernels.hpp $(PRIMARY_HEADERS)
+	$(CXX) -c $(CXXFLAGS) -IHPCG_SRC_PATH/src $< -o $@
