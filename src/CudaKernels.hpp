@@ -112,8 +112,8 @@ enum DIR
 /*
   The project-wide Sliced-ELL kernel family numbering, selected per operator by
   HPCG_EXPLICIT_MV_KIND / HPCG_EXPLICIT_SV_KIND. The numbering is fixed so that
-  a family keeps the same number as it lands; this build implements LDG and
-  LDG_V2, and refuses the rest rather than serving a substitute.
+  a family keeps the same number as it lands; this build implements LDG,
+  LDG_V2 and LDG3, and refuses the rest rather than serving a substitute.
 */
 enum SellKernelKind
 {
@@ -124,6 +124,12 @@ enum SellKernelKind
     SELL_KIND_LDGV3 = 4,
     SELL_KIND_TMAEX = 5
 };
+
+// CUDA caps gridDim.y at 65535 on every architecture HPCG targets; gridDim.x has
+// no such cap, so only the 2D SpMV grids need the clamp. Every family that lays
+// its SpMV grid out that way clamps to this and walks the axis in gridDim.y
+// strides past it, so it lives here rather than in one family's file.
+constexpr unsigned int kMaxGridDimY = 65535u;
 
 // Family and launch shape of the explicit kernels. Overridable per run through
 // the matching environment variables; InitKernelConfig() installs the defaults,
@@ -137,13 +143,32 @@ struct KernelConfig
     int MV_UNROLL;
     int SV_BLOCK_SIZE;
     int MV_BLOCK_SIZE;
-    // Rows each thread owns. LDG_V2 only; the scalar LDG family is one row per
-    // thread by construction and ignores it.
+    // Rows each thread owns. LDG_V2 and LDG3; the scalar LDG family is one row
+    // per thread by construction and ignores it.
     int SV_W;
     int MV_W;
-    // Number of equal row partitions the LDG_V2 SpMV grid is split into, one per
-    // blockIdx.x. 1 is the flat 1D grid. LDG_V2 SpMV only.
+    // Number of equal row partitions the SpMV grid is split into, one per
+    // blockIdx.x. 1 is the flat 1D grid. LDG_V2 and LDG3 SpMV only; both mean
+    // the same thing by it, so they share the field. The LDG3 triangular solve
+    // has no counterpart -- its grid is fixed by the colour loop -- so there is
+    // no SV_PARTS.
     int MV_PARTS;
+    // LDG3 only, as 0/1. Nonzero widens the gather to the widest access the
+    // hardware allows (W of 4 or 8 only); zero forces the 2-wide accesses that
+    // are the family's own narrow variant.
+    //
+    // The family these came from packed width, cache policy and partition count
+    // into the rows-per-thread integer, because its autotuner had to carry them
+    // through a signature it could not change. Nothing here does, so they are
+    // plain fields.
+    int SV_WIDE;
+    int MV_WIDE;
+    // LDG3 only, as 0/1. Nonzero keeps the matrix stream in cache (ld.global.nc);
+    // zero streams it evict-first (.cs), which is what LDG and LDG_V2 do. Which
+    // wins depends on whether the level's matrix is small enough to survive in
+    // L2 between calls, so it is a knob rather than a constant.
+    int SV_CACHED;
+    int MV_CACHED;
 };
 
 extern KernelConfig g_config;
@@ -183,5 +208,24 @@ bool MvLdgV2SellCfg(const SparseMatrix& A, double alpha, double beta, const doub
 template <class OffsetT>
 bool SpsvLdgV2SellCfg(bool forward, const SparseMatrix& A, const double* rv, double* xv, const OffsetT* slice_offsets,
     const idx32_t* columns, const double* values, cudaStream_t stream, int blk, int unroll, int w);
+
+/*
+  LDG3 launchers, defined in mv-ldg-v3.cu / spsv-ldg-v3.cu and instantiated
+  there for both slice-offset widths with 32-bit columns. On top of the LDG_V2
+  knobs they take the access width and the cache policy, which is what the
+  family exists to vary. Both return false when the requested combination, or
+  the launch shape it implies for this matrix, is not one the family can serve;
+  nothing is launched in that case. `wide` is refused at W of 1 and 2, which
+  have no wide form.
+*/
+template <class OffsetT>
+bool MvLdgV3SellCfg(const SparseMatrix& A, double alpha, double beta, const double* x, double* y,
+    const OffsetT* slice_offsets, const idx32_t* columns, const double* values, cudaStream_t stream, int blk,
+    int unroll, int w, bool wide, bool cached, int part);
+
+template <class OffsetT>
+bool SpsvLdgV3SellCfg(bool forward, const SparseMatrix& A, const double* rv, double* xv, const OffsetT* slice_offsets,
+    const idx32_t* columns, const double* values, cudaStream_t stream, int blk, int unroll, int w, bool wide,
+    bool cached);
 #endif
 #endif

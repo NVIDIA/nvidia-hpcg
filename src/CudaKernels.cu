@@ -2768,17 +2768,30 @@ void InitKernelConfig()
     if (const char* env = std::getenv("HPCG_EXPLICIT_MV_KIND"))
         g_config.MV_KIND = std::atoi(env);
 
-    // The unroll depth is not instantiated over the same range in both
-    // families: LDG counts single entries and goes to 16, LDG_V2 counts blocks
-    // of W rows and goes to 4. The default therefore has to follow the family,
-    // or one of the two starts with no kernel to run.
-    g_config.SV_UNROLL = g_config.SV_KIND == SELL_KIND_LDGV2 ? 4 : 8;
-    g_config.MV_UNROLL = g_config.MV_KIND == SELL_KIND_LDGV2 ? 4 : 8;
+    // The unroll depth is not instantiated over the same range in every
+    // family: LDG counts single entries and goes to 16, while LDG_V2 and LDG3
+    // count blocks of W rows and stop at 4 for the W the default picks. The
+    // default therefore has to follow the family, or one of them starts with no
+    // kernel to run.
+    const bool sv_blocked = g_config.SV_KIND == SELL_KIND_LDGV2 || g_config.SV_KIND == SELL_KIND_LDGV3;
+    const bool mv_blocked = g_config.MV_KIND == SELL_KIND_LDGV2 || g_config.MV_KIND == SELL_KIND_LDGV3;
+    g_config.SV_UNROLL = sv_blocked ? 4 : 8;
+    g_config.MV_UNROLL = mv_blocked ? 4 : 8;
     g_config.SV_BLOCK_SIZE = 64;
     g_config.MV_BLOCK_SIZE = 256;
     g_config.SV_W = 4;
     g_config.MV_W = 4;
     g_config.MV_PARTS = 1;
+    // LDG3's two extra axes both default to the variant that always launches.
+    // Narrow needs no pointer alignment beyond what every W already requires,
+    // where wide is refused outright at W of 1 and 2 and additionally checks the
+    // base pointers; streaming (cached = 0) is what LDG and LDG_V2 already do to
+    // the matrix, so the default LDG3 run differs from its parents only in the
+    // axes it was built to vary.
+    g_config.SV_WIDE = 0;
+    g_config.MV_WIDE = 0;
+    g_config.SV_CACHED = 0;
+    g_config.MV_CACHED = 0;
 
     if (const char* env = std::getenv("SV_UNROLL"))
         g_config.SV_UNROLL = std::atoi(env);
@@ -2794,6 +2807,14 @@ void InitKernelConfig()
         g_config.MV_W = std::atoi(env);
     if (const char* env = std::getenv("MV_PARTS"))
         g_config.MV_PARTS = std::atoi(env);
+    if (const char* env = std::getenv("SV_WIDE"))
+        g_config.SV_WIDE = std::atoi(env);
+    if (const char* env = std::getenv("MV_WIDE"))
+        g_config.MV_WIDE = std::atoi(env);
+    if (const char* env = std::getenv("SV_CACHED"))
+        g_config.SV_CACHED = std::atoi(env);
+    if (const char* env = std::getenv("MV_CACHED"))
+        g_config.MV_CACHED = std::atoi(env);
 }
 
 /*
@@ -3007,10 +3028,6 @@ __global__ void __launch_bounds__(ThreadsPerCTA) ex_spsv_sell_single_color_v1_ke
     }
 }
 
-// CUDA caps gridDim.y at 65535 on every architecture HPCG targets; gridDim.x
-// has no such cap, so only the 2D SpMV grid needs the clamp.
-constexpr unsigned int kMaxGridDimY = 65535u;
-
 template <class OffsetT, int BlockSize, int Unroll>
 static void mvSellLaunch(const SparseMatrix& A, double alpha, double beta, const double* x, double* y, local_int_t m,
     const OffsetT* offsets, const idx32_t* columns, const double* values)
@@ -3135,21 +3152,21 @@ bool ExplicitIndexModeUsable(const SparseMatrix& A, const char* op, const char* 
 }
 
 /*
-    Only two of the six numbered families are built here. A request for one of
+    Only three of the six numbered families are built here. A request for one of
     the others is refused rather than served by whichever family happens to be
     present, so that a measurement can never be attributed to the wrong kernel.
 */
 bool ExplicitKindUsable(int kind, const char* op, const char* var, bool& warned)
 {
-    if (kind == SELL_KIND_LDG || kind == SELL_KIND_LDGV2)
+    if (kind == SELL_KIND_LDG || kind == SELL_KIND_LDGV2 || kind == SELL_KIND_LDGV3)
         return true;
     if (!warned)
     {
         warned = true;
         fprintf(stderr,
             "HPCG: %s=%d selects a Sliced-ELL kernel family this build does not contain. This build supports "
-            "%d (LDG) and %d (LDG_V2); using cuSPARSE for %s.\n",
-            var, kind, (int) SELL_KIND_LDG, (int) SELL_KIND_LDGV2, op);
+            "%d (LDG), %d (LDG_V2) and %d (LDG3); using cuSPARSE for %s.\n",
+            var, kind, (int) SELL_KIND_LDG, (int) SELL_KIND_LDGV2, (int) SELL_KIND_LDGV3, op);
     }
     return false;
 }
@@ -3210,17 +3227,24 @@ void mv_sell(DIR d, const SparseMatrix& A, double alpha, double beta, double* x,
             if (g_config.MV_KIND == SELL_KIND_LDGV2)
                 launched = MvLdgV2SellCfg<OffsetT>(A, alpha, beta, x, y, off, col, values, stream,
                     g_config.MV_BLOCK_SIZE, g_config.MV_UNROLL, g_config.MV_W, g_config.MV_PARTS);
+            else if (g_config.MV_KIND == SELL_KIND_LDGV3)
+                launched = MvLdgV3SellCfg<OffsetT>(A, alpha, beta, x, y, off, col, values, stream,
+                    g_config.MV_BLOCK_SIZE, g_config.MV_UNROLL, g_config.MV_W, g_config.MV_WIDE != 0,
+                    g_config.MV_CACHED != 0, g_config.MV_PARTS);
             else
                 launched = mvSellDispatch<OffsetT>(
                     g_config.MV_BLOCK_SIZE, g_config.MV_UNROLL, A, alpha, beta, x, y, m, off, col, values);
         });
     if (!launched)
     {
+        // MV_WIDE and MV_CACHED are reported too: LDG3 refuses combinations the
+        // other families have no notion of, so leaving them out would make a
+        // refusal here indistinguishable from an unavailable block/unroll pair.
         fprintf(stderr,
             "HPCG: no explicit SpMV kernel for HPCG_EXPLICIT_MV_KIND=%d MV_BLOCK_SIZE=%d MV_UNROLL=%d MV_W=%d "
-            "MV_PARTS=%d at level %d with --mi %d. Exiting ...\n",
-            g_config.MV_KIND, g_config.MV_BLOCK_SIZE, g_config.MV_UNROLL, g_config.MV_W, g_config.MV_PARTS, A.level,
-            (int) A.index_mode);
+            "MV_PARTS=%d MV_WIDE=%d MV_CACHED=%d at level %d with --mi %d. Exiting ...\n",
+            g_config.MV_KIND, g_config.MV_BLOCK_SIZE, g_config.MV_UNROLL, g_config.MV_W, g_config.MV_PARTS,
+            g_config.MV_WIDE, g_config.MV_CACHED, A.level, (int) A.index_mode);
         exit(1);
     }
 }
@@ -3254,17 +3278,24 @@ void sv_sell(DIR d, const SparseMatrix& A, double* rv, double* xv)
             if (g_config.SV_KIND == SELL_KIND_LDGV2)
                 launched = SpsvLdgV2SellCfg<OffsetT>(d == Forward, A, rv, xv, off, col, values, stream,
                     g_config.SV_BLOCK_SIZE, g_config.SV_UNROLL, g_config.SV_W);
+            else if (g_config.SV_KIND == SELL_KIND_LDGV3)
+                launched = SpsvLdgV3SellCfg<OffsetT>(d == Forward, A, rv, xv, off, col, values, stream,
+                    g_config.SV_BLOCK_SIZE, g_config.SV_UNROLL, g_config.SV_W, g_config.SV_WIDE != 0,
+                    g_config.SV_CACHED != 0);
             else
                 launched = svSellDispatch<OffsetT>(
                     g_config.SV_BLOCK_SIZE, g_config.SV_UNROLL, d, A, rv, xv, color_size, rows, off, col, values);
         });
     if (!launched)
     {
+        // SV_WIDE and SV_CACHED are reported too: LDG3 refuses combinations the
+        // other families have no notion of, so leaving them out would make a
+        // refusal here indistinguishable from an unavailable block/unroll pair.
         fprintf(stderr,
-            "HPCG: no explicit SpSV kernel for HPCG_EXPLICIT_SV_KIND=%d SV_BLOCK_SIZE=%d SV_UNROLL=%d SV_W=%d at "
-            "level %d with --mi %d. Exiting ...\n",
-            g_config.SV_KIND, g_config.SV_BLOCK_SIZE, g_config.SV_UNROLL, g_config.SV_W, A.level,
-            (int) A.index_mode);
+            "HPCG: no explicit SpSV kernel for HPCG_EXPLICIT_SV_KIND=%d SV_BLOCK_SIZE=%d SV_UNROLL=%d SV_W=%d "
+            "SV_WIDE=%d SV_CACHED=%d at level %d with --mi %d. Exiting ...\n",
+            g_config.SV_KIND, g_config.SV_BLOCK_SIZE, g_config.SV_UNROLL, g_config.SV_W, g_config.SV_WIDE,
+            g_config.SV_CACHED, A.level, (int) A.index_mode);
         exit(1);
     }
 }
