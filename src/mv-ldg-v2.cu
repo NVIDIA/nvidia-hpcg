@@ -42,6 +42,7 @@
 #include "CudaKernels.hpp"
 #include "IndexMode.hpp"
 #include "SparseMatrix.hpp"
+#include "intdiv.hh"
 #include "ldg-loads.cuh"
 
 #include <cuda_runtime.h>
@@ -134,7 +135,7 @@ template <class OffsetT, int BLKDIM, int UNROLL, int W>
 __global__ __launch_bounds__(BLKDIM) void mv_sell_ldgv2(local_int_t m, int parts, local_int_t partition_rows,
     double alpha, double beta, double* __restrict__ y, const double* __restrict__ x,
     const OffsetT* __restrict__ slice_offsets, const idx32_t* __restrict__ col_idx,
-    const double* __restrict__ values, local_int_t slice_size)
+    const double* __restrict__ values, local_int_t slice_size, intdiv32_t slice_size_div)
 {
     local_int_t base_row, row_end;
     if (parts == 1)
@@ -151,16 +152,22 @@ __global__ __launch_bounds__(BLKDIM) void mv_sell_ldgv2(local_int_t m, int parts
     if (base_row >= row_end)
         return;
 
-    const local_int_t slice = base_row / slice_size;
-    const local_int_t in_slice = base_row - slice * slice_size;
+    // Both divisions below are by slice_size, a runtime value the compiler
+    // cannot strength-reduce, and the GPU has no integer-division instruction.
+    // They sit on the per-thread critical path of a kernel whose entire purpose
+    // is keeping the gather saturated, so both go through the same precomputed
+    // magic-number reciprocal rather than a hardware divide.
+    int slice, in_slice;
+    intdiv32_divmod((int32_t) base_row, (int32_t) slice_size, slice_size_div, &slice, &in_slice);
     // Flat element offsets into the column/value arrays exceed 2^31 for large
     // local problems, so widen before they enter the pointer arithmetic even
     // when OffsetT itself is 32-bit.
     const slice_ptr_t row_start = (slice_ptr_t) slice_offsets[slice] + in_slice;
     // Per-slice nnz is bounded by slice_size * HPCG_MAX_ROW_LEN and so fits in
-    // int. Narrowing before the divide keeps this a 32-bit idiv instead of the
-    // emulated 64-bit one a wider OffsetT would otherwise force.
-    const int max_row_len = (int) (slice_offsets[slice + 1] - slice_offsets[slice]) / (int) slice_size;
+    // int32. Narrowing the difference before dividing keeps this in the 32-bit
+    // reciprocal above instead of the 64-bit form a wider OffsetT would force.
+    int max_row_len;
+    intdiv32_div((int32_t) (slice_offsets[slice + 1] - slice_offsets[slice]), slice_size_div, &max_row_len);
 
     const idx32_t* cp = col_idx + row_start;
     const double* vp = values + row_start;
@@ -209,11 +216,13 @@ bool LaunchMvLdgV2(const SparseMatrix& A, double alpha, double beta, const doubl
     if (parts < 1 || slice_size % W != 0 || m % W != 0)
         return false;
 
+    const intdiv32_t sdiv = intdiv32_gen((int32_t) slice_size);
+
     if (parts == 1)
     {
         const local_int_t grid = (m / W + BLKDIM - 1) / BLKDIM;
         mv_sell_ldgv2<OffsetT, BLKDIM, UNROLL, W><<<dim3((unsigned int) grid, 1, 1), BLKDIM, 0, stream>>>(
-            m, 1, m, alpha, beta, y, x, slice_offsets, columns, values, slice_size);
+            m, 1, m, alpha, beta, y, x, slice_offsets, columns, values, slice_size, sdiv);
         return true;
     }
 
@@ -228,7 +237,7 @@ bool LaunchMvLdgV2(const SparseMatrix& A, double alpha, double beta, const doubl
     if (grid_y > 65535u)
         return false;
     mv_sell_ldgv2<OffsetT, BLKDIM, UNROLL, W><<<dim3((unsigned int) parts, grid_y, 1), BLKDIM, 0, stream>>>(
-        m, parts, partition_rows, alpha, beta, y, x, slice_offsets, columns, values, slice_size);
+        m, parts, partition_rows, alpha, beta, y, x, slice_offsets, columns, values, slice_size, sdiv);
     return true;
 }
 
