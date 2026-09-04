@@ -32,8 +32,8 @@
  @file mv-ldg-v2.cu
 
  LDG_V2 Sliced-ELL SpMV: two-stage register pipeline, W rows per thread, wide
- (128/256-bit) gather. Instantiated for 32-bit slice offsets and 32-bit columns
- only, like the rest of the explicit path.
+ (128/256-bit) gather. Instantiated for both slice-offset widths with 32-bit
+ columns, like the rest of the explicit path.
  */
 
 #ifdef USE_CUDA
@@ -263,7 +263,13 @@ bool MvLdgV2SellCfg(const SparseMatrix& A, double alpha, double beta, const doub
     return false;
 }
 
+// Both slice-offset widths, 32-bit columns: --mi 0 and --mi 1 respectively. The
+// kernel body is width-agnostic -- every flat element offset is computed in
+// slice_ptr_t regardless of OffsetT -- so this is an instantiation, not a
+// variant.
 template bool MvLdgV2SellCfg<idx32_t>(const SparseMatrix&, double, double, const double*, double*, const idx32_t*,
+    const idx32_t*, const double*, cudaStream_t, int, int, int, int);
+template bool MvLdgV2SellCfg<idx64_t>(const SparseMatrix&, double, double, const double*, double*, const idx64_t*,
     const idx32_t*, const double*, cudaStream_t, int, int, int, int);
 
 #endif // EXPLICIT_KERNELS

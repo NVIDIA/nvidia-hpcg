@@ -171,7 +171,7 @@ void sv_sell(DIR d, const SparseMatrix& A, double* rv, double* xv);
 
 /*
   LDG_V2 launchers, defined in mv-ldg-v2.cu / spsv-ldg-v2.cu and instantiated
-  there for the 32-bit-offset case alone. Both return false when the requested
+  there for both slice-offset widths with 32-bit columns. Both return false when the requested
   block size / unroll / W triple, or the launch shape it implies for this
   matrix, is not one the family can serve; nothing is launched in that case.
 */

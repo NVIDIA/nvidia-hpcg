@@ -2799,10 +2799,16 @@ void InitKernelConfig()
 /*
     Runs `fn` with a value-initialized tag of the concrete slice-offset element
     type for `mode`, exactly as dispatchIndexMode does, but instantiates only
-    the widths the explicit kernels are built for. Today that is
-    IndexMode::I32_I32 alone; adding IndexMode::I64_I32 means widening the
-    if constexpr, not touching the kernels. Callers see an unsupported mode as
-    `fn` never being invoked.
+    the widths the explicit kernels are built for: both offset widths, with
+    32-bit columns. That covers I32_I32 and I64_I32, the latter being what
+    problems above INT32_MAX padded nonzeros (512^3 among them) require.
+
+    I64_I64 is excluded because the column type is not a template parameter
+    here -- the kernels and every helper in ldg-loads.cuh take idx32_t columns,
+    and the wide gather loads are typed on it. Serving 64-bit columns means
+    retyping that path, not widening this condition.
+
+    Callers see an unsupported mode as `fn` never being invoked.
 */
 template <class Fn>
 static void dispatchSellOffsetType(IndexMode mode, Fn&& fn)
@@ -2810,9 +2816,8 @@ static void dispatchSellOffsetType(IndexMode mode, Fn&& fn)
     dispatchIndexMode(mode,
         [&](auto offTag, auto colTag)
         {
-            using OffsetT = decltype(offTag);
             using ColT = decltype(colTag);
-            if constexpr (std::is_same<OffsetT, idx32_t>::value && std::is_same<ColT, idx32_t>::value)
+            if constexpr (std::is_same<ColT, idx32_t>::value)
                 fn(offTag);
         });
 }
@@ -3115,15 +3120,15 @@ bool ExplicitEnvEnabled(const char* var)
 */
 bool ExplicitIndexModeUsable(const SparseMatrix& A, const char* op, const char* var, bool& warned)
 {
-    if (A.index_mode == IndexMode::I32_I32)
+    if (A.index_mode == IndexMode::I32_I32 || A.index_mode == IndexMode::I64_I32)
         return true;
     if (!warned)
     {
         warned = true;
         fprintf(stderr,
-            "HPCG: %s was requested through %s, but the explicit Sliced-ELL kernels are built for 32-bit slice "
-            "offsets and 32-bit columns only and cannot serve --mi %d (%s). Re-run with --mi 0 to use them; "
-            "using cuSPARSE for this run.\n",
+            "HPCG: %s was requested through %s, but the explicit Sliced-ELL kernels are built for 32-bit columns "
+            "and cannot serve --mi %d (%s). Re-run with --mi 0 (32-bit offsets) or --mi 1 (64-bit offsets) to use "
+            "them; using cuSPARSE for this run.\n",
             op, var, (int) A.index_mode, toString(A.index_mode));
     }
     return false;

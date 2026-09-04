@@ -32,8 +32,8 @@
  @file spsv-ldg-v2.cu
 
  LDG_V2 Sliced-ELL triangular solve: two-stage register pipeline, W rows per
- thread, wide (128/256-bit) gather. Instantiated for 32-bit slice offsets and
- 32-bit columns only, like the rest of the explicit path.
+ thread, wide (128/256-bit) gather. Instantiated for both slice-offset widths
+ with 32-bit columns, like the rest of the explicit path.
  */
 
 #ifdef USE_CUDA
@@ -238,7 +238,10 @@ bool SpsvLdgV2SellCfg(bool forward, const SparseMatrix& A, const double* rv, dou
     return false;
 }
 
+// Both slice-offset widths, 32-bit columns: --mi 0 and --mi 1 respectively.
 template bool SpsvLdgV2SellCfg<idx32_t>(bool, const SparseMatrix&, const double*, double*, const idx32_t*,
+    const idx32_t*, const double*, cudaStream_t, int, int, int);
+template bool SpsvLdgV2SellCfg<idx64_t>(bool, const SparseMatrix&, const double*, double*, const idx64_t*,
     const idx32_t*, const double*, cudaStream_t, int, int, int);
 
 #endif // EXPLICIT_KERNELS
