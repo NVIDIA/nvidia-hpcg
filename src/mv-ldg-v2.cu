@@ -126,79 +126,112 @@ __device__ __forceinline__ void ConsumeBlock(
     it into the 2D shape would reject nearly every launch at the finest level,
     where m/(W*BLKDIM) runs into the hundreds of thousands.
 
+    With STRIDED the partitioned path walks its partition in gridDim.y strides,
+    for launches whose natural tile count exceeds that cap. Without it, every
+    parts > 1 candidate was refused once a partition grew past
+    65535 * BLKDIM * W rows -- 512^3 among them -- so autotuning silently lost
+    the `parts` axis at exactly the sizes where spreading the column stream
+    matters most. This is the treatment LDG3 and cuSPARSE's own Sliced-ELL 2D
+    kernel already use.
+
+    STRIDED is only instantiated for the parts > 1 launch: the 1D shape derives
+    its row from blockIdx.x, which has no cap, so striding it would recompute
+    the same rows.
+
+    The predicate is block-uniform, so when the launch does fit the body runs
+    exactly once and costs only the added register.
+
     `parts` is a plain kernel argument, not a template parameter: its only uses
     are a host-side launch dimension and partition_rows, which the host passes
     in precomputed. Templating it would multiply the instantiation count for
     byte-identical device code.
 */
-template <class OffsetT, int BLKDIM, int UNROLL, int W>
+template <class OffsetT, int BLKDIM, int UNROLL, int W, bool STRIDED = false>
 __global__ __launch_bounds__(BLKDIM) void mv_sell_ldgv2(local_int_t m, int parts, local_int_t partition_rows,
     double alpha, double beta, double* __restrict__ y, const double* __restrict__ x,
     const OffsetT* __restrict__ slice_offsets, const idx32_t* __restrict__ col_idx,
     const double* __restrict__ values, local_int_t slice_size, intdiv32_t slice_size_div)
 {
-    local_int_t base_row, row_end;
-    if (parts == 1)
+    // Rows one y step covers, and so both the stride and the loop bound.
+    constexpr local_int_t kRowsPerTile = (local_int_t) BLKDIM * W;
+    local_int_t by = (local_int_t) blockIdx.y;
+
+    do
     {
-        base_row = ((local_int_t) blockIdx.x * BLKDIM + (local_int_t) threadIdx.x) * W;
-        row_end = m;
-    }
-    else
-    {
-        const local_int_t row_in_partition = ((local_int_t) blockIdx.y * BLKDIM + (local_int_t) threadIdx.x) * W;
-        base_row = (local_int_t) blockIdx.x * partition_rows + row_in_partition;
-        row_end = ((local_int_t) blockIdx.x + 1) * partition_rows;
-    }
-    if (base_row >= row_end)
-        return;
-
-    // Both divisions below are by slice_size, a runtime value the compiler
-    // cannot strength-reduce, and the GPU has no integer-division instruction.
-    // They sit on the per-thread critical path of a kernel whose entire purpose
-    // is keeping the gather saturated, so both go through the same precomputed
-    // magic-number reciprocal rather than a hardware divide.
-    int slice, in_slice;
-    intdiv32_divmod((int32_t) base_row, (int32_t) slice_size, slice_size_div, &slice, &in_slice);
-    // 64-bit only when the slice offsets are, since a flat offset is bounded by
-    // the same padded nonzero count those offsets hold -- see FlatOffsetT.
-    const FlatOffsetT<OffsetT> row_start = (FlatOffsetT<OffsetT>) slice_offsets[slice] + in_slice;
-    // Per-slice nnz is bounded by slice_size * HPCG_MAX_ROW_LEN and so fits in
-    // int32. Narrowing the difference before dividing keeps this in the 32-bit
-    // reciprocal above instead of the 64-bit form a wider OffsetT would force.
-    int max_row_len;
-    intdiv32_div((int32_t) (slice_offsets[slice + 1] - slice_offsets[slice]), slice_size_div, &max_row_len);
-
-    const idx32_t* cp = col_idx + row_start;
-    const double* vp = values + row_start;
-
-    int cA[UNROLL][W], cB[UNROLL][W];
-    double vA[UNROLL][W], vB[UNROLL][W];
-
-    LoadBlock<UNROLL, W>(0, max_row_len, slice_size, cp, vp, cA, vA);
-
-    double sum[W];
-#pragma unroll
-    for (int w = 0; w < W; ++w)
-        sum[w] = 0.0;
-
-    for (int kb = 0; kb < max_row_len; kb += 2 * UNROLL)
-    {
-        LoadBlock<UNROLL, W>(kb + UNROLL, max_row_len, slice_size, cp, vp, cB, vB);
-        ConsumeBlock<UNROLL, W>(sum, cA, vA, x);
-        LoadBlock<UNROLL, W>(kb + 2 * UNROLL, max_row_len, slice_size, cp, vp, cA, vA);
-        ConsumeBlock<UNROLL, W>(sum, cB, vB, x);
-    }
-
-#pragma unroll
-    for (int w = 0; w < W; ++w)
-    {
-        const local_int_t r = base_row + w;
-        if (r < row_end)
+        local_int_t base_row, row_end;
+        if (parts == 1)
         {
-            const double prev = (beta == 0.0) ? 0.0 : beta * ldgload::LoadScalarRw<kStreamVector>(&y[r]);
-            ldgload::StoreScalar<kStreamVector>(&y[r], prev + alpha * sum[w]);
+            base_row = ((local_int_t) blockIdx.x * BLKDIM + (local_int_t) threadIdx.x) * W;
+            row_end = m;
         }
-    }
+        else
+        {
+            const local_int_t row_in_partition = (by * BLKDIM + (local_int_t) threadIdx.x) * W;
+            base_row = (local_int_t) blockIdx.x * partition_rows + row_in_partition;
+            row_end = ((local_int_t) blockIdx.x + 1) * partition_rows;
+        }
+        // A skip rather than a return: under STRIDED the threads that fall off
+        // the end of this tile must still reach the stride below, because the
+        // loop predicate is block-uniform and they carry it for the block.
+        if (base_row < row_end)
+        {
+            // Both divisions below are by slice_size, a runtime value the compiler
+            // cannot strength-reduce, and the GPU has no integer-division
+            // instruction. They sit on the per-thread critical path of a kernel
+            // whose entire purpose is keeping the gather saturated, so both go
+            // through the same precomputed magic-number reciprocal rather than a
+            // hardware divide.
+            int slice, in_slice;
+            intdiv32_divmod((int32_t) base_row, (int32_t) slice_size, slice_size_div, &slice, &in_slice);
+            // 64-bit only when the slice offsets are, since a flat offset is
+            // bounded by the same padded nonzero count those offsets hold -- see
+            // FlatOffsetT.
+            const FlatOffsetT<OffsetT> row_start = (FlatOffsetT<OffsetT>) slice_offsets[slice] + in_slice;
+            // Per-slice nnz is bounded by slice_size * HPCG_MAX_ROW_LEN and so
+            // fits in int32. Narrowing the difference before dividing keeps this
+            // in the 32-bit reciprocal above instead of the 64-bit form a wider
+            // OffsetT would force.
+            int max_row_len;
+            intdiv32_div(
+                (int32_t) (slice_offsets[slice + 1] - slice_offsets[slice]), slice_size_div, &max_row_len);
+
+            const idx32_t* cp = col_idx + row_start;
+            const double* vp = values + row_start;
+
+            int cA[UNROLL][W], cB[UNROLL][W];
+            double vA[UNROLL][W], vB[UNROLL][W];
+
+            LoadBlock<UNROLL, W>(0, max_row_len, slice_size, cp, vp, cA, vA);
+
+            double sum[W];
+#pragma unroll
+            for (int w = 0; w < W; ++w)
+                sum[w] = 0.0;
+
+            for (int kb = 0; kb < max_row_len; kb += 2 * UNROLL)
+            {
+                LoadBlock<UNROLL, W>(kb + UNROLL, max_row_len, slice_size, cp, vp, cB, vB);
+                ConsumeBlock<UNROLL, W>(sum, cA, vA, x);
+                LoadBlock<UNROLL, W>(kb + 2 * UNROLL, max_row_len, slice_size, cp, vp, cA, vA);
+                ConsumeBlock<UNROLL, W>(sum, cB, vB, x);
+            }
+
+#pragma unroll
+            for (int w = 0; w < W; ++w)
+            {
+                const local_int_t r = base_row + w;
+                if (r < row_end)
+                {
+                    const double prev = (beta == 0.0) ? 0.0 : beta * ldgload::LoadScalarRw<kStreamVector>(&y[r]);
+                    ldgload::StoreScalar<kStreamVector>(&y[r], prev + alpha * sum[w]);
+                }
+            }
+        }
+        if constexpr (STRIDED)
+        {
+            by += (local_int_t) gridDim.y;
+        }
+    } while (STRIDED && by * kRowsPerTile < partition_rows);
 }
 
 template <class OffsetT, int BLKDIM, int UNROLL, int W>
@@ -232,11 +265,27 @@ bool LaunchMvLdgV2(const SparseMatrix& A, double alpha, double beta, const doubl
     const local_int_t partition_rows = m / parts;
     if (partition_rows % W != 0)
         return false;
-    const unsigned int grid_y = (unsigned int) ((partition_rows / W + BLKDIM - 1) / BLKDIM);
-    if (grid_y > 65535u)
-        return false;
-    mv_sell_ldgv2<OffsetT, BLKDIM, UNROLL, W><<<dim3((unsigned int) parts, grid_y, 1), BLKDIM, 0, stream>>>(
-        m, parts, partition_rows, alpha, beta, y, x, slice_offsets, columns, values, slice_size, sdiv);
+    // The requested shape is always honored. When the natural tile count exceeds
+    // the cap, gridDim.y is clamped and the strided kernel walks the axis
+    // instead: refusing here would make `parts` unavailable above
+    // kMaxGridDimY * BLKDIM * W rows per partition, which is a property of the
+    // launch geometry rather than of the configuration asked for, and it is what
+    // used to remove the whole axis from autotuning at 512^3. Computed in
+    // slice_ptr_t because the unclamped count overflows a 32-bit unsigned for a
+    // large enough partition.
+    const slice_ptr_t needed_y = ((slice_ptr_t) (partition_rows / W) + BLKDIM - 1) / BLKDIM;
+    if (needed_y <= (slice_ptr_t) kMaxGridDimY)
+    {
+        mv_sell_ldgv2<OffsetT, BLKDIM, UNROLL, W, false>
+            <<<dim3((unsigned int) parts, (unsigned int) needed_y, 1), BLKDIM, 0, stream>>>(
+                m, parts, partition_rows, alpha, beta, y, x, slice_offsets, columns, values, slice_size, sdiv);
+    }
+    else
+    {
+        mv_sell_ldgv2<OffsetT, BLKDIM, UNROLL, W, true>
+            <<<dim3((unsigned int) parts, kMaxGridDimY, 1), BLKDIM, 0, stream>>>(
+                m, parts, partition_rows, alpha, beta, y, x, slice_offsets, columns, values, slice_size, sdiv);
+    }
     return true;
 }
 
