@@ -3529,10 +3529,29 @@ float TimeSvConfig(const SparseMatrix& A, double* rv, double* xv, const SellConf
 
 namespace
 {
+/*
+    On unless the variable turns it off.
+
+    The reverse -- off unless asked -- meant a build made specifically for
+    these kernels ran without them by default, and it cost a wrong published
+    comparison. A 1-node measurement of this branch reported 9438.15 GFLOP/s
+    against master's 9438.88: the build had EXPLICIT_KERNELS, the run set
+    HPCG_AUTOTUNE and the autotune tables are in the log, but not these two
+    variables, so the tuned kernels were measured and then never called. Every
+    SpMV and SymGS ran on cuSPARSE and the run was, correctly, master to within
+    0.01% -- reported as this work achieving nothing.
+
+    The compile flag is already the opt-in, and the tree the kernels came from
+    treats it as one: with EXPLICIT_KERNELS it calls them unconditionally, with
+    no environment gate at all. Requiring two further variables made identical
+    build and run flags mean different things in the two trees, which is the
+    trap above. Setting either to 0 still forces cuSPARSE for that operator,
+    which is what the A/B comparisons want.
+*/
 bool ExplicitEnvEnabled(const char* var)
 {
     const char* value = std::getenv(var);
-    return value != NULL && std::atoi(value) != 0;
+    return value == NULL || std::atoi(value) != 0;
 }
 
 /*
@@ -3585,6 +3604,60 @@ bool UseExplicitSpMV(const SparseMatrix& A)
     return enabled
         && ExplicitKindUsable(g_config.MV_KIND, "the explicit SpMV", "HPCG_EXPLICIT_MV_KIND", kind_warned)
         && ExplicitIndexModeUsable(A, "the explicit SpMV", "HPCG_EXPLICIT_MV", mode_warned);
+}
+
+namespace
+{
+const char* SellKindName(int kind)
+{
+    switch (kind)
+    {
+    case SELL_KIND_LDG: return "explicit LDG";
+    case SELL_KIND_TMA: return "explicit TMA";
+    case SELL_KIND_LDGV2: return "explicit LDG_V2";
+    case SELL_KIND_TMA2D: return "explicit TMA2D";
+    case SELL_KIND_LDGV3: return "explicit LDG3";
+    case SELL_KIND_TMAEX: return "explicit TMA_EX";
+    default: return "explicit (unknown family)";
+    }
+}
+} // namespace
+
+/*
+    Which path each operator will take, printed once before the timed phases.
+
+    Four things decide it -- the compile flag, the two environment variables,
+    and the matrix's index mode -- and when the answer is cuSPARSE the run is
+    still valid and still plausible. It is master's number wearing this
+    branch's name, and it has already been reported as one: see
+    ExplicitEnvEnabled. The autotune tables are not the confirmation they look
+    like, because the autotuner is gated separately from the call sites and
+    will happily tune kernels that nothing then calls.
+
+    So state it outright, in the log, next to the number it explains. A run
+    whose log cannot be read for which path executed is a run whose result
+    cannot be attributed to a kernel -- and this project's whole output is such
+    attributions.
+*/
+void ReportExplicitKernelUse(const SparseMatrix& A)
+{
+    const char* autotune = std::getenv("HPCG_AUTOTUNE");
+    const bool tuned = autotune != NULL && std::atoi(autotune) != 0;
+    // With autotuning the family is chosen per level and per operator, so
+    // naming g_config's would be naming one level's answer as though it were
+    // the run's. The tables above have the rest.
+    const char* mv = UseExplicitSpMV(A) ? (tuned ? "explicit, per level (see autotune table)"
+                                                 : SellKindName(g_config.MV_KIND))
+                                        : "cuSPARSE";
+    const char* sv = UseExplicitSpSV(A) ? (tuned ? "explicit, per level (see autotune table)"
+                                                 : SellKindName(g_config.SV_KIND))
+                                        : "cuSPARSE";
+    printf("Sliced-ELL Path:\n"
+           " | SpMV:  %s\n"
+           " | SymGS: %s\n"
+           " | Autotune: %s\n"
+           " | Index mode: %s\n",
+        mv, sv, tuned ? "on" : "off (row-count heuristic)", toString(A.index_mode));
 }
 
 bool UseExplicitSpSV(const SparseMatrix& A)

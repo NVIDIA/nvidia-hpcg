@@ -680,6 +680,10 @@ int main(int argc, char* argv[])
     // the configuration that installs.
     if (params.rank_type == GPU)
         AutotuneSymGS(A);
+    // After the tuning, because with autotuning on there is no single family
+    // to name until it has run.
+    if (rank == 0 && params.rank_type == GPU)
+        ReportExplicitKernelUse(A);
 #endif
 
 //////////////////////////////

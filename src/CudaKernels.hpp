@@ -206,17 +206,25 @@ void InitKernelConfig();
   Whether this SpMV/SpSV should run on the explicit kernels rather than
   cuSPARSE.
 
-  False unless HPCG_EXPLICIT_MV / HPCG_EXPLICIT_SV is set to a nonzero value,
-  so a default run of an EXPLICIT_KERNELS build takes exactly the same code
-  path as a build without it. Also false, with a one-time warning, when the
-  matrix uses an index mode the explicit kernels are not instantiated for, or
-  when the requested family is not one this build contains.
+  True by default in an EXPLICIT_KERNELS build, since that flag is the opt-in;
+  set HPCG_EXPLICIT_MV / HPCG_EXPLICIT_SV to 0 to force cuSPARSE for that
+  operator, which is how the A/B comparisons are taken. False, with a one-time
+  warning, when the matrix uses an index mode the explicit kernels are not
+  instantiated for, or when the requested family is not one this build
+  contains.
 
   Takes the whole matrix rather than a flag so that the per-level selection the
-  autotuner will drive lands here without touching the call sites.
+  autotuner drives lands here without touching the call sites.
 */
 bool UseExplicitSpMV(const SparseMatrix& A);
 bool UseExplicitSpSV(const SparseMatrix& A);
+
+/*
+  Print which path each operator will take. Call once, from rank 0, after
+  InitKernelConfig and any autotuning, and before the timed phases -- the
+  answer is what every number in the run then means.
+*/
+void ReportExplicitKernelUse(const SparseMatrix& A);
 
 void mv_sell(DIR d, const SparseMatrix& A, double alpha, double beta, double* x, double* y);
 void sv_sell(DIR d, const SparseMatrix& A, double* rv, double* xv);
