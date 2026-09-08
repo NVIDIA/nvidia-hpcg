@@ -2372,6 +2372,58 @@ template<int THREADS_PER_CTA, int ROUNDS>
  
 
 /*
+    GPU Kernel
+    Computes WAXPBY -- double4 version
+
+    The 4-wide forms of these four kernels differ from the 2-wide ones only in
+    how much each thread moves per access. They are all bandwidth bound and none
+    of them is autotuned, so the width is the only tuning they have; see
+    KernelConfig::VECTOR_WIDTH for why it is worth having.
+
+    The tail is a scalar loop rather than the chain of two- and one-element
+    cases the 2-wide form uses, because at 4 wide there are three leftover
+    lengths to spell out and one loop covers all of them. It runs on at most one
+    thread of the launch.
+
+    Both pointers are allocation bases and base is a multiple of 4, so the
+    double4 access is 32-byte aligned. That is a requirement here, not an
+    optimisation: a misaligned vector access faults.
+*/
+template<int THREADS_PER_CTA, int ROUNDS>
+__global__ void __launch_bounds__(THREADS_PER_CTA)
+    computeWAXPBY_kernel_double4(
+        const local_int_t n, double alpha, double* __restrict__ x, double beta, double* __restrict__ y, double* w)
+{
+    const local_int_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+    const local_int_t stride = blockDim.x * gridDim.x;
+
+    #pragma unroll
+    for (int round = 0; round < ROUNDS; ++round)
+    {
+        const local_int_t base = (gid + round * stride) * 4;
+
+        if (base + 3 < n)
+        {
+            const double4 x_vec = *reinterpret_cast<const double4*>(&x[base]);
+            const double4 y_vec = *reinterpret_cast<const double4*>(&y[base]);
+
+            double4 w_vec;
+            w_vec.x = alpha * x_vec.x + beta * y_vec.x;
+            w_vec.y = alpha * x_vec.y + beta * y_vec.y;
+            w_vec.z = alpha * x_vec.z + beta * y_vec.z;
+            w_vec.w = alpha * x_vec.w + beta * y_vec.w;
+
+            *reinterpret_cast<double4*>(&w[base]) = w_vec;
+        }
+        else
+        {
+            for (local_int_t i = base; i < n; ++i)
+                w[i] = alpha * x[i] + beta * y[i];
+        }
+    }
+}
+
+/*
     Computes WAXPBY followed by stream synchronization
 */
 void ComputeWAXPBYCuda(
@@ -2379,9 +2431,13 @@ void ComputeWAXPBYCuda(
 {
     const int ROUNDS = 1;
     const int THREADS_PER_CTA = 256;
-    const int ELELEMENTS_PER_CTA = THREADS_PER_CTA * ROUNDS * 2; // 2 doubles per thread, # rounds per thread
+    const int per_thread = g_config.VECTOR_WIDTH; // 2 or 4 doubles per thread
+    const int ELELEMENTS_PER_CTA = THREADS_PER_CTA * ROUNDS * per_thread;
     const int grid = (n + ELELEMENTS_PER_CTA - 1) / ELELEMENTS_PER_CTA;
-    computeWAXPBY_kernel<THREADS_PER_CTA, ROUNDS><<<grid, THREADS_PER_CTA, 0, stream>>>(n, alpha, x.values_d, beta, y.values_d, w.values_d);
+    if (per_thread == 4)
+        computeWAXPBY_kernel_double4<THREADS_PER_CTA, ROUNDS><<<grid, THREADS_PER_CTA, 0, stream>>>(n, alpha, x.values_d, beta, y.values_d, w.values_d);
+    else
+        computeWAXPBY_kernel<THREADS_PER_CTA, ROUNDS><<<grid, THREADS_PER_CTA, 0, stream>>>(n, alpha, x.values_d, beta, y.values_d, w.values_d);
     CHECK_CUDART(cudaStreamSynchronize(stream));
 }
 
@@ -2497,6 +2553,116 @@ __global__ void __launch_bounds__(THREADS_PER_CTA)
 }
 
 /*
+    GPU Kernel
+    Multiplies x values with d and accumulates back to x -- double4 version
+*/
+template<int THREADS_PER_CTA, int ROUNDS>
+__global__ void __launch_bounds__(THREADS_PER_CTA)
+    spmvDiag_kernel_double4(const local_int_t n, double* x, double* d)
+{
+    const local_int_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+    const local_int_t stride = blockDim.x * gridDim.x;
+
+    #pragma unroll
+    for (int round = 0; round < ROUNDS; ++round)
+    {
+        const local_int_t base = (gid + round * stride) * 4;
+
+        if (base + 3 < n)
+        {
+            double4 x_vec = *reinterpret_cast<double4*>(&x[base]);
+            const double4 d_vec = *reinterpret_cast<const double4*>(&d[base]);
+
+            x_vec.x *= d_vec.x;
+            x_vec.y *= d_vec.y;
+            x_vec.z *= d_vec.z;
+            x_vec.w *= d_vec.w;
+
+            *reinterpret_cast<double4*>(&x[base]) = x_vec;
+        }
+        else
+        {
+            for (local_int_t i = base; i < n; ++i)
+                x[i] *= d[i];
+        }
+    }
+}
+
+/*
+    GPU Kernel
+    Computes z = x - r -- double4 version
+*/
+template<int THREADS_PER_CTA, int ROUNDS>
+__global__ void __launch_bounds__(THREADS_PER_CTA)
+    axpby_kernel_double4(const local_int_t n, double* x, double* y, double* z)
+{
+    const local_int_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+    const local_int_t stride = blockDim.x * gridDim.x;
+
+    #pragma unroll
+    for (int round = 0; round < ROUNDS; ++round)
+    {
+        const local_int_t base = (gid + round * stride) * 4;
+
+        if (base + 3 < n)
+        {
+            const double4 x_vec = *reinterpret_cast<const double4*>(&x[base]);
+            const double4 y_vec = *reinterpret_cast<const double4*>(&y[base]);
+
+            double4 z_vec;
+            z_vec.x = x_vec.x - y_vec.x;
+            z_vec.y = x_vec.y - y_vec.y;
+            z_vec.z = x_vec.z - y_vec.z;
+            z_vec.w = x_vec.w - y_vec.w;
+
+            *reinterpret_cast<double4*>(&z[base]) = z_vec;
+        }
+        else
+        {
+            for (local_int_t i = base; i < n; ++i)
+                z[i] = x[i] - y[i];
+        }
+    }
+}
+
+/*
+    GPU Kernel
+    Computes z += x * y -- double4 version
+*/
+template<int THREADS_PER_CTA, int ROUNDS>
+__global__ void __launch_bounds__(THREADS_PER_CTA)
+    spFma_kernel_double4(const local_int_t n, double* x, double* y, double* z)
+{
+    const local_int_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+    const local_int_t stride = blockDim.x * gridDim.x;
+
+    #pragma unroll
+    for (int round = 0; round < ROUNDS; ++round)
+    {
+        const local_int_t base = (gid + round * stride) * 4;
+
+        if (base + 3 < n)
+        {
+            const double4 x_vec = *reinterpret_cast<const double4*>(&x[base]);
+            const double4 y_vec = *reinterpret_cast<const double4*>(&y[base]);
+            double4 z_vec = *reinterpret_cast<double4*>(&z[base]);
+
+            z_vec.x += x_vec.x * y_vec.x;
+            z_vec.y += x_vec.y * y_vec.y;
+            z_vec.z += x_vec.z * y_vec.z;
+            z_vec.w += x_vec.w * y_vec.w;
+
+            *reinterpret_cast<double4*>(&z[base]) = z_vec;
+        }
+        else
+        {
+            for (local_int_t i = base; i < n; ++i)
+                z[i] += x[i] * y[i];
+        }
+    }
+}
+
+/*
     Multiplies x values with d and accumultaes back to x
     Calls spmvDiag_kernel
 */
@@ -2504,9 +2670,13 @@ void SpmvDiagCuda(local_int_t n, double* x, double* d)
 {
     const int ROUNDS = 1;
     const int THREADS_PER_CTA = 256;
-    const int ELELEMENTS_PER_CTA = THREADS_PER_CTA * ROUNDS * 2; // 2 doubles per thread, # rounds per thread
+    const int per_thread = g_config.VECTOR_WIDTH; // 2 or 4 doubles per thread
+    const int ELELEMENTS_PER_CTA = THREADS_PER_CTA * ROUNDS * per_thread;
     const int grid = (n + ELELEMENTS_PER_CTA - 1) / ELELEMENTS_PER_CTA;
-    spmvDiag_kernel<THREADS_PER_CTA, ROUNDS><<<grid, THREADS_PER_CTA, 0, stream>>>(n, x, d);
+    if (per_thread == 4)
+        spmvDiag_kernel_double4<THREADS_PER_CTA, ROUNDS><<<grid, THREADS_PER_CTA, 0, stream>>>(n, x, d);
+    else
+        spmvDiag_kernel<THREADS_PER_CTA, ROUNDS><<<grid, THREADS_PER_CTA, 0, stream>>>(n, x, d);
 }
 
 /*
@@ -2517,9 +2687,13 @@ void AxpbyCuda(local_int_t n, double* x, double* y, double* z)
 {
     const int ROUNDS = 1;
     const int THREADS_PER_CTA = 256;
-    const int ELELEMENTS_PER_CTA = THREADS_PER_CTA * ROUNDS * 2; // 2 doubles per thread, # rounds per thread
+    const int per_thread = g_config.VECTOR_WIDTH; // 2 or 4 doubles per thread
+    const int ELELEMENTS_PER_CTA = THREADS_PER_CTA * ROUNDS * per_thread;
     const int grid = (n + ELELEMENTS_PER_CTA - 1) / ELELEMENTS_PER_CTA;
-    axpby_kernel<THREADS_PER_CTA, ROUNDS><<<grid, THREADS_PER_CTA, 0, stream>>>(n, x, y, z);
+    if (per_thread == 4)
+        axpby_kernel_double4<THREADS_PER_CTA, ROUNDS><<<grid, THREADS_PER_CTA, 0, stream>>>(n, x, y, z);
+    else
+        axpby_kernel<THREADS_PER_CTA, ROUNDS><<<grid, THREADS_PER_CTA, 0, stream>>>(n, x, y, z);
 }
 
 /*
@@ -2530,9 +2704,13 @@ void SpFmaCuda(local_int_t n, double* x, double* y, double* z)
 {
     const int ROUNDS = 1;
     const int THREADS_PER_CTA = 256;
-    const int ELELEMENTS_PER_CTA = THREADS_PER_CTA * ROUNDS * 2; // 2 doubles per thread, # rounds per thread
+    const int per_thread = g_config.VECTOR_WIDTH; // 2 or 4 doubles per thread
+    const int ELELEMENTS_PER_CTA = THREADS_PER_CTA * ROUNDS * per_thread;
     const int grid = (n + ELELEMENTS_PER_CTA - 1) / ELELEMENTS_PER_CTA;
-    spFma_kernel<THREADS_PER_CTA, ROUNDS><<<grid, THREADS_PER_CTA, 0, stream>>>(n, x, y, z);
+    if (per_thread == 4)
+        spFma_kernel_double4<THREADS_PER_CTA, ROUNDS><<<grid, THREADS_PER_CTA, 0, stream>>>(n, x, y, z);
+    else
+        spFma_kernel<THREADS_PER_CTA, ROUNDS><<<grid, THREADS_PER_CTA, 0, stream>>>(n, x, y, z);
 }
 
 ///////// CG Support Kernels: External Matrix SpMV + Scatter //////////////////
@@ -2810,6 +2988,9 @@ void InitKernelConfig()
     g_config.MV_WIDE = 0;
     g_config.SV_CACHED = 0;
     g_config.MV_CACHED = 0;
+    // 2 to match the tree this came from, so a run that sets nothing measures
+    // what it measures.
+    g_config.VECTOR_WIDTH = 2;
 
     if (const char* env = std::getenv("SV_UNROLL"))
         g_config.SV_UNROLL = std::atoi(env);
@@ -2833,6 +3014,22 @@ void InitKernelConfig()
         g_config.SV_CACHED = std::atoi(env);
     if (const char* env = std::getenv("MV_CACHED"))
         g_config.MV_CACHED = std::atoi(env);
+    // Only 2 and 4 exist, and a value outside them would otherwise select the
+    // 2-wide kernel silently -- a run that asked for something and measured
+    // something else, with the request still sitting in the environment as
+    // evidence that it happened.
+    if (const char* env = std::getenv("VECTOR_WIDTH"))
+    {
+        const int w = std::atoi(env);
+        if (w == 2 || w == 4)
+        {
+            g_config.VECTOR_WIDTH = w;
+        }
+        else
+        {
+            fprintf(stderr, "HPCG: VECTOR_WIDTH=%s is neither 2 nor 4; using %d.\n", env, g_config.VECTOR_WIDTH);
+        }
+    }
 }
 
 /*
@@ -3673,12 +3870,17 @@ void ReportExplicitKernelUse(const SparseMatrix& A)
     const char* sv = UseExplicitSpSV(A) ? (tuned ? "explicit, per level (see autotune table)"
                                                  : SellKindName(g_config.SV_KIND))
                                         : "cuSPARSE";
+    // The vector width belongs in the same banner even though it steers no
+    // Sliced-ELL kernel. It is the one setting here that changes MG without
+    // appearing in an autotune table, so a log that omits it cannot be read for
+    // why two MG numbers differ -- which is how it came to be ported.
     printf("Sliced-ELL Path:\n"
            " | SpMV:  %s\n"
            " | SymGS: %s\n"
            " | Autotune: %s\n"
-           " | Index mode: %s\n",
-        mv, sv, tuned ? "on" : "off (row-count heuristic)", toString(A.index_mode));
+           " | Index mode: %s\n"
+           " | Vector width: %d (spmvDiag, axpby, spFma, WAXPBY)\n",
+        mv, sv, tuned ? "on" : "off (row-count heuristic)", toString(A.index_mode), g_config.VECTOR_WIDTH);
 }
 
 bool UseExplicitSpSV(const SparseMatrix& A)

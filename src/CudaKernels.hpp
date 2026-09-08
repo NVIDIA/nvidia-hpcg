@@ -196,6 +196,18 @@ struct KernelConfig
     // L2 between calls, so it is a knob rather than a constant.
     int SV_CACHED;
     int MV_CACHED;
+    // Doubles each thread moves in the four bandwidth-bound vector kernels --
+    // spmvDiag, axpby, spFma and WAXPBY -- as 2 or 4, nothing else. These are
+    // not Sliced-ELL kernels and are not autotuned, which is exactly why this
+    // had to become visible: spmvDiag runs inside SymGS between the two solves,
+    // so its cost lands in MG while sitting outside sv_sell, where no autotune
+    // table can see it.
+    //
+    // Named VECTOR_WIDTH, and read from an environment variable of that bare
+    // name, to match the tree this came from: a shared cluster init script that
+    // exports it then steers both trees the same way, which is the whole point
+    // of having it here.
+    int VECTOR_WIDTH;
 };
 
 extern KernelConfig g_config;
