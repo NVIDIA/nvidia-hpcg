@@ -8,4 +8,8 @@ bin/hpcg20*.txt
 .DS_Store
 
 # Out-of-source build tree created by hpcg-lab/harness/build-hpcg.sh
-build/
+# Every per-architecture build directory, not just build/. One filesystem here
+# is shared between an x86 node and an aarch64 one, so builds are kept apart by
+# name -- build-rubin, build-patrick-rubin, build-i64mix-rubin -- and each was
+# offering its object tree to `git add` while build/ alone was ignored.
+build*/
