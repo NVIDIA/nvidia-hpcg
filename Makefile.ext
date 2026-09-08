@@ -75,6 +75,8 @@ HPCG_DEPS = src/CG.o \
 	    src/spsv-ldg-v3.o \
 	    src/mv-tma.o \
 	    src/spsv-tma.o \
+	    src/mv-tma-2d.o \
+	    src/spsv-tma-2d.o \
 	    src/autotune.o \
 		src/CpuKernels.o
 
@@ -247,6 +249,15 @@ src/mv-tma.o: HPCG_SRC_PATH/src/mv-tma.cu HPCG_SRC_PATH/src/intdiv.hh
 	nvcc -c -O3 $(CUDA_ARCH) $(HPCG_DEFS) -IHPCG_SRC_PATH/src -I$(CUDA_HOME)/include -I$(CUBLASROOT)/include -I$(MPdir)/include $< -o $@
 
 src/spsv-tma.o: HPCG_SRC_PATH/src/spsv-tma.cu HPCG_SRC_PATH/src/intdiv.hh
+	nvcc -c -O3 $(CUDA_ARCH) $(HPCG_DEFS) -IHPCG_SRC_PATH/src -I$(CUDA_HOME)/include -I$(CUBLASROOT)/include -I$(MPdir)/include $< -o $@
+
+# TMA2D drives the same bulk copy engine through a tensor map, which is encoded
+# by cuTensorMapEncodeTiled -- a driver API entry point, so these two also need
+# -lcuda, which HPCG_LIBS already carries.
+src/mv-tma-2d.o: HPCG_SRC_PATH/src/mv-tma-2d.cu HPCG_SRC_PATH/src/intdiv.hh
+	nvcc -c -O3 $(CUDA_ARCH) $(HPCG_DEFS) -IHPCG_SRC_PATH/src -I$(CUDA_HOME)/include -I$(CUBLASROOT)/include -I$(MPdir)/include $< -o $@
+
+src/spsv-tma-2d.o: HPCG_SRC_PATH/src/spsv-tma-2d.cu HPCG_SRC_PATH/src/intdiv.hh
 	nvcc -c -O3 $(CUDA_ARCH) $(HPCG_DEFS) -IHPCG_SRC_PATH/src -I$(CUDA_HOME)/include -I$(CUBLASROOT)/include -I$(MPdir)/include $< -o $@
 
 # The per-level autotuner. It launches no kernels of its own -- it drives the

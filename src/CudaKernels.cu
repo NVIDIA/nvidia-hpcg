@@ -2781,9 +2781,13 @@ void InitKernelConfig()
     // recorded default ran at, is instantiated at every block size it offers,
     // and leaves the default 256/4 SpMV at 48 KiB -- enough headroom that
     // raising W by hand does not immediately turn into a refusal.
+    //
+    // TMA2D shares that meaning and that footprint exactly -- unroll is the
+    // extent of its tensor box along the stored-entry axis, which is the depth
+    // of the same double buffer -- so it takes the same default.
     auto default_unroll = [](int kind)
     {
-        if (kind == SELL_KIND_TMA)
+        if (kind == SELL_KIND_TMA || kind == SELL_KIND_TMA2D)
             return 2;
         if (kind == SELL_KIND_LDGV2 || kind == SELL_KIND_LDGV3)
             return 4;
@@ -3356,8 +3360,8 @@ static bool GetSvChoice(int level, SellConfig& c)
     failure all of this exists to prevent.
 
     A family this build does not contain is refused rather than served by
-    whichever one is present, so TMA2D and TMA_EX cannot be reached through
-    here even if their numbers are asked for.
+    whichever one is present, so TMA_EX cannot be reached through here even if
+    its number is asked for.
 
     The direction-to-array mapping mirrors mv_sell / sv_sell below, which own
     the normal path and are left as they were.
@@ -3369,17 +3373,23 @@ bool MvSellCfg(DIR d, const SparseMatrix& A, double alpha, double beta, double* 
     const void* offsets = A.sellDev.aSliceOffsets;
     const void* columns = A.sellDev.aColumns;
     const double* values = A.sellAPermValues;
+    // TMA2D only: the extent of the array the tensor map describes. It travels
+    // with the offsets/columns/values triple because it names the same triangle
+    // they do.
+    slice_ptr_t last_nnz = A.sellALocalNumberOfNonzeros;
     if (d == Forward)
     {
         offsets = A.sellDev.lSliceOffsets;
         columns = A.sellDev.lColumns;
         values = A.sellLPermValues;
+        last_nnz = A.sellLLocalNumberOfNonzeros;
     }
     else if (d == Backward)
     {
         offsets = A.sellDev.uSliceOffsets;
         columns = A.sellDev.uColumns;
         values = A.sellUPermValues;
+        last_nnz = A.sellULocalNumberOfNonzeros;
     }
 
     bool launched = false;
@@ -3391,6 +3401,9 @@ bool MvSellCfg(DIR d, const SparseMatrix& A, double alpha, double beta, double* 
             const idx32_t* col = static_cast<const idx32_t*>(columns);
             if (c.kind == SELL_KIND_TMA)
                 launched = MvTmaSellCfg<OffsetT>(A, alpha, beta, x, y, off, col, values, stream, c.blk, c.unroll, c.w);
+            else if (c.kind == SELL_KIND_TMA2D)
+                launched = MvTma2dSellCfg<OffsetT>(
+                    A, alpha, beta, x, y, off, col, values, last_nnz, stream, c.blk, c.unroll, c.w);
             else if (c.kind == SELL_KIND_LDGV2)
                 launched = MvLdgV2SellCfg<OffsetT>(
                     A, alpha, beta, x, y, off, col, values, stream, c.blk, c.unroll, c.w, c.parts);
@@ -3411,11 +3424,14 @@ bool SvSellCfg(DIR d, const SparseMatrix& A, double* rv, double* xv, const SellC
     const void* offsets = A.sellDev.uSliceOffsets;
     const void* columns = A.sellDev.uColumns;
     const double* values = A.sellUPermValues;
+    // TMA2D only; see MvSellCfg.
+    slice_ptr_t last_nnz = A.sellULocalNumberOfNonzeros;
     if (d == Forward)
     {
         offsets = A.sellDev.lSliceOffsets;
         columns = A.sellDev.lColumns;
         values = A.sellLPermValues;
+        last_nnz = A.sellLLocalNumberOfNonzeros;
     }
 
     bool launched = false;
@@ -3428,6 +3444,9 @@ bool SvSellCfg(DIR d, const SparseMatrix& A, double* rv, double* xv, const SellC
             if (c.kind == SELL_KIND_TMA)
                 launched = SpsvTmaSellCfg<OffsetT>(
                     d == Forward, A, rv, xv, off, col, values, stream, c.blk, c.unroll, c.w);
+            else if (c.kind == SELL_KIND_TMA2D)
+                launched = SpsvTma2dSellCfg<OffsetT>(
+                    d == Forward, A, rv, xv, off, col, values, last_nnz, stream, c.blk, c.unroll, c.w);
             else if (c.kind == SELL_KIND_LDGV2)
                 launched = SpsvLdgV2SellCfg<OffsetT>(
                     d == Forward, A, rv, xv, off, col, values, stream, c.blk, c.unroll, c.w);
@@ -3576,21 +3595,23 @@ bool ExplicitIndexModeUsable(const SparseMatrix& A, const char* op, const char* 
 }
 
 /*
-    Only four of the six numbered families are built here. A request for one of
-    the others is refused rather than served by whichever family happens to be
-    present, so that a measurement can never be attributed to the wrong kernel.
+    Five of the six numbered families are built here. A request for the sixth is
+    refused rather than served by whichever family happens to be present, so
+    that a measurement can never be attributed to the wrong kernel.
 */
 bool ExplicitKindUsable(int kind, const char* op, const char* var, bool& warned)
 {
-    if (kind == SELL_KIND_LDG || kind == SELL_KIND_TMA || kind == SELL_KIND_LDGV2 || kind == SELL_KIND_LDGV3)
+    if (kind == SELL_KIND_LDG || kind == SELL_KIND_TMA || kind == SELL_KIND_LDGV2 || kind == SELL_KIND_TMA2D
+        || kind == SELL_KIND_LDGV3)
         return true;
     if (!warned)
     {
         warned = true;
         fprintf(stderr,
             "HPCG: %s=%d selects a Sliced-ELL kernel family this build does not contain. This build supports "
-            "%d (LDG), %d (TMA), %d (LDG_V2) and %d (LDG3); using cuSPARSE for %s.\n",
-            var, kind, (int) SELL_KIND_LDG, (int) SELL_KIND_TMA, (int) SELL_KIND_LDGV2, (int) SELL_KIND_LDGV3, op);
+            "%d (LDG), %d (TMA), %d (LDG_V2), %d (TMA2D) and %d (LDG3); using cuSPARSE for %s.\n",
+            var, kind, (int) SELL_KIND_LDG, (int) SELL_KIND_TMA, (int) SELL_KIND_LDGV2, (int) SELL_KIND_TMA2D,
+            (int) SELL_KIND_LDGV3, op);
     }
     return false;
 }
@@ -3698,17 +3719,21 @@ void mv_sell(DIR d, const SparseMatrix& A, double alpha, double beta, double* x,
     const void* offsets = A.sellDev.aSliceOffsets;
     const void* columns = A.sellDev.aColumns;
     const double* values = A.sellAPermValues;
+    // TMA2D only; see MvSellCfg.
+    slice_ptr_t last_nnz = A.sellALocalNumberOfNonzeros;
     if (d == Forward)
     {
         offsets = A.sellDev.lSliceOffsets;
         columns = A.sellDev.lColumns;
         values = A.sellLPermValues;
+        last_nnz = A.sellLLocalNumberOfNonzeros;
     }
     else if (d == Backward)
     {
         offsets = A.sellDev.uSliceOffsets;
         columns = A.sellDev.uColumns;
         values = A.sellUPermValues;
+        last_nnz = A.sellULocalNumberOfNonzeros;
     }
 
     bool launched = false;
@@ -3720,6 +3745,9 @@ void mv_sell(DIR d, const SparseMatrix& A, double alpha, double beta, double* x,
             const idx32_t* col = static_cast<const idx32_t*>(columns);
             if (g_config.MV_KIND == SELL_KIND_TMA)
                 launched = MvTmaSellCfg<OffsetT>(A, alpha, beta, x, y, off, col, values, stream,
+                    g_config.MV_BLOCK_SIZE, g_config.MV_UNROLL, g_config.MV_W);
+            else if (g_config.MV_KIND == SELL_KIND_TMA2D)
+                launched = MvTma2dSellCfg<OffsetT>(A, alpha, beta, x, y, off, col, values, last_nnz, stream,
                     g_config.MV_BLOCK_SIZE, g_config.MV_UNROLL, g_config.MV_W);
             else if (g_config.MV_KIND == SELL_KIND_LDGV2)
                 launched = MvLdgV2SellCfg<OffsetT>(A, alpha, beta, x, y, off, col, values, stream,
@@ -3772,11 +3800,14 @@ void sv_sell(DIR d, const SparseMatrix& A, double* rv, double* xv)
     const void* offsets = A.sellDev.uSliceOffsets;
     const void* columns = A.sellDev.uColumns;
     const double* values = A.sellUPermValues;
+    // TMA2D only; see MvSellCfg.
+    slice_ptr_t last_nnz = A.sellULocalNumberOfNonzeros;
     if (d == Forward)
     {
         offsets = A.sellDev.lSliceOffsets;
         columns = A.sellDev.lColumns;
         values = A.sellLPermValues;
+        last_nnz = A.sellLLocalNumberOfNonzeros;
     }
 
     bool launched = false;
@@ -3788,6 +3819,9 @@ void sv_sell(DIR d, const SparseMatrix& A, double* rv, double* xv)
             const idx32_t* col = static_cast<const idx32_t*>(columns);
             if (g_config.SV_KIND == SELL_KIND_TMA)
                 launched = SpsvTmaSellCfg<OffsetT>(d == Forward, A, rv, xv, off, col, values, stream,
+                    g_config.SV_BLOCK_SIZE, g_config.SV_UNROLL, g_config.SV_W);
+            else if (g_config.SV_KIND == SELL_KIND_TMA2D)
+                launched = SpsvTma2dSellCfg<OffsetT>(d == Forward, A, rv, xv, off, col, values, last_nnz, stream,
                     g_config.SV_BLOCK_SIZE, g_config.SV_UNROLL, g_config.SV_W);
             else if (g_config.SV_KIND == SELL_KIND_LDGV2)
                 launched = SpsvLdgV2SellCfg<OffsetT>(d == Forward, A, rv, xv, off, col, values, stream,

@@ -115,7 +115,7 @@ enum DIR
   The project-wide Sliced-ELL kernel family numbering, selected per operator by
   HPCG_EXPLICIT_MV_KIND / HPCG_EXPLICIT_SV_KIND. The numbering is fixed so that
   a family keeps the same number as it lands; this build implements LDG, TMA,
-  LDG_V2 and LDG3, and refuses the rest rather than serving a substitute.
+  LDG_V2, TMA2D and LDG3, and refuses the rest rather than serving a substitute.
 */
 enum SellKernelKind
 {
@@ -231,7 +231,7 @@ void sv_sell(DIR d, const SparseMatrix& A, double* rv, double* xv);
 
 /*
   One fully specified Sliced-ELL configuration: the family plus every launch
-  knob any of the four families reads. This is both what the autotuner searches
+  knob any of the five families reads. This is both what the autotuner searches
   over and what a per-level choice stores, so a configuration that was timed and
   a configuration that is run are the same object rather than two encodings of
   one.
@@ -244,10 +244,11 @@ void sv_sell(DIR d, const SparseMatrix& A, double* rv, double* xv);
   Which fields a family reads:
     LDG     blk, unroll
     TMA     blk, unroll, w (rows per thread, its rpt)
+    TMA2D   blk, unroll, w -- the same three, read the same way
     LDG_V2  blk, unroll, w, and parts for the SpMV
     LDG3    all of them, parts for the SpMV only
   A family ignores the rest rather than refusing them, so one struct serves all
-  four and the unread fields keep whatever the search left there.
+  five and the unread fields keep whatever the search left there.
 */
 struct SellConfig
 {
@@ -316,7 +317,7 @@ float TimeMvConfig(const SparseMatrix& A, double* x, double* y, const SellConfig
 float TimeMvConfigDir(const SparseMatrix& A, double* x, double* y, const SellConfig& c, int iters, DIR d);
 
 /*
-  Sweep the four families over the whole multigrid hierarchy and install a
+  Sweep the five families over the whole multigrid hierarchy and install a
   per-level choice for each operator. Returns immediately unless HPCG_AUTOTUNE
   is set to a nonzero value. Defined in autotune.cpp.
 */
@@ -378,5 +379,36 @@ bool MvTmaSellCfg(const SparseMatrix& A, double alpha, double beta, const double
 template <class OffsetT>
 bool SpsvTmaSellCfg(bool forward, const SparseMatrix& A, const double* rv, double* xv, const OffsetT* slice_offsets,
     const idx32_t* columns, const double* values, cudaStream_t stream, int blk, int unroll, int rpt);
+
+/*
+  TMA2D launchers, defined in mv-tma-2d.cu / spsv-tma-2d.cu and instantiated
+  there for both slice-offset widths with 32-bit columns. `rpt` is rows per
+  thread, as it is for TMA, and it additionally sets the extent of the tensor
+  box along the stored-entry axis.
+
+  `last_nnz` is the padded nonzero count of the triangle being addressed --
+  A.sellALocalNumberOfNonzeros, sellLLocalNumberOfNonzeros or
+  sellULocalNumberOfNonzeros, by direction. TMA takes no such parameter: it
+  computes each transfer's address per CTA, where this family describes the
+  whole array to the driver once as a two-dimensional tensor, and the global
+  dimensions of that description need the array's extent.
+
+  Both return false when the requested combination, or the launch shape it
+  implies for this matrix, is not one the family can serve; nothing is launched
+  in that case. On top of TMA's refusals -- a row block that does not fit inside
+  one slice, a shared-memory footprint above the device's opt-in maximum, and a
+  device below compute capability 9.0 -- this family also refuses a padded
+  nonzero count that is not a whole number of slices, or one whose tile count
+  exceeds the int32 range a TMA coordinate has.
+*/
+template <class OffsetT>
+bool MvTma2dSellCfg(const SparseMatrix& A, double alpha, double beta, const double* x, double* y,
+    const OffsetT* slice_offsets, const idx32_t* columns, const double* values, slice_ptr_t last_nnz,
+    cudaStream_t stream, int blk, int unroll, int rpt);
+
+template <class OffsetT>
+bool SpsvTma2dSellCfg(bool forward, const SparseMatrix& A, const double* rv, double* xv, const OffsetT* slice_offsets,
+    const idx32_t* columns, const double* values, slice_ptr_t last_nnz, cudaStream_t stream, int blk, int unroll,
+    int rpt);
 #endif
 #endif

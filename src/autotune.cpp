@@ -51,17 +51,23 @@ constexpr float kInf = 1e30f;
   The families this build contains, and nothing else.
 
   SellKernelKind numbers six families so that a family keeps its number as it
-  lands, but only four are implemented here: TMA2D (3) and TMA_EX (5) have no
-  kernels in this tree. They are therefore absent from every candidate list and
-  from every column of every table below -- a slot no family can serve should
-  not print that family's name at all -- and MvSellCfg / SvSellCfg refuse their
-  numbers outright, so neither can be reached even by naming it in a pin.
+  lands, but only five are implemented here: TMA_EX (5) has no kernels in this
+  tree. It is therefore absent from every candidate list and from every column of
+  every table below -- a slot no family can serve should not print that family's
+  name at all -- and MvSellCfg / SvSellCfg refuse its number outright, so it
+  cannot be reached even by naming it in a pin.
+
+  Kept in kind order, so that a column's position in a printed row is the
+  family's number. TMA2D is 3 and LDG3 is 4, so TMA2D precedes it here; getting
+  that pair the wrong way round would attribute each family's timings to the
+  other, which reads as a finding rather than as a bug.
 */
-constexpr int kNumFam = 4;
-constexpr int kFamKind[kNumFam] = {SELL_KIND_LDG, SELL_KIND_TMA, SELL_KIND_LDGV2, SELL_KIND_LDGV3};
+constexpr int kNumFam = 5;
+constexpr int kFamKind[kNumFam]
+    = {SELL_KIND_LDG, SELL_KIND_TMA, SELL_KIND_LDGV2, SELL_KIND_TMA2D, SELL_KIND_LDGV3};
 // Spelled as every analysis in this project already spells them; slotlib.py
 // anchors its per-slot regexes on exactly these names.
-const char* const kFamName[kNumFam] = {"LDG", "TMA", "LDG_V2", "LDG3"};
+const char* const kFamName[kNumFam] = {"LDG", "TMA", "LDG_V2", "TMA2D", "LDG3"};
 
 int FamIdx(int kind)
 {
@@ -256,10 +262,10 @@ struct Ldg3Split
 
     /*
       When another family takes a slot, two questions are tangled: is its launch
-      shape better, or is its memory path better? LDG3 and TMA read
-      blk/unroll/rows-per-thread the same way, and both advance 2*UNROLL k-steps
-      per iteration, so a shape transfers between them unchanged. Timing each
-      family at both shapes separates the two.
+      shape better, or is its memory path better? LDG3, TMA and TMA2D read
+      blk/unroll/rows-per-thread the same way, and all three advance 2*UNROLL
+      k-steps per iteration, so a shape transfers between them unchanged. Timing
+      each family at both shapes separates the two.
 
       What this cannot show: the sweep already minimises over LDG3, so LDG3 at
       the rival's shape is never faster than LDG3's own pick, and a near-tie
@@ -301,9 +307,9 @@ struct Ldg3Split
   answers it where two runs answer it against different GPU clocks.
 
   Naming a family this build does not contain is an error worth saying out loud
-  rather than an empty search: the two numbers that do that, 3 and 5, are real
-  families in the tree this was ported from, so asking for one is a reasonable
-  mistake with a misleading outcome.
+  rather than an empty search: the one number that does that, 5, is a real family
+  in the tree this was ported from, so asking for it is a reasonable mistake with
+  a misleading outcome.
 */
 struct KindFilter
 {
@@ -349,8 +355,8 @@ KindFilter ParseKindFilter(const char* name, int rank)
             if (rank == 0)
                 fprintf(stderr,
                     "[autotune] %s names family %ld, which this build does not contain; ignoring it. This build has "
-                    "%d (LDG), %d (TMA), %d (LDG_V2) and %d (LDG3).\n",
-                    name, kind, SELL_KIND_LDG, SELL_KIND_TMA, SELL_KIND_LDGV2, SELL_KIND_LDGV3);
+                    "%d (LDG), %d (TMA), %d (LDG_V2), %d (TMA2D) and %d (LDG3).\n",
+                    name, kind, SELL_KIND_LDG, SELL_KIND_TMA, SELL_KIND_LDGV2, SELL_KIND_TMA2D, SELL_KIND_LDGV3);
         }
         else
             f.allow[i] = true;
@@ -425,6 +431,33 @@ void AddTma(std::vector<SellConfig>& v, bool mv)
                 c.blk = mv ? blk_mv[i] : blk_sv[i];
                 c.unroll = u;
                 c.w = mv ? rpt_mv[j] : rpt_sv[j];
+                v.push_back(c);
+            }
+}
+
+/*
+  TMA2D's grid, the same for both operators.
+
+  It is narrower than TMA's on two axes and for one reason each. Rows per thread
+  stops at 4 because a thread's rows are consecutive here and are read and
+  written as one vector access, and four doubles is the widest the hardware has.
+  The block size stops at 256 where TMA's solve reaches 512, because the row
+  block is what one tensor box covers rather than what a colour allows.
+*/
+void AddTma2d(std::vector<SellConfig>& v)
+{
+    const int blk[] = {32, 64, 128, 256};
+    const int un[] = {1, 2, 3, 4, 6, 8};
+    const int rpt[] = {1, 2, 4};
+    for (int b : blk)
+        for (int u : un)
+            for (int r : rpt)
+            {
+                SellConfig c;
+                c.kind = SELL_KIND_TMA2D;
+                c.blk = b;
+                c.unroll = u;
+                c.w = r;
                 v.push_back(c);
             }
 }
@@ -556,6 +589,8 @@ std::vector<SellConfig> BuildCandidates(bool mv, const KindFilter& filter, int c
         AddTma(all, mv);
     if (filter.permits(SELL_KIND_LDGV2))
         AddLdgV2(all, mv);
+    if (filter.permits(SELL_KIND_TMA2D))
+        AddTma2d(all);
     if (filter.permits(SELL_KIND_LDGV3))
         AddLdgV3(all, mv);
     for (int i = 0; i < kNumFam; ++i)
@@ -703,7 +738,7 @@ void AutotuneSymGS(const SparseMatrix& A_top)
     const int rank = A_top.geom ? A_top.geom->rank : 0;
 
     // 10 iterations rather than the 20 this was ported with. The candidate space
-    // is the whole of it -- four families over block size, unroll and W, plus
+    // is the whole of it -- five families over block size, unroll and W, plus
     // LDG3's width, policy and partition axes, which is where the family's
     // advantage lives -- so the space is not the thing to trim; the sample count
     // is. HPCG_AUTOTUNE_ITERS overrides it.
@@ -779,9 +814,9 @@ void AutotuneSymGS(const SparseMatrix& A_top)
     if (!sv_pinned && !svcands.empty())
     {
         if (rank == 0)
-            printf("\n===== HPCG SymGS (SV) autotune: %d LDG + %d TMA + %d LDG_V2 + %d LDG3 configs/level, "
-                   "iters=%d =====\n",
-                n_sv[0], n_sv[1], n_sv[2], n_sv[3], iters);
+            printf("\n===== HPCG SymGS (SV) autotune: %d LDG + %d TMA + %d LDG_V2 + %d TMA2D + %d LDG3 "
+                   "configs/level, iters=%d =====\n",
+                n_sv[0], n_sv[1], n_sv[2], n_sv[3], n_sv[4], iters);
 
         for (const SparseMatrix* m = &A_top; m != NULL; m = m->Ac)
         {
@@ -795,9 +830,9 @@ void AutotuneSymGS(const SparseMatrix& A_top)
     if (!mv_pinned && !mvcands.empty())
     {
         if (rank == 0)
-            printf("\n===== HPCG SpMV (MV) autotune: %d LDG + %d TMA + %d LDG_V2 + %d LDG3 configs/level, "
-                   "iters=%d =====\n",
-                n_mv[0], n_mv[1], n_mv[2], n_mv[3], iters);
+            printf("\n===== HPCG SpMV (MV) autotune: %d LDG + %d TMA + %d LDG_V2 + %d TMA2D + %d LDG3 "
+                   "configs/level, iters=%d =====\n",
+                n_mv[0], n_mv[1], n_mv[2], n_mv[3], n_mv[4], iters);
 
         for (const SparseMatrix* m = &A_top; m != NULL; m = m->Ac)
         {
