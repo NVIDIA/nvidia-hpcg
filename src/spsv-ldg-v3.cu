@@ -164,7 +164,12 @@ __device__ __forceinline__ void LoadValsV3(const double* __restrict__ p, double 
 // Clamping k here is what lets the caller's loop overshoot the end of the row
 // without a branch. A clamped slot gets column -1, which ConsumeBlock turns into
 // a zero contribution without touching x.
-template <int UNROLL, int W, bool WIDE, bool CS>
+// OffsetT is here only to width the stripe offset below. The rest of the
+// function does not care, but a hardcoded size_t made every k step compute a
+// 64-bit address even when the slice offsets are 32-bit and the whole stripe
+// is bounded by slice_size * HPCG_MAX_ROW_LEN -- see FlatOffsetT, which the
+// caller already uses for the row base and which this had not followed.
+template <class OffsetT, int UNROLL, int W, bool WIDE, bool CS>
 __device__ __forceinline__ void LoadBlockV3(int kb, int max_row_len, local_int_t slice_size,
     const idx32_t* __restrict__ cp, const double* __restrict__ vp, int (&cols)[UNROLL][W], double (&vals)[UNROLL][W])
 {
@@ -174,7 +179,7 @@ __device__ __forceinline__ void LoadBlockV3(int kb, int max_row_len, local_int_t
         const int k = kb + ki;
         if (k < max_row_len)
         {
-            const size_t off = (size_t) k * slice_size;
+            const FlatOffsetT<OffsetT> off = (FlatOffsetT<OffsetT>) k * slice_size;
             LoadColsV3<W, WIDE, CS>(&cp[off], cols[ki]);
             LoadValsV3<W, WIDE, CS>(&vp[off], vals[ki]);
         }
@@ -196,9 +201,13 @@ __device__ __forceinline__ void LoadBlockV3(int kb, int max_row_len, local_int_t
 // setLUValues_kernel wrote, not a zero. Selecting 0.0 rather than multiplying is
 // what makes them contribute nothing, and it also means a padded lane never
 // loads x at all.
+// x is __restrict__ here, as it is in spsv-ldg-v2.cu and as this kernel had
+// lost: the caller's x carries the qualifier, and dropping it at the parameter
+// throws it away for the whole gather.
 template <int UNROLL, int W>
 __device__ __forceinline__ void ConsumeBlock(
-    double (&sum)[W], const int (&cols)[UNROLL][W], const double (&vals)[UNROLL][W], const double* x)
+    double (&sum)[W], const int (&cols)[UNROLL][W], const double (&vals)[UNROLL][W],
+    const double* __restrict__ x)
 {
 #pragma unroll
     for (int ki = 0; ki < UNROLL; ++ki)
@@ -244,7 +253,7 @@ __global__ __launch_bounds__(BLKDIM) void spsv_sell_ldgv3(local_int_t color_str,
     int cA[UNROLL][W], cB[UNROLL][W];
     double vA[UNROLL][W], vB[UNROLL][W];
 
-    LoadBlockV3<UNROLL, W, WIDE, CS>(0, max_row_len, slice_size, cp, vp, cA, vA);
+    LoadBlockV3<OffsetT, UNROLL, W, WIDE, CS>(0, max_row_len, slice_size, cp, vp, cA, vA);
 
     // rhs and diag read here rather than at their point of use in the epilogue.
     // Down there nothing is left in the thread to overlap them with: every warp
@@ -261,9 +270,10 @@ __global__ __launch_bounds__(BLKDIM) void spsv_sell_ldgv3(local_int_t color_str,
     // which is streamed once per apply; rhs and diag are vectors, reread by
     // every colour launch of the sweep and by every iteration, and at the
     // coarse levels they sit in cache. Tying them to CS marked them evict-first
-    // on exactly the runs where streaming the matrix is right, which is where
-    // LDG_V2 -- kStreamMatrix true, kStreamVector false -- was beating this
-    // kernel at its own shape.
+    // on exactly the runs where streaming the matrix is right, which is the
+    // split spsv-ldg-v2.cu already makes -- kStreamMatrix true, kStreamVector
+    // false. Splitting them here measured as no change on B200, so this is
+    // consistency with that kernel rather than a win of its own.
     double rhs_m[W], diag_m[W];
 #pragma unroll
     for (int w = 0; w < W; ++w)
@@ -283,9 +293,9 @@ __global__ __launch_bounds__(BLKDIM) void spsv_sell_ldgv3(local_int_t color_str,
     // epilogue, because LoadBlockV3 makes running past the row end harmless.
     for (int kb = 0; kb < max_row_len; kb += 2 * UNROLL)
     {
-        LoadBlockV3<UNROLL, W, WIDE, CS>(kb + UNROLL, max_row_len, slice_size, cp, vp, cB, vB);
+        LoadBlockV3<OffsetT, UNROLL, W, WIDE, CS>(kb + UNROLL, max_row_len, slice_size, cp, vp, cB, vB);
         ConsumeBlock<UNROLL, W>(sum, cA, vA, x);
-        LoadBlockV3<UNROLL, W, WIDE, CS>(kb + 2 * UNROLL, max_row_len, slice_size, cp, vp, cA, vA);
+        LoadBlockV3<OffsetT, UNROLL, W, WIDE, CS>(kb + 2 * UNROLL, max_row_len, slice_size, cp, vp, cA, vA);
         ConsumeBlock<UNROLL, W>(sum, cB, vB, x);
     }
 
