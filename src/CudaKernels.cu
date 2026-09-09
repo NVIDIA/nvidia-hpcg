@@ -2987,6 +2987,7 @@ void InitKernelConfig()
     g_config.SV_WIDE = 0;
     g_config.MV_WIDE = 0;
     g_config.SV_CACHED = 0;
+    g_config.SV_STRIDED = 0;
     g_config.MV_CACHED = 0;
     // 2 to match the tree this came from, so a run that sets nothing measures
     // what it measures.
@@ -3012,6 +3013,9 @@ void InitKernelConfig()
         g_config.MV_WIDE = std::atoi(env);
     if (const char* env = std::getenv("SV_CACHED"))
         g_config.SV_CACHED = std::atoi(env);
+
+    if (const char* env = std::getenv("SV_STRIDED"))
+        g_config.SV_STRIDED = std::atoi(env);
     if (const char* env = std::getenv("MV_CACHED"))
         g_config.MV_CACHED = std::atoi(env);
     // Only 2 and 4 exist, and a value outside them would otherwise select the
@@ -3649,7 +3653,8 @@ bool SvSellCfg(DIR d, const SparseMatrix& A, double* rv, double* xv, const SellC
                     d == Forward, A, rv, xv, off, col, values, stream, c.blk, c.unroll, c.w);
             else if (c.kind == SELL_KIND_LDGV3)
                 launched = SpsvLdgV3SellCfg<OffsetT>(
-                    d == Forward, A, rv, xv, off, col, values, stream, c.blk, c.unroll, c.w, c.wide, c.cached);
+                    d == Forward, A, rv, xv, off, col, values, stream, c.blk, c.unroll, c.w, c.wide, c.cached,
+                    c.strided);
             else if (c.kind == SELL_KIND_LDG)
                 launched = svSellDispatch<OffsetT>(
                     c.blk, c.unroll, d, A, rv, xv, color_size, rows, off, col, values);
@@ -4041,7 +4046,7 @@ void sv_sell(DIR d, const SparseMatrix& A, double* rv, double* xv)
             else if (g_config.SV_KIND == SELL_KIND_LDGV3)
                 launched = SpsvLdgV3SellCfg<OffsetT>(d == Forward, A, rv, xv, off, col, values, stream,
                     g_config.SV_BLOCK_SIZE, g_config.SV_UNROLL, g_config.SV_W, g_config.SV_WIDE != 0,
-                    g_config.SV_CACHED != 0);
+                    g_config.SV_CACHED != 0, g_config.SV_STRIDED != 0);
             else
                 launched = svSellDispatch<OffsetT>(
                     g_config.SV_BLOCK_SIZE, g_config.SV_UNROLL, d, A, rv, xv, color_size, rows, off, col, values);

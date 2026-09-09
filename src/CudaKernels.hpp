@@ -195,6 +195,7 @@ struct KernelConfig
     // wins depends on whether the level's matrix is small enough to survive in
     // L2 between calls, so it is a knob rather than a constant.
     int SV_CACHED;
+    int SV_STRIDED;
     int MV_CACHED;
     // Doubles each thread moves in the four bandwidth-bound vector kernels --
     // spmvDiag, axpby, spFma and WAXPBY -- as 2 or 4, nothing else. These are
@@ -275,6 +276,10 @@ struct SellConfig
     // LDG3 only: keep the matrix stream in cache instead of streaming it
     // evict-first, which is what LDG and LDG_V2 do.
     bool cached = false;
+    // LDG3 SpSV only: give a thread rows BLKDIM apart rather than adjacent, as
+    // TMA does. Trades the wide access for a gather that spans 32 rows per
+    // instruction instead of 32*W. Refused below W of 4, and with wide.
+    bool strided = false;
     // LDG_V2 / LDG3 SpMV only: equal row partitions across blockIdx.x. 1 is the
     // flat 1D grid. Defaults to 1 rather than 0 because both launchers refuse
     // anything below 1, so a configuration built by hand still launches.
@@ -367,7 +372,7 @@ bool MvLdgV3SellCfg(const SparseMatrix& A, double alpha, double beta, const doub
 template <class OffsetT>
 bool SpsvLdgV3SellCfg(bool forward, const SparseMatrix& A, const double* rv, double* xv, const OffsetT* slice_offsets,
     const idx32_t* columns, const double* values, cudaStream_t stream, int blk, int unroll, int w, bool wide,
-    bool cached);
+    bool cached, bool strided);
 
 /*
   TMA launchers, defined in mv-tma.cu / spsv-tma.cu and instantiated there for

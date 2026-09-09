@@ -79,7 +79,8 @@ int FamIdx(int kind)
 
 /*
   The config tag: "blk/unroll" for LDG, which has no rows-per-thread, and
-  "blk/unroll/W" for the rest, with "w" for wide, "c" for cached and "pN" for
+  "blk/unroll/W" for the rest, with "w" for wide, "c" for cached, "s" for the
+  strided row mapping and "pN" for
   the SpMV partition count appended to W.
 
   The format is not free: hpcg-lab/bin/slotlib.py parses every autotune log in
@@ -101,6 +102,8 @@ void FormatCfg(char* buf, size_t n, const SellConfig& c, bool with_parts)
         tag[t++] = 'w';
     if (c.cached)
         tag[t++] = 'c';
+    if (c.strided)
+        tag[t++] = 's';
     tag[t] = '\0';
     // Partitions are an SpMV launch shape; the triangular solves have no
     // counterpart, so naming one there would print a knob that was never read.
@@ -236,7 +239,8 @@ struct Ldg3Split
             const Timed* other = NULL;
             for (const Timed& q : all)
                 if (q.c.kind == SELL_KIND_LDGV3 && q.c.blk == bc.blk && q.c.unroll == bc.unroll && q.c.w == bc.w
-                    && q.c.wide == bc.wide && q.c.parts == bc.parts && q.c.cached == !bc.cached)
+                    && q.c.wide == bc.wide && q.c.parts == bc.parts && q.c.strided == bc.strided
+                    && q.c.cached == !bc.cached)
                 {
                     other = &q;
                     break;
@@ -571,19 +575,32 @@ void AddLdgV3(std::vector<SellConfig>& v, bool mv)
     const int deep_u1[] = {5, 6, 7, 8, 10, 14};
     const int deep_u2[] = {5, 6, 7, 8};
 
-    // (w, wide) pairs, each swept over both cache policies.
+    // (w, wide, strided) triples, each swept over both cache policies.
+    //
+    // The strided row mapping is SpSV only and offered at W of 4 and 8. It gives
+    // up the wide access -- a thread's rows are no longer adjacent -- to gather
+    // x across 32 rows per instruction instead of 32*W. Below W of 4 that span
+    // is small enough that blocked wins outright, so sweeping it there would
+    // spend slots rediscovering that per level. On Rubin at 512x512x288 this is
+    // the only reason TMA takes L0 SymGS: at 32/2/8 it is 4.3572 against this
+    // kernel's blocked 7.2873, while at 64/4/2 blocked is 4.5262 against TMA's
+    // 4.7452. Neither mapping dominates, which is why both are searched.
     struct Shape
     {
         int w;
         bool wide;
+        bool strided;
     };
     std::vector<Shape> shapes;
     for (int ww : {1, 2, 4, 8})
-        shapes.push_back(Shape{ww, false});
+        shapes.push_back(Shape{ww, false, false});
     for (int ww : {4, 8})
-        shapes.push_back(Shape{ww, true});
+        shapes.push_back(Shape{ww, true, false});
+    if (!mv)
+        for (int ww : {4, 8})
+            shapes.push_back(Shape{ww, false, true});
 
-    auto emit = [&](int b, int u, int ww, bool wide)
+    auto emit = [&](int b, int u, int ww, bool wide, bool strided)
     {
         for (bool cached : {false, true})
         {
@@ -594,6 +611,7 @@ void AddLdgV3(std::vector<SellConfig>& v, bool mv)
             c.w = ww;
             c.wide = wide;
             c.cached = cached;
+            c.strided = strided;
             if (!mv)
             {
                 v.push_back(c);
@@ -611,11 +629,11 @@ void AddLdgV3(std::vector<SellConfig>& v, bool mv)
     {
         for (int u : un)
             for (const Shape& s : shapes)
-                emit(b, u, s.w, s.wide);
+                emit(b, u, s.w, s.wide, s.strided);
         for (int u : deep_u1)
-            emit(b, u, 1, false);
+            emit(b, u, 1, false, false);
         for (int u : deep_u2)
-            emit(b, u, 2, false);
+            emit(b, u, 2, false, false);
     }
 }
 
