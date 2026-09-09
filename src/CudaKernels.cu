@@ -3714,10 +3714,20 @@ float TimeMvConfigDir(const SparseMatrix& A, double* x, double* y, const SellCon
 float TimeSvConfig(const SparseMatrix& A, double* rv, double* xv, const SellConfig& c, int iters)
 {
     // Both directions are probed, not just the forward one. A solve runs both,
-    // and LDG3's wide path checks the base pointers of the triangle it is given
-    // -- L and U are different allocations -- so a configuration can be accepted
-    // forward and refused backward. Timing that pair would have measured one
-    // direction and reported a whole sweep.
+    // and LDG3's wide path requires its pointers aligned, so a configuration can
+    // be accepted forward and refused backward. Timing that pair would have
+    // measured one direction and reported a whole sweep.
+    //
+    // It is the columns that differ, not the values. Under
+    // Use_Hpcg_Mem_Reduction, which main.cpp sets unconditionally, L and U are
+    // one values allocation -- the matrix is symmetric, so the two triangles
+    // hold the same numbers and are stored once -- while uColumns can be a view
+    // offset into the same buffer as lColumns and need not share its alignment.
+    //
+    // The shared values array is also why the streaming cache policy is a
+    // stronger claim than it looks for SymGS: .cs says this data will not be
+    // read again, and here the backward sweep re-reads every byte the forward
+    // sweep read, through a transposed index mapping.
     if (!SvSellCfg(Forward, A, rv, xv, c) || !SvSellCfg(Backward, A, rv, xv, c))
         return TimeFailed();
     if (cudaGetLastError() != cudaSuccess || cudaStreamSynchronize(stream) != cudaSuccess)

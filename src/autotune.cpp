@@ -214,6 +214,45 @@ struct Ldg3Split
         }
         printf("\n");
 
+        /*
+          The same comparison at one launch shape, because the line above does
+          not make it. Each side of it is the best config under that policy, and
+          those need not be the same kernel: at level 0 cached won with 64/2/4
+          wide against streaming's 64/6/2, so the margin there mixes the cache
+          hint with a different gather width and unroll depth, and attributes
+          the sum to the hint.
+
+          Holding the shape fixed and flipping only the policy is the
+          measurement that answers whether the hint pays. Worth having because
+          the answer is not obvious for SymGS: L and U are one values
+          allocation, so the backward sweep re-reads every byte the forward
+          sweep read, and .cs tells the cache exactly the opposite.
+        */
+        const bool cbest = pol[1] < pol[0];
+        const SellConfig& bc = cbest ? polc[1] : polc[0];
+        const float bt = cbest ? pol[1] : pol[0];
+        if (bt < kInf)
+        {
+            const Timed* other = NULL;
+            for (const Timed& q : all)
+                if (q.c.kind == SELL_KIND_LDGV3 && q.c.blk == bc.blk && q.c.unroll == bc.unroll && q.c.w == bc.w
+                    && q.c.wide == bc.wide && q.c.parts == bc.parts && q.c.cached == !bc.cached)
+                {
+                    other = &q;
+                    break;
+                }
+            if (other != NULL)
+            {
+                char cfg[32];
+                FormatCfg(cfg, sizeof cfg, bc, with_part);
+                const float st = bc.cached ? other->t : bt;
+                const float ct = bc.cached ? bt : other->t;
+                printf("       LDG3 at %-14s stream %.4f  cached %.4f  (%s by %.2f%%)\n", cfg, st, ct,
+                    (ct < st) ? "cached" : "stream",
+                    100.0 * ((ct < st) ? (st - ct) / st : (ct - st) / ct));
+            }
+        }
+
         const float v3 = pol[0] < pol[1] ? pol[0] : pol[1];
         if (v3 < kInf)
         {
