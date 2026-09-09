@@ -63,6 +63,12 @@
 namespace
 {
 
+// The matrix policy is the CS template parameter, swept per level. The vectors
+// have their own, and it is not swept: rhs, diag and x are reread by every
+// colour launch of a sweep and by every iteration, where the matrix is streamed
+// once per apply. Same split, and the same value, as spsv-ldg-v2.cu.
+constexpr bool kStreamVector = false;
+
 // WIDE is the family's second variant rather than a replacement: with it off,
 // the loads are exactly what measured 2262.5 GFLOP/s, and with it on they are as
 // wide as the hardware allows. Which is better is not obvious and is left to the
@@ -251,20 +257,21 @@ __global__ __launch_bounds__(BLKDIM) void spsv_sell_ldgv3(local_int_t color_str,
     // whether or not the row is live, so the guard picks the value rather than
     // the load: 1.0 for a dead lane's diag, since it is still divided by.
     //
-    // The diagonal follows the same policy as the matrix it belongs to. Each
-    // colour touches a disjoint slice of it, so under CS it is read once and
-    // dropped; under the cached policy the whole vector is small enough to be
-    // worth keeping across the colour launches of one sweep. LoadScalarRo is
-    // ldgload's read-only-once-per-call scalar load -- the same helper LDG_V2
-    // uses for rhs/diag in spsv-ldg-v2.cu, for the identical reason.
+    // Vector policy, not the matrix's. CS is a statement about the matrix,
+    // which is streamed once per apply; rhs and diag are vectors, reread by
+    // every colour launch of the sweep and by every iteration, and at the
+    // coarse levels they sit in cache. Tying them to CS marked them evict-first
+    // on exactly the runs where streaming the matrix is right, which is where
+    // LDG_V2 -- kStreamMatrix true, kStreamVector false -- was beating this
+    // kernel at its own shape.
     double rhs_m[W], diag_m[W];
 #pragma unroll
     for (int w = 0; w < W; ++w)
     {
         const local_int_t r = base_row + w;
         const bool live = r < color_end;
-        rhs_m[w] = live ? rhs[r] : 0.0;
-        diag_m[w] = live ? ldgload::LoadScalarRo<CS>(&diag[r]) : 1.0;
+        rhs_m[w] = live ? ldgload::LoadScalarRo<kStreamVector>(&rhs[r]) : 0.0;
+        diag_m[w] = live ? ldgload::LoadScalarRo<kStreamVector>(&diag[r]) : 1.0;
     }
 
     double sum[W];
