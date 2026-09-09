@@ -621,7 +621,7 @@ struct SlotResult
 */
 template <class TimeFn>
 SlotResult SweepSlot(const char* tag, const SparseMatrix& m, const std::vector<SellConfig>& cands, bool with_parts,
-    double bytes, int rank, TimeFn&& timer)
+    double bytes, int rank, int iters, TimeFn&& timer)
 {
     float best[kNumFam];
     SellConfig bestc[kNumFam];
@@ -698,10 +698,65 @@ SlotResult SweepSlot(const char* tag, const SparseMatrix& m, const std::vector<S
         margin);
     if (bytes > 0.0)
         printf(" BW=%.0f", bytes / best[win] / 1.0e6);
+    // Per level now, so a row can be read for how well its margin is resolved:
+    // a +0.6% win at 3 iterations and the same margin at 32 are not the same
+    // claim. Appended rather than inserted, because slotlib.py matches a slot
+    // on the front of the line.
+    printf(" it=%d", iters);
     printf("\n");
     split.print(with_parts, best);
     split.print_geometry(bestc[win], best[win], bestc[FamIdx(SELL_KIND_LDGV3)], best[FamIdx(SELL_KIND_LDGV3)]);
     return out;
+}
+
+/*
+  Iterations for one level, chosen so that every level gets a comparable
+  measurement budget rather than a comparable iteration count.
+
+  A fixed count spends the time where it is least needed. At level 0 a SymGS
+  config takes about 4 ms and three of them settle the answer well clear of the
+  next family. At level 2 a config takes 0.11 ms, every family lands within a
+  couple of percent of every other, and three iterations put the whole decision
+  inside the noise: across two runs of the same tree the level-2 winner changed
+  family, and an unchanged tree's level-2 time moved 8%. The sweep was then
+  choosing between configurations it could not tell apart, and reporting the
+  choice as though it could.
+
+  The budget is whatever the finest level already costs, so that level is timed
+  exactly as before and the coarse ones are brought up to it. Cost per level
+  stays roughly flat instead of falling away with the row count -- which is
+  affordable precisely because the coarse levels are cheap: at level 2 the whole
+  sweep spent under a second where level 0 spent seven.
+
+  Capped, because level 3 is mostly launch latency rather than work, so matching
+  the budget there would ask for hundreds of iterations of a kernel whose cost
+  does not average down with more of them.
+
+  The probe costs one config per level at the base count, and its own time only
+  has to be right to an order of magnitude, so an unrepresentative first
+  candidate cannot do worse than leave a level at the count it used before.
+*/
+template <class TimeFn>
+int SlotIters(const std::vector<SellConfig>& cands, int base, int max_iters, double& budget_ms, TimeFn&& timer)
+{
+    for (const SellConfig& c : cands)
+    {
+        const float t = timer(c, base);
+        if (t <= 0.0f)
+            continue;
+        if (budget_ms <= 0.0)
+        {
+            budget_ms = (double) base * t;
+            return base;
+        }
+        int it = (int) (budget_ms / t + 0.5);
+        if (it < base)
+            it = base;
+        if (it > max_iters)
+            it = max_iters;
+        return it;
+    }
+    return base;
 }
 
 // Bytes of matrix stream one apply of the operator moves, for the BW column: one
@@ -746,6 +801,19 @@ void AutotuneSymGS(const SparseMatrix& A_top)
     if (const char* it = std::getenv("HPCG_AUTOTUNE_ITERS"))
         if (*it)
             iters = std::atoi(it);
+
+    // Ceiling on what SlotIters may raise a coarse level to. 32 rather than the
+    // budget's own answer, which at level 3 runs to the hundreds for a kernel
+    // whose cost is mostly launch latency and does not average down. At 32 a
+    // coarse sweep costs a second or two against level 0's seven, and the
+    // sampling error falls by about three -- enough to resolve the couple of
+    // percent that separates the families there, which 3 could not.
+    int max_iters = 32;
+    if (const char* it = std::getenv("HPCG_AUTOTUNE_MAX_ITERS"))
+        if (*it)
+            max_iters = std::atoi(it);
+    if (max_iters < 1)
+        max_iters = 1;
     if (iters < 1)
         iters = 1;
 
@@ -815,13 +883,16 @@ void AutotuneSymGS(const SparseMatrix& A_top)
     {
         if (rank == 0)
             printf("\n===== HPCG SymGS (SV) autotune: %d LDG + %d TMA + %d LDG_V2 + %d TMA2D + %d LDG3 "
-                   "configs/level, iters=%d =====\n",
-                n_sv[0], n_sv[1], n_sv[2], n_sv[3], n_sv[4], iters);
+                   "configs/level, iters=%d..%d per level =====\n",
+                n_sv[0], n_sv[1], n_sv[2], n_sv[3], n_sv[4], iters, max_iters);
 
+        double budget = 0.0;
         for (const SparseMatrix* m = &A_top; m != NULL; m = m->Ac)
         {
-            const SlotResult r = SweepSlot("", *m, svcands, false, SvBytes(*m), rank,
-                [&](const SellConfig& c) { return TimeSvConfig(*m, rv, xv, c, iters); });
+            const int it = SlotIters(svcands, iters, max_iters, budget,
+                [&](const SellConfig& c, int n) { return TimeSvConfig(*m, rv, xv, c, n); });
+            const SlotResult r = SweepSlot("", *m, svcands, false, SvBytes(*m), rank, it,
+                [&](const SellConfig& c) { return TimeSvConfig(*m, rv, xv, c, it); });
             if (r.feasible)
                 SetSvChoice(m->level, r.win);
         }
@@ -831,13 +902,16 @@ void AutotuneSymGS(const SparseMatrix& A_top)
     {
         if (rank == 0)
             printf("\n===== HPCG SpMV (MV) autotune: %d LDG + %d TMA + %d LDG_V2 + %d TMA2D + %d LDG3 "
-                   "configs/level, iters=%d =====\n",
-                n_mv[0], n_mv[1], n_mv[2], n_mv[3], n_mv[4], iters);
+                   "configs/level, iters=%d..%d per level =====\n",
+                n_mv[0], n_mv[1], n_mv[2], n_mv[3], n_mv[4], iters, max_iters);
 
+        double budget = 0.0;
         for (const SparseMatrix* m = &A_top; m != NULL; m = m->Ac)
         {
-            const SlotResult r = SweepSlot("", *m, mvcands, true, MvBytes(*m), rank,
-                [&](const SellConfig& c) { return TimeMvConfig(*m, xv, rv, c, iters); });
+            const int it = SlotIters(mvcands, iters, max_iters, budget,
+                [&](const SellConfig& c, int n) { return TimeMvConfig(*m, xv, rv, c, n); });
+            const SlotResult r = SweepSlot("", *m, mvcands, true, MvBytes(*m), rank, it,
+                [&](const SellConfig& c) { return TimeMvConfig(*m, xv, rv, c, it); });
             if (r.feasible)
                 SetMvChoice(m->level, r.win);
         }
@@ -860,9 +934,14 @@ void AutotuneSymGS(const SparseMatrix& A_top)
             if (rank == 0)
                 printf("\n===== MV on the %s submatrix, diagnostic only, selection unchanged =====\n",
                     (dir == 1) ? "L (SymGS forward, beta=1, accumulates)" : "U (SymGS backward, beta=0, overwrites)");
+            double budget = 0.0;
             for (const SparseMatrix* m = &A_top; m != NULL; m = m->Ac)
-                SweepSlot(dir == 1 ? "MV-L " : "MV-U ", *m, mvcands, true, 0.0, rank,
-                    [&](const SellConfig& c) { return TimeMvConfigDir(*m, xv, rv, c, iters, d); });
+            {
+                const int it = SlotIters(mvcands, iters, max_iters, budget,
+                    [&](const SellConfig& c, int n) { return TimeMvConfigDir(*m, xv, rv, c, n, d); });
+                SweepSlot(dir == 1 ? "MV-L " : "MV-U ", *m, mvcands, true, 0.0, rank, it,
+                    [&](const SellConfig& c) { return TimeMvConfigDir(*m, xv, rv, c, it, d); });
+            }
         }
     }
 
