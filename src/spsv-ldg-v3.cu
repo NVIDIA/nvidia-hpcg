@@ -240,6 +240,33 @@ __global__ __launch_bounds__(BLKDIM) void spsv_sell_ldgv3(local_int_t color_str,
 
     LoadBlockV3<UNROLL, W, WIDE, CS>(0, max_row_len, slice_size, cp, vp, cA, vA);
 
+    // rhs and diag read here rather than at their point of use in the epilogue.
+    // Down there nothing is left in the thread to overlap them with: every warp
+    // arrives at the tail together, both loads miss, and the division cannot
+    // start until diag lands. Read before the loop, that latency is spent
+    // against the k iterations instead, which is what spsv-tma.cu does.
+    //
+    // The cost is 4*W registers held across the loop -- two doubles a row --
+    // competing with the same budget the A/B prefetch draws on. It is charged
+    // whether or not the row is live, so the guard picks the value rather than
+    // the load: 1.0 for a dead lane's diag, since it is still divided by.
+    //
+    // The diagonal follows the same policy as the matrix it belongs to. Each
+    // colour touches a disjoint slice of it, so under CS it is read once and
+    // dropped; under the cached policy the whole vector is small enough to be
+    // worth keeping across the colour launches of one sweep. LoadScalarRo is
+    // ldgload's read-only-once-per-call scalar load -- the same helper LDG_V2
+    // uses for rhs/diag in spsv-ldg-v2.cu, for the identical reason.
+    double rhs_m[W], diag_m[W];
+#pragma unroll
+    for (int w = 0; w < W; ++w)
+    {
+        const local_int_t r = base_row + w;
+        const bool live = r < color_end;
+        rhs_m[w] = live ? rhs[r] : 0.0;
+        diag_m[w] = live ? ldgload::LoadScalarRo<CS>(&diag[r]) : 1.0;
+    }
+
     double sum[W];
 #pragma unroll
     for (int w = 0; w < W; ++w)
@@ -255,18 +282,12 @@ __global__ __launch_bounds__(BLKDIM) void spsv_sell_ldgv3(local_int_t color_str,
         ConsumeBlock<UNROLL, W>(sum, cB, vB, x);
     }
 
-    // The diagonal follows the same policy as the matrix it belongs to. Each
-    // colour touches a disjoint slice of it, so under CS it is read once and
-    // dropped; under the cached policy the whole vector is small enough to be
-    // worth keeping across the colour launches of one sweep. LoadScalarRo is
-    // ldgload's read-only-once-per-call scalar load -- the same helper LDG_V2
-    // uses for rhs/diag in spsv-ldg-v2.cu, for the identical reason.
 #pragma unroll
     for (int w = 0; w < W; ++w)
     {
         const local_int_t r = base_row + w;
         if (r < color_end)
-            x[r] = (alpha * rhs[r] - sum[w]) / ldgload::LoadScalarRo<CS>(&diag[r]);
+            x[r] = (alpha * rhs_m[w] - sum[w]) / diag_m[w];
     }
 }
 
