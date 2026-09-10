@@ -234,6 +234,17 @@ void ExtSpMVCuda(SparseMatrix& A, double alpha, double* x, double* y);
 // Transfer Problem to CPU
 size_t CopyDataToHostCuda(SparseMatrix& A, Vector* b, Vector* x, Vector* xexact);
 enum DIR{Forward = 0, Backward = 1, General = 2};
+
+/*
+  As SetMvChoice, but for one triangle of the operator rather than the whole of
+  it. The L and U multiplies inside SymGS otherwise run on the configuration
+  chosen by timing full A, which costs 5.0% across the hierarchy on Rubin. Only
+  Forward and Backward are accepted; a level left unset falls back to the
+  full-matrix choice, so this changes nothing unless HPCG_TUNE_DIRS=2 installed
+  something. Declared here rather than beside SetMvChoice because DIR is not
+  in scope that early in this header.
+*/
+void SetMvChoiceDir(int level, DIR d, int kind, int blk, int unroll, int rpt, int parts);
 void sv_sell(DIR d, const SparseMatrix & A, double *rv, double *xv);
 void mv_sell(DIR d, const SparseMatrix & A, double alpha, double beta, double *x, double *y);
 #endif

@@ -481,8 +481,18 @@ void AutotuneSymGS(const SparseMatrix& A_top)
     // family obviously still searches it.
     const char* sw = std::getenv("HPCG_SWEEP_TMAEX");
     const bool sweep_tx = sw && *sw && std::atoi(sw) != 0;
+    /*
+      HPCG_TUNE_DIRS: 0 off, 1 measure and report only, 2 measure and install.
+
+      Kept apart deliberately. Every directional run recorded so far was taken
+      under =1, whose contract is that the selection is untouched; promoting it
+      silently would leave those runs incomparable with future ones while
+      looking identical in the log. =2 is the opt-in that claims the 5%.
+    */
     const char* sd = std::getenv("HPCG_TUNE_DIRS");
-    const bool sweep_dirs = sd && *sd && std::atoi(sd) != 0;
+    const int tune_dirs = sd && *sd ? std::atoi(sd) : 0;
+    const bool sweep_dirs = tune_dirs != 0;
+    const bool select_dirs = tune_dirs >= 2;
     auto drop_tmaex = [](std::vector<Cand>& v, int forced) {
         if (forced == SV_KIND_TMAEX)
             return;
@@ -764,21 +774,26 @@ void AutotuneSymGS(const SparseMatrix& A_top)
         }
     }
 
-    // Diagnostic only, off by default. The MV winner above was chosen by timing
-    // the full matrix A, but that one choice is then used for the L and U
-    // multiplies inside SymGS too -- half the nonzeros each, and L accumulates
-    // where A and U overwrite. Those two run in the MG hot path and are never
-    // measured. This sweeps each family against them and prints what would have
-    // been picked. Nothing here changes the selection, so every arm keeps its
-    // meaning and the extra sweep time is only spent when asked for.
+    // Off by default. The MV winner above was chosen by timing the full matrix
+    // A, but that one choice is then used for the L and U multiplies inside
+    // SymGS too -- half the nonzeros each, and L accumulates where A and U
+    // overwrite. Those two run in the MG hot path and were never measured.
+    //
+    // They also do not want A's shape. On a Rubin uGPU at 512x512x288, A takes
+    // 64/7/2p16 at L0 where L takes 128/4/4wp8 and U 128/4/4wcp8; inheriting
+    // costs 6.3% and 3.8% there, and 5.0% over all eight slots.
+    //
+    // Under =1 this only prints what would have been picked, which is what the
+    // recorded directional runs mean. Under =2 it installs them as well.
     if (sweep_dirs)
     {
         for (int dir = 1; dir <= 2; ++dir)
         {
             const char* tag = (dir == 1) ? "MV-L" : "MV-U";
             if (rank == 0)
-                printf("\n===== MV on the %s submatrix, diagnostic only, selection unchanged =====\n",
-                    (dir == 1) ? "L (SymGS forward, beta=1, accumulates)" : "U (SymGS backward, beta=0, overwrites)");
+                printf("\n===== MV on the %s submatrix, %s =====\n",
+                    (dir == 1) ? "L (SymGS forward, beta=1, accumulates)" : "U (SymGS backward, beta=0, overwrites)",
+                    select_dirs ? "SELECTING: winners installed for this triangle" : "diagnostic only, selection unchanged");
 
             for (const SparseMatrix* m = &A_top; m != nullptr; m = m->Ac)
             {
@@ -803,13 +818,20 @@ void AutotuneSymGS(const SparseMatrix& A_top)
                         bestc[c.kind] = c;
                     }
                 }
-                if (rank != 0)
-                    continue;
-
                 int win = 0;
                 for (int k = 1; k < kNumSvKernelKinds; ++k)
                     if (best[k] < best[win])
                         win = k;
+
+                // Before the rank guard: the choice has to exist on every rank
+                // that launches the kernel, not just the one that prints.
+                if (select_dirs && best[win] < kInf)
+                    SetMvChoiceDir(m->level, (dir == 1) ? Forward : Backward, bestc[win].kind, bestc[win].blk,
+                        bestc[win].unroll, bestc[win].rpt, bestc[win].parts);
+
+                if (rank != 0)
+                    continue;
+
                 if (best[win] >= kInf)
                 {
                     printf("  %s L%d rows=%-9d | no feasible config\n", tag, m->level, (int) m->localNumberOfRows);

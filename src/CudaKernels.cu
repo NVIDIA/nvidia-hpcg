@@ -4407,6 +4407,25 @@ bool MvTmaExSellCfg(const SparseMatrix& A, double alpha, double beta, const doub
 namespace {
 struct MvChoice { bool set; int kind; int blk; int unroll; int rpt; int parts; };
 MvChoice g_mv_choice[kMaxSvLevels] = {};
+
+/*
+    The L and U multiplies inside SymGS, kept apart from the full-matrix choice.
+
+    Each carries half the nonzeros of A, and the shape that wins on A is not the
+    one that wins on either triangle: on a Rubin uGPU at 512x512x288 the full
+    matrix takes 64/7/2p16 at L0 while L takes 128/4/4wp8 and U 128/4/4wcp8, so
+    running them on A's choice costs 6.3% and 3.8% there and 5.0% over all eight
+    slots of the hierarchy.
+
+    Nothing here needs a wider record: rpt already carries the access width and
+    the cache policy in its sign and hundreds digit, which is what LdgV3Wide and
+    LdgV3Cached read, so -104 names the wide cached W=4 shape those winners use.
+
+    Indexed by DIR, so only Forward and Backward are stored; General is the full
+    matrix and already has g_mv_choice. Unset falls back to it, leaving every
+    run that does not sweep the directions exactly as it was.
+*/
+MvChoice g_mv_choice_dir[2][kMaxSvLevels] = {};
 }
 
 void SetMvChoice(int level, int kind, int blk, int unroll, int rpt, int parts)
@@ -4415,13 +4434,34 @@ void SetMvChoice(int level, int kind, int blk, int unroll, int rpt, int parts)
         g_mv_choice[level] = MvChoice{true, kind, blk, unroll, rpt, parts};
 }
 
-static bool GetMvChoice(int level, int& kind, int& blk, int& unroll, int& rpt, int& parts)
+void SetMvChoiceDir(int level, DIR d, int kind, int blk, int unroll, int rpt, int parts)
+{
+    if (level >= 0 && level < kMaxSvLevels && (d == Forward || d == Backward))
+        g_mv_choice_dir[d][level] = MvChoice{true, kind, blk, unroll, rpt, parts};
+}
+
+static bool GetMvChoice(int level, DIR d, int& kind, int& blk, int& unroll, int& rpt, int& parts)
 {
     static const Pin pin = ParsePin("HPCG_PIN_MV");
     static bool announced = false;
     if (ApplyPin(pin, "MV", announced, kind, blk, unroll, rpt))
     {
         g_mv_pinned = true;
+        return true;
+    }
+
+    // A choice made for this triangle specifically outranks the full-matrix
+    // one, which is otherwise what L and U inherit. Only a selecting
+    // directional sweep sets these, so this is a no-op for every other run.
+    if ((d == Forward || d == Backward) && level >= 0 && level < kMaxSvLevels
+        && g_mv_choice_dir[d][level].set)
+    {
+        const MvChoice& c = g_mv_choice_dir[d][level];
+        kind = c.kind;
+        blk = c.blk;
+        unroll = c.unroll;
+        rpt = c.rpt;
+        parts = c.parts;
         return true;
     }
 
@@ -4604,7 +4644,7 @@ void mv_sell(DIR d, const SparseMatrix & A, double alpha, double beta, double *x
 
     {
         int a_kind, a_blk, a_unroll, a_rpt, a_parts;
-        if (GetMvChoice(A.level, a_kind, a_blk, a_unroll, a_rpt, a_parts)) {
+        if (GetMvChoice(A.level, d, a_kind, a_blk, a_unroll, a_rpt, a_parts)) {
             if (MvSellCfg(d, A, alpha, beta, x, y, a_kind, a_blk, a_unroll, a_rpt, a_parts))
                 return;
             if (g_mv_pinned)
