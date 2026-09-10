@@ -676,9 +676,39 @@ struct SlotResult
   for the diagnostic ones; the leading-whitespace-then-tag-then-level shape of
   the printed line is what slotlib.py matches a slot on.
 */
+/*
+  Response-surface dump, off unless HPCG_AUTOTUNE_DUMP names a path.
+
+  The per-level lines this file prints give the best of each family, which is
+  what a tuning run needs to read and exactly the wrong thing for deciding
+  which knobs a shipped heuristic can afford to fix: "128 won" does not say
+  whether 64 lost by 3% or by 0.05%, and only the second permits a constant.
+  So write every configuration's time, refused ones included as -1 so that a
+  gap in the surface is distinguishable from a slow point.
+
+  Rank 0 only, truncated per run.
+*/
+FILE* DumpFile(int rank)
+{
+    static FILE* f = [rank]() -> FILE* {
+        const char* p = std::getenv("HPCG_AUTOTUNE_DUMP");
+        if (!p || !*p || rank != 0)
+            return NULL;
+        FILE* h = fopen(p, "w");
+        if (!h)
+        {
+            fprintf(stderr, "[autotune] cannot write HPCG_AUTOTUNE_DUMP=%s; continuing without the dump\n", p);
+            return NULL;
+        }
+        fprintf(h, "op,level,rows,nnz,colors,slice,fam,blk,unroll,w,wide,cached,strided,parts,iters,ms\n");
+        return h;
+    }();
+    return f;
+}
+
 template <class TimeFn>
-SlotResult SweepSlot(const char* tag, const SparseMatrix& m, const std::vector<SellConfig>& cands, bool with_parts,
-    double bytes, int rank, int iters, TimeFn&& timer)
+SlotResult SweepSlot(const char* op, const char* tag, const SparseMatrix& m, const std::vector<SellConfig>& cands,
+    bool with_parts, double bytes, int rank, int iters, TimeFn&& timer)
 {
     float best[kNumFam];
     SellConfig bestc[kNumFam];
@@ -694,6 +724,14 @@ SlotResult SweepSlot(const char* tag, const SparseMatrix& m, const std::vector<S
     for (const SellConfig& c : cands)
     {
         const float t = timer(c);
+        if (FILE* d = DumpFile(rank))
+        {
+            const int fi = FamIdx(c.kind);
+            fprintf(d, "%s,%d,%d,%lld,%d,%d,%s,%d,%d,%d,%d,%d,%d,%d,%d,%.6f\n", op, m.level,
+                (int) m.localNumberOfRows, (long long) m.localNumberOfNonzeros, m.totalColors, (int) m.slice_size,
+                fi >= 0 ? kFamName[fi] : "?", c.blk, c.unroll, c.w, c.wide ? 1 : 0, c.cached ? 1 : 0,
+                c.strided ? 1 : 0, with_parts ? c.parts : 0, iters, (double) t);
+        }
         if (t < 0.0f)
             continue;
         split.add(c, t);
@@ -893,16 +931,64 @@ void AutotuneSymGS(const SparseMatrix& A_top)
     const std::vector<SellConfig> svcands = BuildCandidates(false, force_sv, n_sv);
     const std::vector<SellConfig> mvcands = BuildCandidates(true, force_mv, n_mv);
 
+    /*
+      Per-level SymGS overrides, named HPCG_FORCE_KIND_SV_L<level>. They exist
+      for the one experiment the per-operator filter cannot express: run LDG3
+      everywhere except the single level where it does not win, and read the
+      end-to-end difference against running it everywhere. That is the question
+      a library port has to answer -- not which kernel wins a level, but what
+      the level is worth -- and it needs two runs that differ in exactly one
+      choice.
+
+          HPCG_FORCE_KIND=4                          LDG3 everywhere
+          HPCG_FORCE_KIND=4 HPCG_FORCE_KIND_SV_L0=1  the same, TMA at SymGS L0
+
+      SpMV is deliberately not given the same knob. Nothing has asked for it,
+      and an unused axis in the search is one more thing to explain.
+    */
+    std::vector<SellConfig> sv_lvl[kMaxSellLevels];
+    bool sv_lvl_set[kMaxSellLevels] = {};
+    for (int l = 0; l < kMaxSellLevels; ++l)
+    {
+        char var[40], op[32];
+        snprintf(var, sizeof var, "HPCG_FORCE_KIND_SV_L%d", l);
+        const KindFilter f = ParseKindFilter(var, rank);
+        if (!f.active)
+            continue;
+        int n[kNumFam];
+        sv_lvl[l] = BuildCandidates(false, f, n);
+        sv_lvl_set[l] = true;
+        if (rank == 0)
+        {
+            snprintf(op, sizeof op, "SymGS level %d", l);
+            PrintFilter(op, f);
+        }
+    }
+    bool sv_lvl_any = false;
+    for (int l = 0; l < kMaxSellLevels; ++l)
+        sv_lvl_any = sv_lvl_any || !sv_lvl[l].empty();
+
     // A pin applies one configuration to every level and outranks anything
     // chosen here, so sweeping under one would spend the time and then discard
     // the answer.
     const bool mv_pinned = std::getenv("HPCG_PIN_MV") != NULL && *std::getenv("HPCG_PIN_MV") != '\0';
     const bool sv_pinned = std::getenv("HPCG_PIN_SV") != NULL && *std::getenv("HPCG_PIN_SV") != '\0';
 
-    const bool sweep_dirs = [] {
+    /*
+      HPCG_TUNE_DIRS: 0 off, 1 measure and report only, 2 measure and install.
+
+      The two are kept apart deliberately. Every directional run recorded so far
+      was taken under =1, whose contract is that the selection is untouched and
+      the arm keeps its meaning; silently promoting it to selecting would make
+      those runs and any future one incomparable while looking identical in the
+      log. =2 is the opt-in that claims the 5%.
+    */
+    const int tune_dirs = [] {
         const char* e = std::getenv("HPCG_TUNE_DIRS");
-        return e && *e && std::atoi(e) != 0;
+        return e && *e ? std::atoi(e) : 0;
     }();
+    const bool sweep_dirs = tune_dirs != 0;
+    const bool select_dirs = tune_dirs >= 2;
 
     if (rank == 0)
     {
@@ -936,7 +1022,7 @@ void AutotuneSymGS(const SparseMatrix& A_top)
     cudaMemset(rv, 0, n * sizeof(double));
     cudaMemset(xv, 0, n * sizeof(double));
 
-    if (!sv_pinned && !svcands.empty())
+    if (!sv_pinned && (!svcands.empty() || sv_lvl_any))
     {
         if (rank == 0)
             printf("\n===== HPCG SymGS (SV) autotune: %d LDG + %d TMA + %d LDG_V2 + %d TMA2D + %d LDG3 "
@@ -946,9 +1032,13 @@ void AutotuneSymGS(const SparseMatrix& A_top)
         double budget = 0.0;
         for (const SparseMatrix* m = &A_top; m != NULL; m = m->Ac)
         {
-            const int it = SlotIters(svcands, iters, max_iters, budget,
+            const bool over = m->level >= 0 && m->level < kMaxSellLevels && sv_lvl_set[m->level];
+            const std::vector<SellConfig>& cands = over ? sv_lvl[m->level] : svcands;
+            if (cands.empty())
+                continue;
+            const int it = SlotIters(cands, iters, max_iters, budget,
                 [&](const SellConfig& c, int n) { return TimeSvConfig(*m, rv, xv, c, n); });
-            const SlotResult r = SweepSlot("", *m, svcands, false, SvBytes(*m), rank, it,
+            const SlotResult r = SweepSlot("SV", "", *m, cands, false, SvBytes(*m), rank, it,
                 [&](const SellConfig& c) { return TimeSvConfig(*m, rv, xv, c, it); });
             if (r.feasible)
                 SetSvChoice(m->level, r.win);
@@ -967,7 +1057,7 @@ void AutotuneSymGS(const SparseMatrix& A_top)
         {
             const int it = SlotIters(mvcands, iters, max_iters, budget,
                 [&](const SellConfig& c, int n) { return TimeMvConfig(*m, xv, rv, c, n); });
-            const SlotResult r = SweepSlot("", *m, mvcands, true, MvBytes(*m), rank, it,
+            const SlotResult r = SweepSlot("MV", "", *m, mvcands, true, MvBytes(*m), rank, it,
                 [&](const SellConfig& c) { return TimeMvConfig(*m, xv, rv, c, it); });
             if (r.feasible)
                 SetMvChoice(m->level, r.win);
@@ -975,13 +1065,17 @@ void AutotuneSymGS(const SparseMatrix& A_top)
     }
 
     /*
-      Diagnostic only, off by default. The MV winner above was chosen by timing
-      the full matrix A, but that one choice is then used for the L and U
-      multiplies inside SymGS too -- half the nonzeros each, and L accumulates
-      where A and U overwrite. Those two run in the MG hot path and are never
-      measured. This sweeps each family against them and prints what would have
-      been picked. Nothing here changes the selection, so every arm keeps its
-      meaning and the extra sweep time is only spent when asked for.
+      Off by default. The MV winner above was chosen by timing the full matrix
+      A, but that one choice is then used for the L and U multiplies inside
+      SymGS too -- half the nonzeros each, and L accumulates where A and U
+      overwrite. Those two run in the MG hot path and were never measured.
+
+      They also do not want A's shape. On a Rubin uGPU at 512x512x288, A takes
+      64/7/2p16 at L0 where L takes 128/4/4wp8 and U 128/4/4wcp8; the
+      inheritance costs 6.3% and 3.8% there, and 5.0% over all eight slots.
+
+      Under =1 this only prints what would have been picked, which is what the
+      recorded directional runs mean. Under =2 it installs them as well.
     */
     if (sweep_dirs && !mvcands.empty())
     {
@@ -989,15 +1083,18 @@ void AutotuneSymGS(const SparseMatrix& A_top)
         {
             const DIR d = (dir == 1) ? Forward : Backward;
             if (rank == 0)
-                printf("\n===== MV on the %s submatrix, diagnostic only, selection unchanged =====\n",
-                    (dir == 1) ? "L (SymGS forward, beta=1, accumulates)" : "U (SymGS backward, beta=0, overwrites)");
+                printf("\n===== MV on the %s submatrix, %s =====\n",
+                    (dir == 1) ? "L (SymGS forward, beta=1, accumulates)" : "U (SymGS backward, beta=0, overwrites)",
+                    select_dirs ? "SELECTING: winners installed for this triangle" : "diagnostic only, selection unchanged");
             double budget = 0.0;
             for (const SparseMatrix* m = &A_top; m != NULL; m = m->Ac)
             {
                 const int it = SlotIters(mvcands, iters, max_iters, budget,
                     [&](const SellConfig& c, int n) { return TimeMvConfigDir(*m, xv, rv, c, n, d); });
-                SweepSlot(dir == 1 ? "MV-L " : "MV-U ", *m, mvcands, true, 0.0, rank, it,
-                    [&](const SellConfig& c) { return TimeMvConfigDir(*m, xv, rv, c, it, d); });
+                const SlotResult r = SweepSlot(dir == 1 ? "MV-L" : "MV-U", dir == 1 ? "MV-L " : "MV-U ", *m, mvcands,
+                    true, 0.0, rank, it, [&](const SellConfig& c) { return TimeMvConfigDir(*m, xv, rv, c, it, d); });
+                if (select_dirs && r.feasible)
+                    SetMvChoiceDir(m->level, d, r.win);
             }
         }
     }

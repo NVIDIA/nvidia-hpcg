@@ -3369,6 +3369,22 @@ LevelChoice g_mv_choice[kMaxSellLevels];
 LevelChoice g_sv_choice[kMaxSellLevels];
 
 /*
+    The L and U multiplies inside SymGS, kept apart from the full-matrix choice.
+
+    Each carries half the nonzeros of A, and the shape that wins on A is not the
+    one that wins on either triangle: on a Rubin uGPU at 512x512x288 the full
+    matrix takes 64/7/2p16 at L0 while L takes 128/4/4wp8 and U takes
+    128/4/4wcp8, and running them on A's choice costs 6.3% and 3.8%. Over all
+    eight slots of the hierarchy it is 5.0%, paid on every smoother call
+    (ComputeSYMGS.cpp:147 and :181).
+
+    Indexed by DIR, which is why only Forward and Backward are stored: General
+    is the full matrix and already has g_mv_choice. Unset falls back to it, so a
+    run that never sweeps the directions behaves exactly as before.
+*/
+LevelChoice g_mv_choice_dir[2][kMaxSellLevels];
+
+/*
     HPCG_PIN_MV / HPCG_PIN_SV name one configuration and apply it to every
     level, taking precedence over the autotuner.
 
@@ -3396,12 +3412,12 @@ Pin ParsePin(const char* name)
     if (!v || !*v)
         return p;
 
-    // wide and cached default off and parts to 1, so the short four-field form
-    // names the same configuration it always did.
-    long field[7] = {0, 0, 0, 0, 0, 0, 1};
+    // wide, cached and strided default off and parts to 1, so the short
+    // four-field form names the same configuration it always did.
+    long field[8] = {0, 0, 0, 0, 0, 0, 1, 0};
     int n = 0;
     const char* s = v;
-    while (*s && n < 7)
+    while (*s && n < 8)
     {
         char* end = NULL;
         const long value = std::strtol(s, &end, 10);
@@ -3417,7 +3433,8 @@ Pin ParsePin(const char* name)
     if (n < 4 || *s != '\0')
     {
         std::fprintf(stderr,
-            "ERROR: %s must be \"kind,blk,unroll,w\" with optional \",wide,cached,parts\", got \"%s\"\n", name, v);
+            "ERROR: %s must be \"kind,blk,unroll,w\" with optional \",wide,cached,parts,strided\", got \"%s\"\n",
+            name, v);
         std::exit(1);
     }
 
@@ -3428,6 +3445,10 @@ Pin ParsePin(const char* name)
     p.cfg.wide = field[4] != 0;
     p.cfg.cached = field[5] != 0;
     p.cfg.parts = (int) field[6];
+    // Eighth, because the strided row mapping arrived after the pin format was
+    // fixed and a pin that cannot name it cannot isolate it -- which is the one
+    // thing pinning exists to do.
+    p.cfg.strided = field[7] != 0;
     p.set = true;
     return p;
 }
@@ -3446,17 +3467,18 @@ void AnnouncePin(const char* what, const SellConfig& c, bool& announced)
     if (announced)
         return;
     announced = true;
-    std::fprintf(stderr, "%s pinned to kind=%d blk=%d unroll=%d w=%d wide=%d cached=%d parts=%d on all levels\n", what,
-        c.kind, c.blk, c.unroll, c.w, (int) c.wide, (int) c.cached, c.parts);
+    std::fprintf(stderr,
+        "%s pinned to kind=%d blk=%d unroll=%d w=%d wide=%d cached=%d parts=%d strided=%d on all levels\n", what,
+        c.kind, c.blk, c.unroll, c.w, (int) c.wide, (int) c.cached, c.parts, (int) c.strided);
 }
 
 void PinRefused(const char* what, int level, const SellConfig& c)
 {
     std::fprintf(stderr,
-        "ERROR: %s was pinned to kind=%d blk=%d unroll=%d w=%d wide=%d cached=%d parts=%d,\n"
+        "ERROR: %s was pinned to kind=%d blk=%d unroll=%d w=%d wide=%d cached=%d parts=%d strided=%d,\n"
         "       but no launcher accepts that configuration at level %d. Falling through\n"
         "       would have measured a different kernel under the pinned name.\n",
-        what, c.kind, c.blk, c.unroll, c.w, (int) c.wide, (int) c.cached, c.parts, level);
+        what, c.kind, c.blk, c.unroll, c.w, (int) c.wide, (int) c.cached, c.parts, (int) c.strided, level);
     std::exit(1);
 }
 
@@ -3502,6 +3524,21 @@ bool GetMvChoiceForLevel(int level, SellConfig& c)
     return true;
 }
 
+void SetMvChoiceDir(int level, DIR d, const SellConfig& c)
+{
+    if (level >= 0 && level < kMaxSellLevels && (d == Forward || d == Backward))
+        g_mv_choice_dir[d][level] = LevelChoice{true, c};
+}
+
+bool GetMvChoiceForLevelDir(int level, DIR d, SellConfig& c)
+{
+    if (level < 0 || level >= kMaxSellLevels || (d != Forward && d != Backward)
+        || !g_mv_choice_dir[d][level].set)
+        return false;
+    c = g_mv_choice_dir[d][level].cfg;
+    return true;
+}
+
 bool GetSvChoiceForLevel(int level, SellConfig& c)
 {
     if (level < 0 || level >= kMaxSellLevels || !g_sv_choice[level].set)
@@ -3510,8 +3547,128 @@ bool GetSvChoiceForLevel(int level, SellConfig& c)
     return true;
 }
 
-static bool GetMvChoice(int level, SellConfig& c)
+/*
+    Pick a configuration from the matrix shape, with no measurement.
+
+    This is what a library ships: the sweep needs the matrix in hand and costs
+    a fifth of a second, and neither is available behind a cuSPARSE entry
+    point. The rules below are read off the Rubin sweeps at 512x512x288 and
+    512^3, restricted to LDG3, which is the family we would carry.
+
+    On the two parameters: rows does all the work and nnz does none. Every HPCG
+    level at both sizes has nnz/rows between 26.5 and 26.9 -- a 1.5% spread
+    across a 900x range of rows -- so a rule keyed on nnz/rows cannot separate
+    levels that want visibly different shapes. nnz is still taken here because
+    for a matrix that is not HPCG's 27-point stencil it is the parameter that
+    bounds the useful unroll depth, and a rule that ignores it would be wrong
+    the first time it saw one.
+
+    What the sweeps support, per operator, best-of-LDG3 against rows:
+
+      SpMV   134.2M 256/7/2p8   75.5M 64/7/2p16, 128/7/2p8   16.8M 256/7/2cp8
+             9.4M 64/7/2cp8   2.1M 64/7/2p4   1.18M 64/7/2p4
+             262K 64/1/4wp4   147K 128/1/2p1, 256/1/2p2
+
+      SymGS  134.2M 64/2/4wc   75.5M 64/2/4wc (3 runs), 64/4/2 (1)
+             16.8M 64/2/2c   9.4M 64/2/2 (3 runs)   2.1M 128/1/4w
+             1.18M 128/4/2, 256/4/2, 128/7/2   262K 256/6/1
+             147K 128/7/1, 256/5/1, 128/4/1, 64/5/1c
+
+    W and UNROLL move together and monotonically in rows, and that is the
+    signal. BLKDIM does not: the same slot picks 64, 128 and 256 across repeats,
+    which reads as a flat direction rather than a choice, so it is fixed at 128
+    here. HPCG_AUTOTUNE_DUMP exists to confirm that reading, and if the surface
+    turns out not to be flat in BLKDIM this is the line to revisit.
+
+    Two slots disagree with the rules and are called out rather than fitted.
+    SymGS at 2.1M wants 128/1/4w where the rule says 128/4/2; that is one
+    observation at 512^3, against three at 1.18M that agree with the rule, and
+    it is a level LDG3 loses to LDG outright. Cached wins at 16.8M SymGS and at
+    9.4M/16.8M SpMV by 0.18% to 1.22%, which is inside the run-to-run spread, so
+    streaming is used throughout except where the margin is large.
+*/
+SellConfig HeuristicSellConfig(bool mv, local_int_t rows, double nnz_per_row)
 {
+    SellConfig c{};
+    c.kind = SELL_KIND_LDGV3;
+    c.blk = 128;
+    c.cached = false;
+    c.wide = false;
+    c.strided = false;
+    c.parts = 1;
+
+    // Two k-steps are in flight per unrolled iteration, so an unroll deeper
+    // than half the row length buys nothing but registers.
+    const int unroll_cap = (int) std::max(1.0, std::ceil(nnz_per_row / 2.0));
+
+    if (mv)
+    {
+        c.w = 2;
+        c.unroll = std::min(rows >= (1 << 20) ? 7 : 1, unroll_cap);
+        c.parts = rows >= (5 << 20) ? 8 : (rows >= (1 << 19) ? 4 : 1);
+    }
+    else if (rows >= (32 << 20))
+    {
+        // Widest tile the register file affords, and the only slot where
+        // caching wins by a margin (3.6% to 4.7%) that survives repeats.
+        c.blk = 64;
+        c.unroll = std::min(2, unroll_cap);
+        c.w = 4;
+        c.wide = true;
+        c.cached = true;
+    }
+    else if (rows >= (4 << 20))
+    {
+        c.blk = 64;
+        c.unroll = std::min(2, unroll_cap);
+        c.w = 2;
+    }
+    else if (rows >= (1 << 19))
+    {
+        c.unroll = std::min(4, unroll_cap);
+        c.w = 2;
+    }
+    else
+    {
+        // Below half a million rows one row per thread is what keeps enough
+        // warps resident to cover the gather latency.
+        c.unroll = std::min(6, unroll_cap);
+        c.w = 1;
+    }
+    return c;
+}
+
+static bool UseHeuristic()
+{
+    static const bool on = getenv("HPCG_HEURISTIC") && atoi(getenv("HPCG_HEURISTIC")) != 0;
+    return on;
+}
+
+static bool HeuristicChoice(bool mv, const SparseMatrix& A, SellConfig& c)
+{
+    if (!UseHeuristic())
+        return false;
+    const local_int_t rows = A.localNumberOfRows;
+    const double nnz_per_row = rows > 0 ? (double) A.localNumberOfNonzeros / (double) rows : 27.0;
+    c = HeuristicSellConfig(mv, rows, nnz_per_row);
+
+    // Say what it picked, once per operator and level. A heuristic that runs
+    // silently is one nobody can check against the sweep it came from.
+    static bool said[2][kMaxSellLevels] = {};
+    const int level = A.level;
+    if (level >= 0 && level < kMaxSellLevels && !said[mv][level] && A.geom && A.geom->rank == 0)
+    {
+        said[mv][level] = true;
+        printf("[heuristic] %s level %d: rows=%d nnz/row=%.1f -> LDG3 %d/%d/%d%s%s p%d\n", mv ? "SpMV " : "SymGS",
+            level, (int) rows, nnz_per_row, c.blk, c.unroll, c.w, c.wide ? "w" : "", c.cached ? "c" : "", c.parts);
+        fflush(stdout);
+    }
+    return true;
+}
+
+static bool GetMvChoice(const SparseMatrix& A, DIR d, SellConfig& c)
+{
+    const int level = A.level;
     static const Pin pin = ParsePin("HPCG_PIN_MV");
     static bool announced = false;
     if (pin.set)
@@ -3521,16 +3678,26 @@ static bool GetMvChoice(int level, SellConfig& c)
         c = pin.cfg;
         return true;
     }
+    // A choice made for this triangle specifically outranks the full-matrix
+    // one, which is otherwise what L and U inherit. Only set by a selecting
+    // directional sweep, so this is a no-op for every other run.
+    if ((d == Forward || d == Backward) && level >= 0 && level < kMaxSellLevels
+        && g_mv_choice_dir[d][level].set)
+    {
+        c = g_mv_choice_dir[d][level].cfg;
+        return true;
+    }
     if (level >= 0 && level < kMaxSellLevels && g_mv_choice[level].set)
     {
         c = g_mv_choice[level].cfg;
         return true;
     }
-    return false;
+    return HeuristicChoice(true, A, c);
 }
 
-static bool GetSvChoice(int level, SellConfig& c)
+static bool GetSvChoice(const SparseMatrix& A, SellConfig& c)
 {
+    const int level = A.level;
     static const Pin pin = ParsePin("HPCG_PIN_SV");
     static bool announced = false;
     if (pin.set)
@@ -3545,7 +3712,7 @@ static bool GetSvChoice(int level, SellConfig& c)
         c = g_sv_choice[level].cfg;
         return true;
     }
-    return false;
+    return HeuristicChoice(false, A, c);
 }
 
 /*
@@ -3895,7 +4062,8 @@ void ReportExplicitKernelUse(const SparseMatrix& A)
            " | Autotune: %s\n"
            " | Index mode: %s\n"
            " | Vector width: %d (spmvDiag, axpby, spFma, WAXPBY)\n",
-        mv, sv, tuned ? "on" : "off (row-count heuristic)", toString(A.index_mode), g_config.VECTOR_WIDTH);
+        mv, sv, tuned ? "on" : (UseHeuristic() ? "off (shape heuristic, see [heuristic] lines)" : "off (row-count heuristic)"),
+        toString(A.index_mode), g_config.VECTOR_WIDTH);
 }
 
 bool UseExplicitSpSV(const SparseMatrix& A)
@@ -3921,7 +4089,7 @@ void mv_sell(DIR d, const SparseMatrix& A, double alpha, double beta, double* x,
     // function runs exactly as it did before per-level selection existed.
     {
         SellConfig chosen;
-        if (GetMvChoice(A.level, chosen))
+        if (GetMvChoice(A, d, chosen))
         {
             if (MvSellCfg(d, A, alpha, beta, x, y, chosen))
                 return;
@@ -4001,7 +4169,7 @@ void sv_sell(DIR d, const SparseMatrix& A, double* rv, double* xv)
     // does nothing and the g_config path below is reached unchanged.
     {
         SellConfig chosen;
-        if (GetSvChoice(A.level, chosen))
+        if (GetSvChoice(A, chosen))
         {
             if (SvSellCfg(d, A, rv, xv, chosen))
                 return;

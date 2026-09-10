@@ -301,6 +301,17 @@ void SetMvChoice(int level, const SellConfig& c);
 void SetSvChoice(int level, const SellConfig& c);
 
 /*
+  As above, but for one triangle of the operator rather than the whole of it.
+  The L and U multiplies inside SymGS otherwise run on the configuration chosen
+  by timing full A, which is worth 5.0% across the hierarchy on Rubin. Only
+  Forward and Backward are accepted; a level left unset falls back to the
+  full-matrix choice, so this changes nothing unless a selecting directional
+  sweep installed something.
+*/
+void SetMvChoiceDir(int level, DIR d, const SellConfig& c);
+bool GetMvChoiceForLevelDir(int level, DIR d, SellConfig& c);
+
+/*
   Read back the stored per-level choice, false if that level has none. These
   read the same arrays mv_sell / sv_sell consult and deliberately ignore any
   pin, so a report written through them says what the dispatch will do rather
