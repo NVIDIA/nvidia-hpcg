@@ -2541,6 +2541,13 @@ __global__ void __launch_bounds__(128) replaceMatrixDiagonal_kernel(
 void ReplaceMatrixDiagonalCuda(SparseMatrix& A, Vector& diagonal)
 {
     const int grid = (A.localNumberOfRows + 128 - 1) / 128;
+#ifdef EXPLICIT_KERNELS
+    // The explicit path never allocates sellDev.aColumns -- A's SELL columns live
+    // in sellAPermColumns at a fixed 32-bit width, so there is no mode to
+    // dispatch on. Reading sellDev here faults on a null pointer.
+    replaceMatrixDiagonal_kernel<local_int_t><<<grid, 128, 0, stream>>>(A.localNumberOfRows, A.slice_size,
+        A.sellAPermColumns, A.sellAPermValues, A.diagonal, diagonal.values_d);
+#else
     dispatchIndexMode(A.index_mode,
         [&](auto /*offTag*/, auto colTag)
         {
@@ -2548,6 +2555,7 @@ void ReplaceMatrixDiagonalCuda(SparseMatrix& A, Vector& diagonal)
             replaceMatrixDiagonal_kernel<ColT><<<grid, 128, 0, stream>>>(A.localNumberOfRows, A.slice_size,
                 static_cast<const ColT*>(A.sellDev.aColumns), A.sellAPermValues, A.diagonal, diagonal.values_d);
         });
+#endif
 }
 
 /*
