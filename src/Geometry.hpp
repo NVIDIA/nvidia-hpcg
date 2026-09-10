@@ -52,12 +52,28 @@ typedef long long local_int_t;
 #endif
 
 /*!
-  Type for GPU Sliced-ELL / CSR-scratch offsets and nonzero counters.
+  Type for GPU Sliced-ELL / CSR-scratch offsets and nonzero counters,
+  shared by cuSPARSE's Sliced-ELL path and the explicit SELL/CSR kernels.
 
   These quantities (flat value-array offsets, cumulative per-row nonzero
   counts, per-slice offsets) can exceed 2^31 for large local problems
   (e.g. 512^3 has ~3.6e9 local nonzeros), so they are always 64-bit,
-  independent of local_int_t. Column/row *indices* stay local_int_t.
+  independent of local_int_t and of INDEX_64.
+  Column/row *indices* stay local_int_t; only offsets/counters widen here.
+
+  This costs the explicit kernels a 64-bit idiv on every slice-offset
+  divmod where a 32-bit one would have sufficed for small problems --
+  see intdiv.hh, which exists to mitigate exactly that cost. It was
+  judged worth paying uniformly rather than risk a silent overflow at
+  problem sizes already in use.
+
+  Note: because these counters are unconditionally 64-bit, a plain
+  32-bit-index build is NOT implicitly limited to small problems -- the
+  nonzero count no longer overflows first, and local_int_t alone allows
+  ~2^31 rows. Any launch-geometry limit (e.g. the gridDim.y cap in
+  mv_sell) must therefore be enforced unconditionally, not only under a
+  wide-index build flag. Selecting 32- vs 64-bit indices for the
+  cuSPARSE/NVPL Sliced-ELL path is a runtime choice (IndexMode / --mi).
 */
 typedef long long slice_ptr_t;
 

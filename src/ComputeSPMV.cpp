@@ -62,6 +62,7 @@
 
   @see ComputeSPMV_ref
 */
+
 int ComputeSPMV(const SparseMatrix& A, Vector& x, Vector& y)
 {
 
@@ -72,12 +73,14 @@ int ComputeSPMV(const SparseMatrix& A, Vector& x, Vector& y)
 #ifndef HPCG_NO_MPI
         PackSendBufferCuda(A, x, false, copy_stream);
 #endif
-
+        #ifdef EXPLICIT_KERNELS
+        mv_sell(General, A, one, zero, x.values_d, y.values_d);
+        #else
         CHECK_CUSPARSE(cusparseDnVecSetValues(A.cusparseOpt.vecX, x.values_d));
         CHECK_CUSPARSE(cusparseDnVecSetValues(A.cusparseOpt.vecY, y.values_d));
         CHECK_CUSPARSE(cusparseSpMV(cusparsehandle, CUSPARSE_OPERATION_NON_TRANSPOSE, &one, A.cusparseOpt.matA,
             A.cusparseOpt.vecX, &zero, A.cusparseOpt.vecY, CUDA_R_64F, CUSPARSE_SPMV_ALG_DEFAULT, A.bufferMvA));
-
+        #endif
 #ifndef HPCG_NO_MPI
         if (A.totalToBeSent > 0)
         {

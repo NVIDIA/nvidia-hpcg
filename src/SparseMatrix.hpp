@@ -40,7 +40,9 @@
 
 #ifdef USE_CUDA
 #include <cuda.h>
+#ifndef EXPLICIT_KERNELS
 #include <cusparse.h>
+#endif
 #endif
 
 #ifdef USE_GRACE
@@ -72,6 +74,7 @@ using GlobalToLocalMap = std::unordered_map<global_int_t, local_int_t>;
 #endif
 
 #ifdef USE_CUDA
+#ifndef EXPLICIT_KERNELS
 struct CUSPARSE_STRUCT
 {
     cusparseDnVecDescr_t vecX;
@@ -83,6 +86,7 @@ struct CUSPARSE_STRUCT
     // CUSPARSE SpSV
     cusparseSpSVDescr_t spsvDescrL, spsvDescrU;
 };
+#endif // !EXPLICIT_KERNELS
 
 /*!
   Width-agnostic device storage for the GPU Sliced-ELL operator arrays.
@@ -191,6 +195,9 @@ struct SparseMatrix_STRUCT
 
     local_int_t totalToBeSent; //!< total number of entries to be sent
     local_int_t slice_size;
+    slice_ptr_t sellALocalNumberOfNonzeros;
+    slice_ptr_t sellLLocalNumberOfNonzeros;
+    slice_ptr_t sellULocalNumberOfNonzeros;
 
 #ifndef HPCG_NO_MPI
     local_int_t numberOfExternalValues; //!< number of entries that are external to this process
@@ -212,12 +219,23 @@ struct SparseMatrix_STRUCT
     local_int_t* f2cPerm;
 
     // Sliced EllPACK
+#ifndef EXPLICIT_KERNELS
     // aarch64 host slice offsets and columns are width-agnostic (void*), sized by
     // --mi like GPU sellDev: offsets are int32 for --mi 0 and int64 for --mi 1/2;
     // columns are int32 for --mi 0/1 and int64 for --mi 2. Typed access is
-    // confined to dispatchIndexMode() call sites in CpuKernels.
+    // confined to dispatchIndexMode() call sites in CpuKernels. The GPU
+    // (cuSPARSE) path never reads these directly either -- it goes through
+    // sellDev below. These fields are CPU/NVPL-only in a mixed-indexing build.
     void *sellASliceMrl, *sellLSliceMrl, *sellUSliceMrl;
     void *sellAPermColumns, *sellLPermColumns, *sellUPermColumns;
+#else
+    // Explicit GPU kernels (LDG/LDG2/LDG3/TMA) read these directly as fixed-
+    // width device pointers -- they predate sellDev and never go through
+    // cuSPARSE, so there is no IndexMode to dispatch on. slice_ptr_t is
+    // unconditionally 64-bit (see Geometry.hpp); columns stay local_int_t.
+    slice_ptr_t *sellASliceMrl, *sellLSliceMrl, *sellUSliceMrl;
+    local_int_t *sellAPermColumns, *sellLPermColumns, *sellUPermColumns;
+#endif
     double *sellAPermValues, *sellLPermValues, *sellUPermValues;
     double* diagonal;
 
@@ -244,7 +262,9 @@ struct SparseMatrix_STRUCT
     IndexMode index_mode = IndexMode::I32_I32;
 
 #ifdef USE_CUDA
+#ifndef EXPLICIT_KERNELS
     CUSPARSE_STRUCT cusparseOpt;
+#endif
     GPU_AUX_STRUCT gpuAux;
     SellDeviceArrays sellDev; // Width-agnostic SELL offset/column device arrays
 #endif

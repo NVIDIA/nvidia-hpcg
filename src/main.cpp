@@ -67,6 +67,7 @@
 #include "ExchangeHalo.hpp"
 #include "GenerateCoarseProblem.hpp"
 #include "GenerateGeometry.hpp"
+#include "MicroBenchmark.hpp"
 #include "GenerateProblem.hpp"
 #include "Geometry.hpp"
 #include "OptimizeProblem.hpp"
@@ -77,6 +78,7 @@
 #include "TestNorms.hpp"
 #include "TestSymmetry.hpp"
 #include "Vector.hpp"
+#include "WriteMtx.hpp"
 #include "WriteProblem.hpp"
 #include "hpcg.hpp"
 #include "mytimer.hpp"
@@ -90,7 +92,9 @@ using std::endl;
 extern int use_output_file;
 
 #ifdef USE_CUDA
+#ifndef EXPLICIT_KERNELS
 cusparseHandle_t cusparsehandle;
+#endif
 cublasHandle_t cublashandle;
 cudaStream_t stream;
 cudaEvent_t copy_done;
@@ -198,6 +202,35 @@ int main(int argc, char* argv[])
             printf(" | Index mode (--mi %d): %s\n", (int) Index_Mode, toString(Index_Mode));
         if (params.exec_mode == CPUONLY || params.exec_mode == GPUCPU)
             printf(" | Index mode (--mi %d): %s\n", (int) Index_Mode, toString(Index_Mode));
+    }
+
+    // --mi 0 keeps the Sliced-ELL slice offsets 32-bit. Those offsets are flat
+    // element indices into the *padded* columns/values arrays -- see
+    // createAMatrixSliceOffsets_kernel(): arr[i] = i * slice_size *
+    // HPCG_MAX_ROW_LEN -- so the limit is INT32_MAX padded nonzeros, not
+    // INT32_MAX rows. 512^3 needs 134217728 * 27 == 3.6e9 and so cannot run
+    // with --mi 0. Reject it here rather than overflowing an offset during
+    // setup, which surfaces much later as wrong results or a fault far from
+    // the cause.
+    {
+        constexpr long long kMaxInt32 = (1LL << 31) - 1;
+        const long long slice = params.gpu_slice_size > 0 ? (long long) params.gpu_slice_size
+            : (params.cpu_slice_size > 0                  ? (long long) params.cpu_slice_size
+                                                          : 1);
+        const long long rows = (long long) params.nx * (long long) params.ny * (long long) params.nz;
+        const long long padded_nnz = ((rows + slice - 1) / slice) * slice * HPCG_MAX_ROW_LEN;
+        if (!offsetsAre64(Index_Mode) && padded_nnz > kMaxInt32)
+        {
+            if (rank == 0)
+                printf("Error: --mi %d uses 32-bit Sliced-ELL offsets, which address at most %lld padded nonzeros, "
+                       "but %lldx%lldx%lld local needs %lld. Re-run with --mi 1 (64-bit offsets). Exiting ...\n",
+                    (int) Index_Mode, kMaxInt32, (long long) params.nx, (long long) params.ny, (long long) params.nz,
+                    padded_nnz);
+#ifndef HPCG_NO_MPI
+            MPI_Finalize();
+#endif
+            return 0;
+        }
     }
 
     // Check P2P comm mode
@@ -342,7 +375,7 @@ int main(int argc, char* argv[])
     int cusparseMajor = 0, cusparseMinor = 0;
     if (params.exec_mode == GPUONLY || params.exec_mode == GPUCPU)
     {
-#ifdef USE_CUDA
+#if defined(USE_CUDA) && !defined(EXPLICIT_KERNELS)
         // Cusparse Version
         CHECK_CUSPARSE(cusparseGetProperty(MAJOR_VERSION, &cusparseMajor));
         CHECK_CUSPARSE(cusparseGetProperty(MINOR_VERSION, &cusparseMinor));
@@ -397,12 +430,14 @@ int main(int argc, char* argv[])
         A.slice_size = params.gpu_slice_size;
         A.index_mode = Index_Mode; // Propagated to coarse levels in AllocateMemCuda.
         cublasCreate(&(cublashandle));
-        CHECK_CUSPARSE(cusparseCreate(&(cusparsehandle)));
         CHECK_CUDART(cudaStreamCreate(&(stream)));
         CHECK_CUDART(cudaStreamCreate(&(copy_stream)));
-        CHECK_CUSPARSE(cusparseSetStream(cusparsehandle, stream));
         cublasSetStream(cublashandle, stream);
+#ifndef EXPLICIT_KERNELS
+        CHECK_CUSPARSE(cusparseCreate(&(cusparsehandle)));
+        CHECK_CUSPARSE(cusparseSetStream(cusparsehandle, stream));
         CHECK_CUSPARSE(cusparseSetPointerMode(cusparsehandle, CUSPARSE_POINTER_MODE_HOST));
+#endif
         CHECK_CUDART(cudaEventCreate(&copy_done));
 #ifdef USE_NCCL
         if (params.p2_mode == NCCL)
@@ -588,7 +623,7 @@ int main(int argc, char* argv[])
 
     if (params.exec_mode == GPUONLY || params.exec_mode == GPUCPU)
     {
-#ifdef USE_CUDA
+#if defined(USE_CUDA) && !defined(EXPLICIT_KERNELS)
         if (cusparseMajor < 12 || (cusparseMajor == 12 && cusparseMinor < 5))
         {
             // Test for the most course matrix
@@ -610,6 +645,11 @@ int main(int argc, char* argv[])
     size_t opt_mem = OptimizeProblem(A, data, b, x, xexact);
     t7 = mytimer() - t7;
     times[7] = t7;
+
+#ifdef USE_CUDA
+    if (params.rank_type == GPU)
+        AutotuneSymGS(A);
+#endif
 #ifdef HPCG_DEBUG
     if (rank == 0)
         std::cout << "Total problem optimize in main (sec) = " << t7 << endl;
@@ -629,6 +669,7 @@ int main(int argc, char* argv[])
         int numSMS = props.multiProcessorCount;
 
         if (rank == 0)
+#ifndef EXPLICIT_KERNELS
             printf(
                 "GPU Rank Info:\n"
                 " | cuSPARSE version %d.%d\n%s"
@@ -643,6 +684,22 @@ int main(int argc, char* argv[])
                 cusparseMajor, cusparseMinor, Use_Compression ? " | L2 compression is activated\n" : "",
                 cpuRefMemory / 1024.0 / 1024.0, props.name, numSMS, (total_bytes - free_bytes) >> 20, total_bytes >> 20,
                 A.geom->npx, A.geom->npy, A.geom->npz, (int)A.geom->nx, (int)A.geom->ny, (int)A.geom->nz, params.numThreads, (long long)A.slice_size);
+#else
+            printf(
+                "GPU Rank Info:\n"
+                " | EXPLICIT_KERNELS (cuSPARSE not used)\n%s"
+                " | Reference CPU memory = %.2f MB\n"
+                " | GPU Name: '%s'\n"
+                " | Number of SMs: %d\n"
+                " | GPU Memory Use: %ld MB / %ld MB\n"
+                " | Process Grid: %dx%dx%d\n"
+                " | Local Domain: %dx%dx%d\n"
+                " | Number of CPU Threads: %d\n"
+                " | Slice Size: %lld\n",
+                Use_Compression ? " | L2 compression is activated\n" : "",
+                cpuRefMemory / 1024.0 / 1024.0, props.name, numSMS, (total_bytes - free_bytes) >> 20, total_bytes >> 20,
+                A.geom->npx, A.geom->npy, A.geom->npz, (int)A.geom->nx, (int)A.geom->ny, (int)A.geom->nz, params.numThreads, (long long)A.slice_size);
+#endif
         CHECK_CUDART(cudaDeviceSynchronize());
 #endif
     }
@@ -665,12 +722,31 @@ int main(int argc, char* argv[])
 #endif // USE_GRACE
     }
 
+
+#ifdef HPCG_WRITE_MTX
+    if (rank == 0) {
+        WriteSellToMtx(A, "matrix_A.mtx", "matrix_L.mtx");
+    }
+#endif
+
 #ifdef HPCG_DETAILED_DEBUG
     if (geom->size == 1)
         WriteProblem(*geom, A, b, x, xexact);
 #endif
 
     MPI_Barrier(MPI_COMM_WORLD);
+
+      // Initialize kernel configuration from environment variables
+      #ifdef USE_CUDA
+      InitKernelConfig();
+      #endif
+
+      #if defined(USE_CUDA) && defined(HPCG_MICRO_BENCHMARK)
+      if (RunMicroBenchmarks(A, b, x, rank)) {
+          MPI_Finalize();
+          return 0;
+      }
+      #endif
 
 //////////////////////////////
 // Validation Testing Phase //
@@ -959,7 +1035,9 @@ int main(int argc, char* argv[])
     {
 #ifdef USE_CUDA
         cublasDestroy(cublashandle);
+#ifndef EXPLICIT_KERNELS
         CHECK_CUSPARSE(cusparseDestroy(cusparsehandle));
+#endif
         CHECK_CUDART(cudaStreamDestroy(stream));
         CHECK_CUDART(cudaStreamDestroy(copy_stream));
         CHECK_CUDART(cudaEventDestroy(copy_done));

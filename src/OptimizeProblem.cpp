@@ -89,6 +89,8 @@ size_t OptimizeProblemGpu(SparseMatrix& A_in, CGData& data, Vector& b, Vector& x
         A->totalColors = totalColors;
         PermElemToSendCuda(A->totalToBeSent, A->gpuAux.elementsToSend, A->ref2opt);
 
+#ifndef EXPLICIT_KERNELS
+
         // Runtime-selected SELL index widths for this matrix (see IndexMode.hpp).
         const IndexMode mode = A->index_mode;
         const size_t offBytes = offsetIndexBytes(mode);
@@ -237,6 +239,52 @@ size_t OptimizeProblemGpu(SparseMatrix& A_in, CGData& data, Vector& b, Vector& x
         CHECK_CUSPARSE(cusparseDestroyDnVec(dummy1));
         CHECK_CUSPARSE(cusparseDestroyDnVec(dummy2));
         // //////////////////////////////////////////////////////////////////////////
+#else
+
+        // Create the permuted matrix directly in column-major sliced-ELLPACK
+        // layout. The gather kernel now emits the transposed layout in place, so
+        // the previous separate TransposeCuda pass is no longer needed.
+        EllPermColumnsValuesCuda(nrow, A->gpuAux.nnzPerRow, A->gpuAux.columns, A->gpuAux.values,
+            A->gpuAux.csrAPermOffsets, A->sellAPermColumns, A->sellAPermValues, A->opt2ref, A->ref2opt,
+            A->gpuAux.sellADiagonalIdx, A->gpuAux.csrLPermOffsets, A->gpuAux.csrUPermOffsets, false, slice_size);
+
+        // Per block max row len
+        local_int_t num_slices = (nrow + slice_size - 1) / slice_size;
+        EllMaxRowLenPerBlockCuda(nrow, slice_size, A->gpuAux.csrLPermOffsets, A->gpuAux.csrUPermOffsets,
+            A->sellLSliceMrl, A->sellUSliceMrl);
+
+        // Find prefix sum for sliced ell
+        PrefixsumCuda(num_slices, A->sellLSliceMrl);
+        MultiplyBySliceSizeCUDA(num_slices, slice_size, A->sellLSliceMrl + 1);
+
+        PrefixsumCuda(num_slices, A->sellUSliceMrl);
+        MultiplyBySliceSizeCUDA(num_slices, slice_size, A->sellUSliceMrl + 1);
+
+        // Set the general matrix slice_offsets
+        CreateAMatrixSliceOffsetsCuda(num_slices + 1, A->slice_size, A->sellASliceMrl);
+
+        // Lower Upper ELL variant parts
+        CreateSellLUColumnsValuesCuda(nrow, slice_size, A->sellAPermColumns, A->sellAPermValues, A->sellLSliceMrl,
+            A->sellLPermColumns, A->sellLPermValues, A->sellUSliceMrl, A->sellUPermColumns, A->sellUPermValues, level);
+
+        local_int_t sell_slices = (nrow + slice_size - 1) / slice_size;
+        const local_int_t half_nnz = (A->localNumberOfNonzeros - nrow - A->extNnz) / 2;
+
+        slice_ptr_t sell_l_nnz = 0;
+        CHECK_CUDART(cudaMemcpyAsync(
+            &sell_l_nnz, &(A->sellLSliceMrl[sell_slices]), sizeof(slice_ptr_t), cudaMemcpyDeviceToHost, stream));
+
+        slice_ptr_t sell_u_nnz = 0;
+        CHECK_CUDART(cudaMemcpyAsync(
+            &sell_u_nnz, &(A->sellUSliceMrl[sell_slices]), sizeof(slice_ptr_t), cudaMemcpyDeviceToHost, stream));
+
+        slice_ptr_t sell_nnz = (slice_ptr_t) sell_slices * slice_size * HPCG_MAX_ROW_LEN;
+        A->sellALocalNumberOfNonzeros = sell_nnz;
+        A->sellLLocalNumberOfNonzeros = sell_l_nnz;
+        A->sellULocalNumberOfNonzeros = sell_u_nnz;
+
+#endif
+        ////////////////////////////////////////////////////////////////////////////
         A = A->Ac;
     }
 
@@ -256,6 +304,7 @@ size_t OptimizeProblemGpu(SparseMatrix& A_in, CGData& data, Vector& b, Vector& x
 #ifdef USE_GRACE
 size_t OptimizeProblemCpu(SparseMatrix& A_in, CGData& data, Vector& b, Vector& x, Vector& xexact)
 {
+#ifndef EXPLICIT_KERNELS
     // Start with AllocateMemCpu-retained host memory; add NVPL SpSV buffers
     // allocated below as they are queried.
     size_t mem = EstimateCpuOptMem(A_in);
@@ -451,6 +500,177 @@ size_t OptimizeProblemCpu(SparseMatrix& A_in, CGData& data, Vector& b, Vector& x
     }
 
     return mem;
+#else
+    // Initialize data structures
+    size_t mem = EstimateCpuOptMem(A_in);
+    AllocateMemCpu(A_in);
+
+    SparseMatrix* A = &A_in;
+    local_int_t numberOfMgLevels = 4;
+    local_int_t slice_size = A->slice_size;
+    for (int level = 0; level < numberOfMgLevels; ++level)
+    {
+        // Color the matrix
+        int num_colors;
+        ColorMatrixCpu(*A, &num_colors);
+        A->totalColors = num_colors;
+
+        // Compute when each color starts
+        A->cpuAux.firstRowOfColor[0] = 0;
+        for (int c = 1; c < A->totalColors; c++)
+        {
+            A->cpuAux.firstRowOfColor[c] = A->cpuAux.firstRowOfColor[c - 1] + A->cpuAux.nRowsWithColor[c - 1];
+        }
+
+        // Reorder the matrix
+        CreateSellPermCpu(*A);
+
+#ifndef HPCG_NO_MPI
+        // Translate row IDs that will be send to neighbours
+#pragma omp parallel for
+        for (local_int_t i = 0; i < A->totalToBeSent; i++)
+        {
+            local_int_t orig = A->elementsToSend[i];
+            A->elementsToSend[i] = A->ref2opt[orig];
+        }
+#endif
+
+        local_int_t numberOfNonzerosPerRow = HPCG_MAX_ROW_LEN;
+        local_int_t nrow = A->localNumberOfRows;
+        local_int_t half_nnz = (A->localNumberOfNonzeros - nrow - A->extNnz) / 2;
+        local_int_t num_slices = (nrow + slice_size - 1) / slice_size;
+        local_int_t sell_l_nnz = A->sellLSliceMrl[num_slices];
+        local_int_t sell_u_nnz = A->sellUSliceMrl[num_slices];
+        local_int_t sell_nnz = num_slices * slice_size * numberOfNonzerosPerRow;
+
+        auto INDEX_TYPE = NVPL_SPARSE_INDEX_32I;
+#ifdef INDEX_64 // In src/Geometry
+        INDEX_TYPE = NVPL_SPARSE_INDEX_64I;
+#endif
+
+        nvpl_sparse_create_sliced_ell(&(A->nvplSparseOpt.matL), nrow, nrow, half_nnz, sell_l_nnz, slice_size,
+            A->sellLSliceMrl, A->sellLPermColumns, A->sellLPermValues, INDEX_TYPE, INDEX_TYPE,
+            NVPL_SPARSE_INDEX_BASE_ZERO, NVPL_SPARSE_R_64F);
+
+        nvpl_sparse_create_sliced_ell(&(A->nvplSparseOpt.matU), nrow, nrow, half_nnz, sell_u_nnz, slice_size,
+            A->sellUSliceMrl, A->sellUPermColumns, A->sellUPermValues, INDEX_TYPE, INDEX_TYPE,
+            NVPL_SPARSE_INDEX_BASE_ZERO, NVPL_SPARSE_R_64F);
+
+        nvpl_sparse_create_sliced_ell(&(A->nvplSparseOpt.matA), nrow, nrow, A->localNumberOfNonzeros, sell_nnz,
+            slice_size, A->sellASliceMrl, A->sellAPermColumns, A->sellAPermValues, INDEX_TYPE, INDEX_TYPE,
+            NVPL_SPARSE_INDEX_BASE_ZERO, NVPL_SPARSE_R_64F);
+
+        double alpha = 1.0, beta = 0.0;
+        size_t e_buf_size = 0;
+        size_t l_buf_size = 0, u_buf_size = 0, i_buf_size = 0, max_buf_size = 0;
+        nvpl_sparse_create_dn_vec(&(A->nvplSparseOpt.vecX), nrow, x.values, NVPL_SPARSE_R_64F);
+        nvpl_sparse_create_dn_vec(&(A->nvplSparseOpt.vecY), nrow, b.values, NVPL_SPARSE_R_64F);
+        max_buf_size = e_buf_size;
+
+        // //MV
+        // //Lower
+        nvpl_sparse_spmv_create_descr(&A->nvplSparseOpt.spmvLDescr);
+        nvpl_sparse_spmv_buffer_size(nvpl_sparse_handle, NVPL_SPARSE_OPERATION_NON_TRANSPOSE, &alpha,
+            A->nvplSparseOpt.matL, A->nvplSparseOpt.vecX, &beta, A->nvplSparseOpt.vecY, A->nvplSparseOpt.vecY,
+            NVPL_SPARSE_R_64F, NVPL_SPARSE_SPMV_ALG_DEFAULT, A->nvplSparseOpt.spmvLDescr, &l_buf_size);
+        // //Upper
+        nvpl_sparse_spmv_create_descr(&A->nvplSparseOpt.spmvUDescr);
+        nvpl_sparse_spmv_buffer_size(nvpl_sparse_handle, NVPL_SPARSE_OPERATION_NON_TRANSPOSE, &alpha,
+            A->nvplSparseOpt.matU, A->nvplSparseOpt.vecX, &beta, A->nvplSparseOpt.vecY, A->nvplSparseOpt.vecY,
+            NVPL_SPARSE_R_64F, NVPL_SPARSE_SPMV_ALG_DEFAULT, A->nvplSparseOpt.spmvUDescr, &u_buf_size);
+        // //L+D+U
+        nvpl_sparse_spmv_create_descr(&A->nvplSparseOpt.spmvADescr);
+        nvpl_sparse_spmv_buffer_size(nvpl_sparse_handle, NVPL_SPARSE_OPERATION_NON_TRANSPOSE, &alpha,
+            A->nvplSparseOpt.matA, A->nvplSparseOpt.vecX, &beta, A->nvplSparseOpt.vecY, A->nvplSparseOpt.vecY,
+            NVPL_SPARSE_R_64F, NVPL_SPARSE_SPMV_ALG_DEFAULT, A->nvplSparseOpt.spmvADescr, &i_buf_size);
+
+        max_buf_size = std::max(std::max(i_buf_size, e_buf_size), std::max(u_buf_size, l_buf_size));
+
+        // //SV
+        // //Lower
+        size_t buffer_size_sv_l, buffer_size_sv_u;
+        nvpl_sparse_fill_mode_t fillmode_l = NVPL_SPARSE_FILL_MODE_LOWER;
+        nvpl_sparse_fill_mode_t fillmode_u = NVPL_SPARSE_FILL_MODE_UPPER;
+        nvpl_sparse_diag_type_t diagtype = NVPL_SPARSE_DIAG_TYPE_NON_UNIT;
+
+        nvpl_sparse_spsv_create_descr(&A->nvplSparseOpt.spsvDescrL);
+        nvpl_sparse_spsv_create_descr(&A->nvplSparseOpt.spsvDescrU);
+        nvpl_sparse_sp_mat_set_attribute(
+            A->nvplSparseOpt.matL, NVPL_SPARSE_SPMAT_DIAG_TYPE, &(diagtype), sizeof(diagtype));
+        nvpl_sparse_sp_mat_set_attribute(
+            A->nvplSparseOpt.matL, NVPL_SPARSE_SPMAT_FILL_MODE, &(fillmode_l), sizeof(fillmode_l));
+
+        Vector origDiagA;
+        InitializeVector(origDiagA, A->localNumberOfRows, CPU);
+        CopyMatrixDiagonal(*A, origDiagA);
+
+        // Pass strictly L, and then update the diagonal
+        if (!Use_Hpcg_Mem_Reduction || A->localNumberOfRows % 8 != 0)
+        {
+            nvpl_sparse_sp_mat_set_attribute(
+                A->nvplSparseOpt.matA, NVPL_SPARSE_SPMAT_FILL_MODE, &(fillmode_l), sizeof(fillmode_l));
+            nvpl_sparse_spsv_buffer_size(nvpl_sparse_handle, NVPL_SPARSE_OPERATION_NON_TRANSPOSE, &alpha,
+                A->nvplSparseOpt.matA, A->nvplSparseOpt.vecX, A->nvplSparseOpt.vecY, NVPL_SPARSE_R_64F,
+                NVPL_SPARSE_SPSV_ALG_DEFAULT, A->nvplSparseOpt.spsvDescrL, &buffer_size_sv_l);
+
+            A->bufferSvL = new char[buffer_size_sv_l];
+            mem += buffer_size_sv_l;
+            nvpl_sparse_spsv_analysis(nvpl_sparse_handle, NVPL_SPARSE_OPERATION_NON_TRANSPOSE, &alpha,
+                A->nvplSparseOpt.matA, A->nvplSparseOpt.vecX, A->nvplSparseOpt.vecY, NVPL_SPARSE_R_64F,
+                NVPL_SPARSE_SPSV_ALG_DEFAULT, A->nvplSparseOpt.spsvDescrL, A->bufferSvL);
+        }
+        else
+        {
+            nvpl_sparse_spsv_analysis(nvpl_sparse_handle, NVPL_SPARSE_OPERATION_NON_TRANSPOSE, &alpha,
+                A->nvplSparseOpt.matL, A->nvplSparseOpt.vecX, A->nvplSparseOpt.vecY, NVPL_SPARSE_R_64F,
+                NVPL_SPARSE_SPSV_ALG_DEFAULT, A->nvplSparseOpt.spsvDescrL, A->bufferSvL);
+            nvpl_sparse_spsv_update_matrix(
+                nvpl_sparse_handle, A->nvplSparseOpt.spsvDescrL, origDiagA.values, NVPL_SPARSE_SPSV_UPDATE_DIAGONAL);
+        }
+
+        // Pass strctly U, and then update diagonal
+        nvpl_sparse_sp_mat_set_attribute(
+            A->nvplSparseOpt.matU, NVPL_SPARSE_SPMAT_FILL_MODE, &(fillmode_u), sizeof(fillmode_u));
+        if (!Use_Hpcg_Mem_Reduction || A->localNumberOfRows % 8 != 0)
+        {
+            nvpl_sparse_sp_mat_set_attribute(
+                A->nvplSparseOpt.matA, NVPL_SPARSE_SPMAT_FILL_MODE, &(fillmode_u), sizeof(fillmode_u));
+            nvpl_sparse_spsv_buffer_size(nvpl_sparse_handle, NVPL_SPARSE_OPERATION_NON_TRANSPOSE, &alpha,
+                A->nvplSparseOpt.matA, A->nvplSparseOpt.vecX, A->nvplSparseOpt.vecY, NVPL_SPARSE_R_64F,
+                NVPL_SPARSE_SPSV_ALG_DEFAULT, A->nvplSparseOpt.spsvDescrU, &buffer_size_sv_u);
+            A->bufferSvU = new char[buffer_size_sv_u];
+            mem += buffer_size_sv_u;
+            nvpl_sparse_spsv_analysis(nvpl_sparse_handle, NVPL_SPARSE_OPERATION_NON_TRANSPOSE, &alpha,
+                A->nvplSparseOpt.matA, A->nvplSparseOpt.vecX, A->nvplSparseOpt.vecY, NVPL_SPARSE_R_64F,
+                NVPL_SPARSE_SPSV_ALG_DEFAULT, A->nvplSparseOpt.spsvDescrU, A->bufferSvU);
+        }
+        else
+        {
+            nvpl_sparse_spsv_analysis(nvpl_sparse_handle, NVPL_SPARSE_OPERATION_NON_TRANSPOSE, &alpha,
+                A->nvplSparseOpt.matU, A->nvplSparseOpt.vecX, A->nvplSparseOpt.vecY, NVPL_SPARSE_R_64F,
+                NVPL_SPARSE_SPSV_ALG_DEFAULT, A->nvplSparseOpt.spsvDescrU, A->bufferSvU);
+            nvpl_sparse_spsv_update_matrix(
+                nvpl_sparse_handle, A->nvplSparseOpt.spsvDescrU, origDiagA.values, NVPL_SPARSE_SPSV_UPDATE_DIAGONAL);
+        }
+
+        DeleteVector(origDiagA);
+        //////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+        A = A->Ac;
+    }
+    A = &A_in;
+
+    for (int level = 1; level < numberOfMgLevels; level++)
+    {
+        local_int_t nrow_c = A->Ac->localNumberOfRows;
+        local_int_t nrow_f = A->localNumberOfRows;
+        // Permute space injector operator
+        F2cPermCpu(nrow_c, A->mgData->f2cOperator, A->f2cPerm, A->ref2opt, A->Ac->opt2ref);
+        A = A->Ac;
+    }
+
+    return mem;
+#endif
 }
 #endif // USE_GRACE
 

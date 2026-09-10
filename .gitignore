@@ -6,3 +6,12 @@ bin/xhpcg
 bin/xhpcg-cpu
 bin/hpcg20*.txt
 .DS_Store
+
+# Build trees. These were tracked, so every rebuild dirtied the tree and the
+# DIRTY marker the run harness records stopped meaning anything.
+build/
+build-*/
+bin/xhpcg*
+*.o
+*.log
+cpu-repro-logs/

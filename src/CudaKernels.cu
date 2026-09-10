@@ -18,7 +18,9 @@
 #ifdef USE_CUDA
 #include <cuda.h>
 #include <cuda_runtime.h>
+#ifndef EXPLICIT_KERNELS
 #include <cusparse.h>
+#endif
 
 // Thrust for coloring
 #include <thrust/copy.h>
@@ -38,6 +40,7 @@
 #ifndef HPCG_NO_MPI
 #include "ExchangeHalo.hpp"
 #include "Geometry.hpp"
+#include <cstdio>
 #include <cstdlib>
 #include <mpi.h>
 extern p2p_comm_mode_t P2P_Mode; // Initialized in src/init.cpp
@@ -45,6 +48,92 @@ extern p2p_comm_mode_t P2P_Mode; // Initialized in src/init.cpp
 extern ncclComm_t Nccl_Comm; // Initialized in src/init.cpp
 #endif
 #endif
+
+
+// Runtime configuration parameters (can be overridden by environment variables)
+struct KernelConfig {
+    int SV_UNROLL;
+    int MV_UNROLL;
+    int SV_BLOCK_SIZE;
+    int MV_BLOCK_SIZE;
+    int VECTOR_WIDTH;
+    bool USE_TMA_MV;
+    bool USE_TMA_SV;
+};
+
+// Global configuration instance
+KernelConfig g_config;
+
+// Function to initialize configuration from environment variables
+void InitKernelConfig() {
+    // Set default values
+    g_config.SV_UNROLL = 8;
+    g_config.MV_UNROLL = 8;
+    g_config.SV_BLOCK_SIZE = 64;
+    g_config.MV_BLOCK_SIZE = 256;
+    g_config.VECTOR_WIDTH = 2;
+    g_config.USE_TMA_MV = false;
+    g_config.USE_TMA_SV = false;
+    
+    // Read from environment variables
+    const char* env_sv_unroll = std::getenv("SV_UNROLL");
+    if (env_sv_unroll) {
+        g_config.SV_UNROLL = std::atoi(env_sv_unroll);
+    }
+    
+    const char* env_mv_unroll = std::getenv("MV_UNROLL");
+    if (env_mv_unroll) {
+        g_config.MV_UNROLL = std::atoi(env_mv_unroll);
+    }
+    
+    const char* env_sv_block_size = std::getenv("SV_BLOCK_SIZE");
+    if (env_sv_block_size) {
+        g_config.SV_BLOCK_SIZE = std::atoi(env_sv_block_size);
+    }
+    
+    const char* env_mv_block_size = std::getenv("MV_BLOCK_SIZE");
+    if (env_mv_block_size) {
+        g_config.MV_BLOCK_SIZE = std::atoi(env_mv_block_size);
+    }
+    
+    const char* env_vector_width = std::getenv("VECTOR_WIDTH");
+    if (env_vector_width) {
+        g_config.VECTOR_WIDTH = std::atoi(env_vector_width);
+    }
+    
+    const char* env_use_tma_mv = std::getenv("USE_TMA_MV");
+    if (env_use_tma_mv) {
+        g_config.USE_TMA_MV = (std::atoi(env_use_tma_mv) != 0);
+    }
+    
+    const char* env_use_tma_sv = std::getenv("USE_TMA_SV");
+    if (env_use_tma_sv) {
+        g_config.USE_TMA_SV = (std::atoi(env_use_tma_sv) != 0);
+    }
+
+#ifdef INDEX_64
+    // TMA column tensor maps are hard-wired to CU_TENSOR_MAP_DATA_TYPE_INT32 and
+    // the device-side shared-memory buffers are declared as int[] / int*. With
+    // INDEX_64, column indices are int64, so TMA would silently truncate/corrupt
+    // them. Disable TMA under INDEX_64 and surface a clear message.
+    if (g_config.USE_TMA_MV || g_config.USE_TMA_SV) {
+        fprintf(stderr,
+            "WARNING: USE_TMA_MV/USE_TMA_SV are not supported with INDEX_64 "
+            "(TMA column path is INT32-only). Disabling TMA.\n");
+        g_config.USE_TMA_MV = false;
+        g_config.USE_TMA_SV = false;
+    }
+#endif
+}
+
+// Note: Legacy defines removed - use g_config for runtime configuration
+
+// Always include TMA headers since TMA usage is now runtime-configurable
+#include <cuda/barrier>
+#include <cuda/type_traits>
+#include <cuda/ptx>
+namespace ptx = cuda::ptx;
+
 
 // Support Atomic Add
 __device__ int atomic_add(int* ptr, int val)
@@ -151,9 +240,9 @@ slice_ptr_t EstimateLUmem(local_int_t n, local_int_t padded_n, local_int_t level
     // (e.g. 1024x512x512 -> ~3.9e9), so both the intermediate and the result
     // must be 64-bit or they overflow.
     slice_ptr_t estimated_size = (slice_ptr_t) ((slice_ptr_t) padded_n * HPCG_MAX_ROW_LEN * 1.0f / divisor);
-    local_int_t v288x512x512[] = {1057190464, 132276512, 16615072, 2074384};
-    local_int_t v296x512x512[] = {1095636608, 136618560, 16967616, 2883872};
-    local_int_t* v = n == 288 * 512 * 512 ? v288x512x512
+    slice_ptr_t v288x512x512[] = {1057190464, 132276512, 16615072, 2074384};
+    slice_ptr_t v296x512x512[] = {1095636608, 136618560, 16967616, 2883872};
+    slice_ptr_t* v = n == 288 * 512 * 512 ? v288x512x512
         : n == 296 * 512 * 512            ? v296x512x512
         : nullptr;
     if (v != nullptr)
@@ -167,6 +256,42 @@ slice_ptr_t EstimateLUmem(local_int_t n, local_int_t padded_n, local_int_t level
         else if (level == 3)
             estimated_size = v[3];
     }
+
+    // Round up so the estimate is a safe *alignment* as well as a safe size.
+    //
+    // AllocateMemOptCuda packs L and U into one columns allocation:
+    //     sellLPermColumns = gpuAux.columns;
+    //     sellUPermColumns = gpuAux.columns + estimated_size;
+    // so estimated_size is an element displacement applied to an otherwise
+    // cudaMalloc-aligned base. The LDG_V2/LDG3 families gather columns with
+    // wide vector loads (v2/v4/v8.u32, i.e. 8/16/32 bytes), which the hardware
+    // requires to be naturally aligned. An unaligned displacement therefore
+    // misaligns *every* U column load in those kernels, while L (base pointer,
+    // aligned) and the separately-cudaMalloc'd value arrays are unaffected.
+    //
+    // This is not an overrun -- compute-sanitizer reports "Invalid __global__
+    // read of size 16 bytes ... is misaligned and is inside the nearest
+    // allocation". It is also invisible to the scalar LDG/explicit kernels,
+    // whose 4-byte loads only need 4-byte alignment, which is why only the
+    // wide-load families ever tripped on it.
+    //
+    // The raw estimate is padded_n * HPCG_MAX_ROW_LEN / divisor computed in
+    // float, so its low bits are essentially arbitrary: at 256^3 level 1 it
+    // came out 30607082 == 2 (mod 4), putting U's base 8 bytes off a 16-byte
+    // boundary -- W=2 (8-byte) loads still worked, W=4 (16-byte) faulted. The
+    // divisor value thus decided alignment by luck, which is why divisor=1.0
+    // "fixed" the crash (padded_n * 27 is a multiple of 32) and why the
+    // hard-coded sizes above never tripped (all are multiples of 16).
+    //
+    // Contract: the estimate is a multiple of 8 elements, so the displaced U
+    // base is 256-bit (32-byte) aligned for int32 columns (8 * 4 == 32) and
+    // 64-byte aligned for int64 columns. That is the widest access the kernels
+    // issue (ld.global.v8.u32 / v4.f64), so every column/value load is
+    // naturally aligned. This applies to both the explicit path and the
+    // cuSPARSE path, which places uColumns at the same displacement.
+    // The value arrays get their own cudaMalloc and are aligned already.
+    constexpr slice_ptr_t kWideLoadAlign = 8;
+    estimated_size = (estimated_size + kWideLoadAlign - 1) / kWideLoadAlign * kWideLoadAlign;
 
     return estimated_size;
 }
@@ -317,6 +442,7 @@ void AllocateMemOptCuda(SparseMatrix& A_in)
         local_int_t localNumberOfRows = nx * ny * nz;
         int slice_size = A->slice_size;
 
+#ifndef EXPLICIT_KERNELS
         local_int_t num_blocks = (localNumberOfRows + slice_size - 1) / slice_size;
         local_int_t paddedRowLen = num_blocks * slice_size;
 
@@ -409,6 +535,80 @@ void AllocateMemOptCuda(SparseMatrix& A_in)
         nx /= 2;
         ny /= 2;
         nz /= 2;
+#else
+        size_t num_blocks = (localNumberOfRows + slice_size - 1) / slice_size;
+        size_t paddedRowLen = num_blocks * slice_size;
+
+        // Okay We need to find the memory needed
+        CHECK_CUDART(cudaMalloc((void**) &(A->sellAPermColumns),
+            sizeof(local_int_t) * (paddedRowLen * HPCG_MAX_ROW_LEN + slice_size * HPCG_MAX_ROW_LEN)));
+        A->sellAPermValues = A->gpuAux.values; // Use the same space as values
+
+        /*Memory Estimation for lower and upper parts*/
+        slice_ptr_t estimated_size = EstimateLUmem(localNumberOfRows, (local_int_t) paddedRowLen, level, slice_size);
+
+        // Reuse columns arrays, not used after we create SELL
+        A->sellLPermColumns = A->gpuAux.columns;
+        A->sellUPermColumns = A->gpuAux.columns + estimated_size;
+        if (!Use_Compression)
+        {
+            if (Use_Hpcg_Mem_Reduction)
+            {
+                CHECK_CUDART(cudaMalloc((void**) &(A->sellUPermValues), sizeof(double) * estimated_size));
+        
+                // Both matrices have the same values, -1
+                A->sellLPermValues = A->sellUPermValues;
+            }
+            else
+            {
+                CHECK_CUDART(cudaMalloc((void**) &(A->sellUPermValues), sizeof(double) * estimated_size));
+                CHECK_CUDART(cudaMalloc((void**) &(A->sellLPermValues), sizeof(double) * estimated_size));
+            }
+        }
+        else
+        {
+            if (Use_Hpcg_Mem_Reduction)
+            {
+                CHECK_CUDART(cudaMalloc((void**) &(A->sellUPermValues), sizeof(double) * estimated_size));
+
+                // Both matrices have the same values, -1
+                A->sellLPermValues = A->sellUPermValues;
+            }
+            else
+            {
+                CHECK_CUDART(cudaMallocCompressible((void**) &(A->sellUPermValues), sizeof(double) * estimated_size));
+                CHECK_CUDART(cudaMallocCompressible((void**) &(A->sellLPermValues), sizeof(double) * estimated_size));
+            }
+        }
+
+        CHECK_CUDART(cudaMalloc((void**) &(A->sellLSliceMrl), sizeof(slice_ptr_t) * (paddedRowLen / slice_size + 1)));
+        CHECK_CUDART(cudaMalloc((void**) &(A->sellUSliceMrl), sizeof(slice_ptr_t) * (paddedRowLen / slice_size + 1)));
+        CHECK_CUDART(cudaMalloc((void**) &(A->sellASliceMrl), sizeof(slice_ptr_t) * (paddedRowLen / slice_size + 1)));
+
+        CHECK_CUDART(cudaMalloc((void**) &(A->gpuAux.color), localNumberOfRows * sizeof(local_int_t)));
+        CHECK_CUDART(cudaMemset(A->gpuAux.color, -1, localNumberOfRows * sizeof(local_int_t)));
+        A->gpuAux.colorCountCpu = new int[64];
+        for (int i = 0; i < 64; i++)
+        {
+            A->gpuAux.colorCountCpu[i] = 0;
+        }
+
+#ifndef EXPLICIT_KERNELS
+        // SpSV related memory optimization
+        // HPCG estimated buffer size
+        if (Use_Hpcg_Mem_Reduction && (localNumberOfRows % 8 == 0))
+        {
+            size_t buffer_size_sv_l = 2048 + (8 * sizeof(local_int_t) * size_t(localNumberOfRows));
+            CHECK_CUDART(cudaMalloc(&A->bufferSvL, buffer_size_sv_l));
+            // Same buffer since we they both share the same diagional
+            A->bufferSvU = A->bufferSvL;
+        }
+#endif
+
+        nx /= 2;
+        ny /= 2;
+        nz /= 2;
+#endif
         if (level == numberOfMgLevels - 1)
         {
         }
@@ -539,6 +739,7 @@ void DeleteMatrixGpu(SparseMatrix& A)
         CHECK_CUDART(cudaFree(AA->sellDev.uSliceOffsets));
         CHECK_CUDART(cudaFree(AA->sellDev.aSliceOffsets));
 
+#ifndef EXPLICIT_KERNELS
         if (AA->cusparseOpt.vecX)
             CHECK_CUSPARSE(cusparseDestroyDnVec(AA->cusparseOpt.vecX));
         if (AA->cusparseOpt.vecY)
@@ -547,6 +748,7 @@ void DeleteMatrixGpu(SparseMatrix& A)
         CHECK_CUSPARSE(cusparseDestroySpMat(AA->cusparseOpt.matA));
         CHECK_CUSPARSE(cusparseDestroySpMat(AA->cusparseOpt.matL));
         CHECK_CUSPARSE(cusparseDestroySpMat(AA->cusparseOpt.matU));
+#endif
 
         CHECK_CUDART(cudaFree(AA->csrExtOffsets));
         CHECK_CUDART(cudaFree(AA->csrExtColumns));
@@ -555,9 +757,11 @@ void DeleteMatrixGpu(SparseMatrix& A)
         CHECK_CUDART(cudaFree(AA->gpuAux.color));
         delete[] AA->gpuAux.colorCountCpu;
 
+#ifndef EXPLICIT_KERNELS
         CHECK_CUDART(cudaFree(AA->bufferSvL));
         if (!Use_Hpcg_Mem_Reduction || AA->localNumberOfRows % 8 != 0)
             CHECK_CUDART(cudaFree(AA->bufferSvU));
+#endif
 
 #ifndef HPCG_NO_MPI
         if (P2P_Mode == MPI_GPU_All2allv || P2P_Mode == MPI_CPU_All2allv)
@@ -669,7 +873,7 @@ __global__ void __launch_bounds__(THREADS_PER_CTA) compressCsrOffsets_kernel(loc
     }
     __syncthreads();
 
-    int tmp = 0;
+    slice_ptr_t tmp = 0;
     int map_str = 0;
     for (int i = 1; i < bidx + 1; i++)
     {
@@ -1674,8 +1878,8 @@ __global__ void ellMaxRowLenPerBlock_kernel(local_int_t nrow, local_int_t slice_
     {
         if (i < nrow)
         {
-            auto l_rl = csrLPermOffsets[i];
-            auto u_rl = csrUPermOffsets[i];
+            local_int_t l_rl = (local_int_t) csrLPermOffsets[i];
+            local_int_t u_rl = (local_int_t) csrUPermOffsets[i];
 
             if (l_local_mrl < l_rl)
                 l_local_mrl = l_rl;
@@ -1970,6 +2174,7 @@ void PermElemToSendCuda(local_int_t totalToBeSent, local_int_t* elementsToSend, 
 /*
     Creates the internal permuted matrix in (Sliced-)ELLPACK format
 */
+#ifndef EXPLICIT_KERNELS
 void EllPermColumnsValuesCuda(local_int_t localNumberOfRows, local_int_t* nnzPerRow, local_int_t* columns,
     double* values, slice_ptr_t* csr_perm_offsets, void* csr_perm_columns, double* csr_perm_values,
     local_int_t* opt2ref, local_int_t* ref2opt, slice_ptr_t* diagonalIdx, slice_ptr_t* csrLPermOffsets,
@@ -2144,6 +2349,119 @@ void CreateSellLUColumnsValuesCuda(const local_int_t n, const int slice_size, vo
                 static_cast<ColT*>(ell_u_columns), ell_u_values);
         });
 }
+#else
+// Explicit kernels: fixed-width device arrays, no IndexMode dispatch (see SparseMatrix.hpp).
+void EllPermColumnsValuesCuda(local_int_t localNumberOfRows, local_int_t* nnzPerRow, local_int_t* columns,
+    double* values, slice_ptr_t* csr_perm_offsets, local_int_t* csr_perm_columns, double* csr_perm_values,
+    local_int_t* opt2ref, local_int_t* ref2opt, slice_ptr_t* diagonalIdx, slice_ptr_t* csrLPermOffsets,
+    slice_ptr_t* csrUPermOffsets, bool find_diag, local_int_t slice_size)
+{
+    // The build kernel now emits the column-major sliced-ELL layout directly, so
+    // the value buffer must be initialized to -1 over the full padded slice range
+    // (the kernel only overwrites the diagonal; off-diagonal/pad values stay -1).
+    const local_int_t num_slices = (localNumberOfRows + slice_size - 1) / slice_size;
+    const local_int_t paddedRowLen = num_slices * slice_size;
+    const slice_ptr_t nnz_out = (slice_ptr_t) paddedRowLen * HPCG_MAX_ROW_LEN;
+
+    const slice_ptr_t grid_nnz = (nnz_out + 128 - 1) / 128;
+    setMinusOne_kernel<<<grid_nnz, 128, 0, stream>>>(nnz_out, csr_perm_values);
+
+    // For a partial final slice, the padded rows beyond localNumberOfRows are not
+    // visited by the kernel; pre-fill that slice's column indices with -1 so the
+    // pad entries are skipped downstream. (No-op for slice-size-divisible sizes.)
+    if (paddedRowLen > localNumberOfRows)
+    {
+        const size_t last_slice_base = (size_t) (num_slices - 1) * slice_size * HPCG_MAX_ROW_LEN;
+        const size_t last_slice_bytes = (size_t) slice_size * HPCG_MAX_ROW_LEN * sizeof(local_int_t);
+        CHECK_CUDART(cudaMemsetAsync(csr_perm_columns + last_slice_base, 0xFF, last_slice_bytes, stream));
+    }
+
+    const int BLOCK_SIZE = 128;
+    const int GROUP_SIZE = 8; // Number of threads per row
+
+    const int WORKERS = BLOCK_SIZE / GROUP_SIZE;
+    const local_int_t grid = (localNumberOfRows + WORKERS - 1) / WORKERS;
+
+    if (find_diag)
+        ellPermColumnsValues_kernel<BLOCK_SIZE, GROUP_SIZE, true, local_int_t><<<grid, BLOCK_SIZE, 0, stream>>>(
+            localNumberOfRows, nnzPerRow, columns, values, csr_perm_offsets, csr_perm_columns, csr_perm_values,
+            opt2ref, ref2opt, diagonalIdx, csrLPermOffsets, csrUPermOffsets, slice_size);
+    else
+        ellPermColumnsValues_kernel<BLOCK_SIZE, GROUP_SIZE, false, local_int_t><<<grid, BLOCK_SIZE, 0, stream>>>(
+            localNumberOfRows, nnzPerRow, columns, values, csr_perm_offsets, csr_perm_columns, csr_perm_values,
+            opt2ref, ref2opt, diagonalIdx, csrLPermOffsets, csrUPermOffsets, slice_size);
+}
+
+/*
+    Finds the max lower and upper row length for each slice
+*/
+void EllMaxRowLenPerBlockCuda(local_int_t nrow, int slice_size, slice_ptr_t* ell_perm_l_offsets,
+    slice_ptr_t* ell_perm_u_offsets, slice_ptr_t* sellLSliceMrl, slice_ptr_t* ell_u_block_mrl)
+{
+    int blockSize = 512;
+    local_int_t gridSize = (nrow + slice_size - 1) / slice_size;
+    ellMaxRowLenPerBlock_kernel<slice_ptr_t><<<gridSize, blockSize, 0, stream>>>(
+        nrow, slice_size, ell_perm_l_offsets, ell_perm_u_offsets, sellLSliceMrl, ell_u_block_mrl);
+}
+
+/*
+    Finds prefix sum using CUB
+*/
+void PrefixsumCuda(local_int_t localNumberOfRows, slice_ptr_t* arr)
+{
+    void* d_temp_storage = NULL;
+    size_t temp_storage_bytes = 0;
+    CHECK_CUDART(cudaMemsetAsync(arr, 0, sizeof(slice_ptr_t), stream));
+    cub::DeviceScan::InclusiveSum(d_temp_storage, temp_storage_bytes, arr + 1, arr + 1, localNumberOfRows);
+    CHECK_CUDART(cudaMalloc(&d_temp_storage, temp_storage_bytes));
+    cub::DeviceScan::InclusiveSum(d_temp_storage, temp_storage_bytes, arr + 1, arr + 1, localNumberOfRows);
+    CHECK_CUDART(cudaFree(d_temp_storage));
+}
+
+/*
+    Multiplies the slice offset based on max row length by
+        the slice size to make based on number of nnz
+*/
+void MultiplyBySliceSizeCUDA(local_int_t nrow, int slice_size, slice_ptr_t* arr)
+{
+    const local_int_t grid = (nrow + 128 - 1) / 128;
+    multiplyBySliceSize_kernel<slice_ptr_t><<<grid, 128, 0, stream>>>(nrow, slice_size, arr);
+}
+
+/*
+    Creates a slice offset for the general matrix that has exactly
+*/
+void CreateAMatrixSliceOffsetsCuda(local_int_t nrow, local_int_t slice_size, slice_ptr_t* arr)
+{
+    const local_int_t grid = (nrow + 128 - 1) / 128;
+    createAMatrixSliceOffsets_kernel<slice_ptr_t><<<grid, 128, 0, stream>>>(nrow, slice_size, arr);
+}
+
+/*
+    Creates the lower and upper matrices in sliced ELLPACK format
+*/
+void CreateSellLUColumnsValuesCuda(const local_int_t n, const int slice_size, local_int_t* ell_columns,
+    double* ell_values, slice_ptr_t* ell_l_slice_offset, local_int_t* ell_l_columns, double* ell_l_values,
+    slice_ptr_t* ell_u_slice_offset, local_int_t* ell_u_columns, double* ell_u_values, int level)
+{
+    local_int_t num_blocks = (n + slice_size - 1) / slice_size;
+    local_int_t paddedRowLen = num_blocks * slice_size;
+
+    /*Memory Estimation for lower and upper parts*/
+    slice_ptr_t estimated_size = EstimateLUmem(n, (local_int_t) paddedRowLen, level, slice_size);
+
+    const int BlockSize = 128;
+    const int ELEMENTS_PER_THREAD = 8;
+    const int ELEMENTS_PER_CTA = BlockSize * ELEMENTS_PER_THREAD;
+    const slice_ptr_t grid_nnz = (estimated_size + ELEMENTS_PER_CTA - 1) / ELEMENTS_PER_CTA;
+    local_int_t grid = (n + BlockSize - 1) / BlockSize;
+    setLUValues_kernel<BlockSize, ELEMENTS_PER_THREAD><<<grid_nnz, BlockSize, 0, stream>>>(
+        estimated_size, ell_u_values, ell_l_values);
+    createSellLUColumnsValues_kernel<slice_ptr_t, local_int_t><<<grid, BlockSize, 0, stream>>>(n, slice_size,
+        ell_columns, ell_values, ell_l_slice_offset, ell_l_columns, ell_l_values, ell_u_slice_offset, ell_u_columns,
+        ell_u_values);
+}
+#endif
 
 /*
     Permutes a vector using the coloring matrix
@@ -2324,11 +2642,11 @@ void ComputeProlongationCuda(const SparseMatrix& A, Vector& x)
 //////////////////////// CG Support Kernels: WAXPBY ///////////////////////////
 /*
     GPU Kernel
-    Computes WAXPBY
+    Computes WAXPBY - double2 version
 */
 template<int THREADS_PER_CTA, int ROUNDS>
  __global__ void __launch_bounds__(THREADS_PER_CTA)
-    computeWAXPBY_kernel(const local_int_t n, double alpha, double* __restrict__ x, double beta, double* __restrict__ y, double* w)
+    computeWAXPBY_kernel_double2(const local_int_t n, double alpha, double* __restrict__ x, double beta, double* __restrict__ y, double* w)
  {
     const local_int_t gid = blockIdx.x * blockDim.x + threadIdx.x;
     const local_int_t stride = blockDim.x * gridDim.x;
@@ -2358,6 +2676,58 @@ template<int THREADS_PER_CTA, int ROUNDS>
          }
      }
  }
+
+/*
+    GPU Kernel
+    Computes WAXPBY - double4 version
+*/
+template<int THREADS_PER_CTA, int ROUNDS>
+ __global__ void __launch_bounds__(THREADS_PER_CTA)
+    computeWAXPBY_kernel_double4(const local_int_t n, double alpha, double* __restrict__ x, double beta, double* __restrict__ y, double* w)
+ {
+    const local_int_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+    const local_int_t stride = blockDim.x * gridDim.x;
+    
+    // Process ROUNDS rounds of double4 elements per thread
+    #pragma unroll
+    for (int round = 0; round < ROUNDS; ++round)
+    {
+        local_int_t base_idx = gid + round * stride;
+
+         // Use double4 for vectorized loads/stores when possible
+         if ( (base_idx * 4 + 3) < n)
+         {
+             double4 x_vec = *reinterpret_cast<double4*>(&x[base_idx * 4]);
+             double4 y_vec = *reinterpret_cast<double4*>(&y[base_idx * 4]);
+             
+             double4 w_vec;
+             w_vec.x = alpha * x_vec.x + beta * y_vec.x;
+             w_vec.y = alpha * x_vec.y + beta * y_vec.y;
+             w_vec.z = alpha * x_vec.z + beta * y_vec.z;
+             w_vec.w = alpha * x_vec.w + beta * y_vec.w;
+             
+             *reinterpret_cast<double4*>(&w[base_idx * 4]) = w_vec;
+         }
+         else if ( (base_idx * 4 + 2) < n)
+         {
+             // Handle 3 remaining elements
+             w[base_idx * 4] = alpha * x[base_idx * 4] + beta * y[base_idx * 4];
+             w[base_idx * 4 + 1] = alpha * x[base_idx * 4 + 1] + beta * y[base_idx * 4 + 1];
+             w[base_idx * 4 + 2] = alpha * x[base_idx * 4 + 2] + beta * y[base_idx * 4 + 2];
+         }
+         else if ( (base_idx * 4 + 1) < n)
+         {
+             // Handle 2 remaining elements
+             w[base_idx * 4] = alpha * x[base_idx * 4] + beta * y[base_idx * 4];
+             w[base_idx * 4 + 1] = alpha * x[base_idx * 4 + 1] + beta * y[base_idx * 4 + 1];
+         }
+         else if ( (base_idx * 4) < n)
+         {
+             // Handle 1 remaining element
+             w[base_idx * 4] = alpha * x[base_idx * 4] + beta * y[base_idx * 4];
+         }
+     }
+ }
  
 
 /*
@@ -2368,20 +2738,26 @@ void ComputeWAXPBYCuda(
 {
     const int ROUNDS = 1;
     const int THREADS_PER_CTA = 256;
-    const int ELELEMENTS_PER_CTA = THREADS_PER_CTA * ROUNDS * 2; // 2 doubles per thread, # rounds per thread
-    const int grid = (n + ELELEMENTS_PER_CTA - 1) / ELELEMENTS_PER_CTA;
-    computeWAXPBY_kernel<THREADS_PER_CTA, ROUNDS><<<grid, THREADS_PER_CTA, 0, stream>>>(n, alpha, x.values_d, beta, y.values_d, w.values_d);
+    if (g_config.VECTOR_WIDTH == 4) {
+        const int ELELEMENTS_PER_CTA = THREADS_PER_CTA * ROUNDS * 4; // 4 doubles per thread, # rounds per thread
+        const int grid = (n + ELELEMENTS_PER_CTA - 1) / ELELEMENTS_PER_CTA;
+        computeWAXPBY_kernel_double4<THREADS_PER_CTA, ROUNDS><<<grid, THREADS_PER_CTA, 0, stream>>>(n, alpha, x.values_d, beta, y.values_d, w.values_d);
+    } else {
+        const int ELELEMENTS_PER_CTA = THREADS_PER_CTA * ROUNDS * 2; // 2 doubles per thread, # rounds per thread
+        const int grid = (n + ELELEMENTS_PER_CTA - 1) / ELELEMENTS_PER_CTA;
+        computeWAXPBY_kernel_double2<THREADS_PER_CTA, ROUNDS><<<grid, THREADS_PER_CTA, 0, stream>>>(n, alpha, x.values_d, beta, y.values_d, w.values_d);
+    }
     CHECK_CUDART(cudaStreamSynchronize(stream));
 }
 
 //////////////////////// CG Support Kernels: SYMG /////////////////////////////
 /*
     GPU Kernel
-    Multiplies x values with d and accumultaes back to x
+    Multiplies x values with d and accumultaes back to x - double2 version
 */
 template<int THREADS_PER_CTA, int ROUNDS>
  __global__ void __launch_bounds__(THREADS_PER_CTA)
-    spmvDiag_kernel(const local_int_t n, double* x, double* d)
+    spmvDiag_kernel_double2(const local_int_t n, double* x, double* d)
  {
      const local_int_t gid = blockIdx.x * blockDim.x + threadIdx.x;
      const local_int_t stride = blockDim.x * gridDim.x;
@@ -2413,11 +2789,62 @@ template<int THREADS_PER_CTA, int ROUNDS>
 
 /*
     GPU Kernel
-    Computes z = x - r
+    Multiplies x values with d and accumultaes back to x - double4 version
+*/
+template<int THREADS_PER_CTA, int ROUNDS>
+ __global__ void __launch_bounds__(THREADS_PER_CTA)
+    spmvDiag_kernel_double4(const local_int_t n, double* x, double* d)
+ {
+     const local_int_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+     const local_int_t stride = blockDim.x * gridDim.x;
+     
+     // Process ROUNDS rounds of double4 elements per thread
+     #pragma unroll
+     for (int round = 0; round < ROUNDS; ++round)
+     {
+         local_int_t base_idx = gid + round * stride;
+         
+         // Use double4 for vectorized loads/stores when possible
+         if (base_idx * 4 + 3 < n)
+         {
+             double4 x_vec = *reinterpret_cast<double4*>(&x[base_idx * 4]);
+             double4 d_vec = *reinterpret_cast<double4*>(&d[base_idx * 4]);
+             
+             x_vec.x *= d_vec.x;
+             x_vec.y *= d_vec.y;
+             x_vec.z *= d_vec.z;
+             x_vec.w *= d_vec.w;
+             
+             *reinterpret_cast<double4*>(&x[base_idx * 4]) = x_vec;
+         }
+         else if (base_idx * 4 + 2 < n)
+         {
+             // Handle 3 remaining elements
+             x[base_idx * 4] *= d[base_idx * 4];
+             x[base_idx * 4 + 1] *= d[base_idx * 4 + 1];
+             x[base_idx * 4 + 2] *= d[base_idx * 4 + 2];
+         }
+         else if (base_idx * 4 + 1 < n)
+         {
+             // Handle 2 remaining elements
+             x[base_idx * 4] *= d[base_idx * 4];
+             x[base_idx * 4 + 1] *= d[base_idx * 4 + 1];
+         }
+         else if (base_idx * 4 < n)
+         {
+             // Handle 1 remaining element
+             x[base_idx * 4] *= d[base_idx * 4];
+         }
+     }
+ }
+
+/*
+    GPU Kernel
+    Computes z = x - r - double2 version
 */
 template<int THREADS_PER_CTA, int ROUNDS>
 __global__ void __launch_bounds__(THREADS_PER_CTA)
-    axpby_kernel(const local_int_t n, double* x, double* y, double* z)
+    axpby_kernel_double2(const local_int_t n, double* x, double* y, double* z)
 {
     const local_int_t gid = blockIdx.x * blockDim.x + threadIdx.x;
     const local_int_t stride = blockDim.x * gridDim.x;
@@ -2450,11 +2877,63 @@ __global__ void __launch_bounds__(THREADS_PER_CTA)
 
 /*
     GPU Kernel
-    Computes z += x * y
+    Computes z = x - r - double4 version
 */
 template<int THREADS_PER_CTA, int ROUNDS>
 __global__ void __launch_bounds__(THREADS_PER_CTA)
-    spFma_kernel(const local_int_t n, double* x, double* y, double* z)
+    axpby_kernel_double4(const local_int_t n, double* x, double* y, double* z)
+{
+    const local_int_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+    const local_int_t stride = blockDim.x * gridDim.x;
+    
+    // Process ROUNDS rounds of double4 elements per thread
+    #pragma unroll
+    for (int round = 0; round < ROUNDS; ++round)
+    {
+        local_int_t base_idx = gid + round * stride;
+        
+        // Use double4 for vectorized loads/stores when possible
+        if (base_idx * 4 + 3 < n)
+        {
+            double4 x_vec = *reinterpret_cast<double4*>(&x[base_idx * 4]);
+            double4 y_vec = *reinterpret_cast<double4*>(&y[base_idx * 4]);
+            
+            double4 z_vec;
+            z_vec.x = x_vec.x - y_vec.x;
+            z_vec.y = x_vec.y - y_vec.y;
+            z_vec.z = x_vec.z - y_vec.z;
+            z_vec.w = x_vec.w - y_vec.w;
+            
+            *reinterpret_cast<double4*>(&z[base_idx * 4]) = z_vec;
+        }
+        else if (base_idx * 4 + 2 < n)
+        {
+            // Handle 3 remaining elements
+            z[base_idx * 4] = x[base_idx * 4] - y[base_idx * 4];
+            z[base_idx * 4 + 1] = x[base_idx * 4 + 1] - y[base_idx * 4 + 1];
+            z[base_idx * 4 + 2] = x[base_idx * 4 + 2] - y[base_idx * 4 + 2];
+        }
+        else if (base_idx * 4 + 1 < n)
+        {
+            // Handle 2 remaining elements
+            z[base_idx * 4] = x[base_idx * 4] - y[base_idx * 4];
+            z[base_idx * 4 + 1] = x[base_idx * 4 + 1] - y[base_idx * 4 + 1];
+        }
+        else if (base_idx * 4 < n)
+        {
+            // Handle 1 remaining element
+            z[base_idx * 4] = x[base_idx * 4] - y[base_idx * 4];
+        }
+    }
+}
+
+/*
+    GPU Kernel
+    Computes z += x * y - double2 version
+*/
+template<int THREADS_PER_CTA, int ROUNDS>
+__global__ void __launch_bounds__(THREADS_PER_CTA)
+    spFma_kernel_double2(const local_int_t n, double* x, double* y, double* z)
 {
     const local_int_t gid = blockIdx.x * blockDim.x + threadIdx.x;
     const local_int_t stride = blockDim.x * gridDim.x;
@@ -2486,6 +2965,58 @@ __global__ void __launch_bounds__(THREADS_PER_CTA)
 }
 
 /*
+    GPU Kernel
+    Computes z += x * y - double4 version
+*/
+template<int THREADS_PER_CTA, int ROUNDS>
+__global__ void __launch_bounds__(THREADS_PER_CTA)
+    spFma_kernel_double4(const local_int_t n, double* x, double* y, double* z)
+{
+    const local_int_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+    const local_int_t stride = blockDim.x * gridDim.x;
+    
+    // Process ROUNDS rounds of double4 elements per thread
+    #pragma unroll
+    for (int round = 0; round < ROUNDS; ++round)
+    {
+        local_int_t base_idx = gid + round * stride;
+        
+        // Use double4 for vectorized loads/stores when possible
+        if (base_idx * 4 + 3 < n)
+        {
+            double4 x_vec = *reinterpret_cast<double4*>(&x[base_idx * 4]);
+            double4 y_vec = *reinterpret_cast<double4*>(&y[base_idx * 4]);
+            double4 z_vec = *reinterpret_cast<double4*>(&z[base_idx * 4]);
+            
+            z_vec.x += x_vec.x * y_vec.x;
+            z_vec.y += x_vec.y * y_vec.y;
+            z_vec.z += x_vec.z * y_vec.z;
+            z_vec.w += x_vec.w * y_vec.w;
+            
+            *reinterpret_cast<double4*>(&z[base_idx * 4]) = z_vec;
+        }
+        else if (base_idx * 4 + 2 < n)
+        {
+            // Handle 3 remaining elements
+            z[base_idx * 4] += x[base_idx * 4] * y[base_idx * 4];
+            z[base_idx * 4 + 1] += x[base_idx * 4 + 1] * y[base_idx * 4 + 1];
+            z[base_idx * 4 + 2] += x[base_idx * 4 + 2] * y[base_idx * 4 + 2];
+        }
+        else if (base_idx * 4 + 1 < n)
+        {
+            // Handle 2 remaining elements
+            z[base_idx * 4] += x[base_idx * 4] * y[base_idx * 4];
+            z[base_idx * 4 + 1] += x[base_idx * 4 + 1] * y[base_idx * 4 + 1];
+        }
+        else if (base_idx * 4 < n)
+        {
+            // Handle 1 remaining element
+            z[base_idx * 4] += x[base_idx * 4] * y[base_idx * 4];
+        }
+    }
+}
+
+/*
     Multiplies x values with d and accumultaes back to x
     Calls spmvDiag_kernel
 */
@@ -2493,9 +3024,15 @@ void SpmvDiagCuda(local_int_t n, double* x, double* d)
 {
     const int ROUNDS = 1;
     const int THREADS_PER_CTA = 256;
-    const int ELELEMENTS_PER_CTA = THREADS_PER_CTA * ROUNDS * 2; // 2 doubles per thread, # rounds per thread
-    const int grid = (n + ELELEMENTS_PER_CTA - 1) / ELELEMENTS_PER_CTA;
-    spmvDiag_kernel<THREADS_PER_CTA, ROUNDS><<<grid, THREADS_PER_CTA, 0, stream>>>(n, x, d);
+    if (g_config.VECTOR_WIDTH == 4) {
+        const int ELELEMENTS_PER_CTA = THREADS_PER_CTA * ROUNDS * 4; // 4 doubles per thread, # rounds per thread
+        const int grid = (n + ELELEMENTS_PER_CTA - 1) / ELELEMENTS_PER_CTA;
+        spmvDiag_kernel_double4<THREADS_PER_CTA, ROUNDS><<<grid, THREADS_PER_CTA, 0, stream>>>(n, x, d);
+    } else {
+        const int ELELEMENTS_PER_CTA = THREADS_PER_CTA * ROUNDS * 2; // 2 doubles per thread, # rounds per thread
+        const int grid = (n + ELELEMENTS_PER_CTA - 1) / ELELEMENTS_PER_CTA;
+        spmvDiag_kernel_double2<THREADS_PER_CTA, ROUNDS><<<grid, THREADS_PER_CTA, 0, stream>>>(n, x, d);
+    }
 }
 
 /*
@@ -2506,9 +3043,15 @@ void AxpbyCuda(local_int_t n, double* x, double* y, double* z)
 {
     const int ROUNDS = 1;
     const int THREADS_PER_CTA = 256;
-    const int ELELEMENTS_PER_CTA = THREADS_PER_CTA * ROUNDS * 2; // 2 doubles per thread, # rounds per thread
-    const int grid = (n + ELELEMENTS_PER_CTA - 1) / ELELEMENTS_PER_CTA;
-    axpby_kernel<THREADS_PER_CTA, ROUNDS><<<grid, THREADS_PER_CTA, 0, stream>>>(n, x, y, z);
+    if (g_config.VECTOR_WIDTH == 4) {
+        const int ELELEMENTS_PER_CTA = THREADS_PER_CTA * ROUNDS * 4; // 4 doubles per thread, # rounds per thread
+        const int grid = (n + ELELEMENTS_PER_CTA - 1) / ELELEMENTS_PER_CTA;
+        axpby_kernel_double4<THREADS_PER_CTA, ROUNDS><<<grid, THREADS_PER_CTA, 0, stream>>>(n, x, y, z);
+    } else {
+        const int ELELEMENTS_PER_CTA = THREADS_PER_CTA * ROUNDS * 2; // 2 doubles per thread, # rounds per thread
+        const int grid = (n + ELELEMENTS_PER_CTA - 1) / ELELEMENTS_PER_CTA;
+        axpby_kernel_double2<THREADS_PER_CTA, ROUNDS><<<grid, THREADS_PER_CTA, 0, stream>>>(n, x, y, z);
+    }
 }
 
 /*
@@ -2519,9 +3062,15 @@ void SpFmaCuda(local_int_t n, double* x, double* y, double* z)
 {
     const int ROUNDS = 1;
     const int THREADS_PER_CTA = 256;
-    const int ELELEMENTS_PER_CTA = THREADS_PER_CTA * ROUNDS * 2; // 2 doubles per thread, # rounds per thread
-    const int grid = (n + ELELEMENTS_PER_CTA - 1) / ELELEMENTS_PER_CTA;
-    spFma_kernel<THREADS_PER_CTA, ROUNDS><<<grid, THREADS_PER_CTA, 0, stream>>>(n, x, y, z);
+    if (g_config.VECTOR_WIDTH == 4) {
+        const int ELELEMENTS_PER_CTA = THREADS_PER_CTA * ROUNDS * 4; // 4 doubles per thread, # rounds per thread
+        const int grid = (n + ELELEMENTS_PER_CTA - 1) / ELELEMENTS_PER_CTA;
+        spFma_kernel_double4<THREADS_PER_CTA, ROUNDS><<<grid, THREADS_PER_CTA, 0, stream>>>(n, x, y, z);
+    } else {
+        const int ELELEMENTS_PER_CTA = THREADS_PER_CTA * ROUNDS * 2; // 2 doubles per thread, # rounds per thread
+        const int grid = (n + ELELEMENTS_PER_CTA - 1) / ELELEMENTS_PER_CTA;
+        spFma_kernel_double2<THREADS_PER_CTA, ROUNDS><<<grid, THREADS_PER_CTA, 0, stream>>>(n, x, y, z);
+    }
 }
 
 ///////// CG Support Kernels: External Matrix SpMV + Scatter //////////////////
@@ -2549,12 +3098,12 @@ __global__ void __launch_bounds__(THREADS_PER_CTA) extMv_kernel(const local_int_
 
     const local_int_t lrow = blockIdx.x * NTHREADS + tidy;
 
-    const local_int_t str = row < n ? csr_offsets[lrow] : 0;
-    const local_int_t end = row < n ? csr_offsets[lrow + 1] : 0;
+    const slice_ptr_t str = row < n ? csr_offsets[lrow] : 0;
+    const slice_ptr_t end = row < n ? csr_offsets[lrow + 1] : 0;
     double sum = 0.0;
     columns += str + tidx;
     values += str + tidx;
-    local_int_t last = end - str - tidx;
+    slice_ptr_t last = end - str - tidx;
 #pragma unroll
     for (int i = 0; i < UNROLL; i++)
     {
@@ -2738,4 +3287,1405 @@ size_t CopyDataToHostCuda(SparseMatrix& A_in, Vector* b, Vector* x, Vector* xexa
 
     return fnbytes;
 }
+
+
+
+template<int ThreadsPerCTA, int Unroll>
+__global__ __launch_bounds__(ThreadsPerCTA)
+void ex_spsv_sell_single_color_v1_kernel(int slice_size,
+                                      int color_str,
+                                      int color_end,
+                                      double* __restrict__ x,
+                                      const double* __restrict__ y,
+                                      slice_ptr_t* slice_offsets,
+                                      const local_int_t* __restrict__ col_idx,
+                                      const double* __restrict__ values,
+                                      double* inv_d_values,
+                                      double alpha) 
+{
+    auto row_original_id = blockIdx.x * ThreadsPerCTA + threadIdx.x + color_str;
+    int row_inblock_id = row_original_id % slice_size;
+    int row_block_id   = row_original_id / slice_size;
+    double  sell_sum       = 0.0f;
+    if (row_original_id < color_end) {
+        slice_ptr_t  row_start_index = slice_offsets[row_block_id] + row_inblock_id;
+        // Per-slice nnz is bounded by slice_size*HPCG_MAX_ROW_LEN (fits in int).
+        // Cast to int BEFORE the divide so we get a 32-bit idiv instead of the
+        // slow emulated 64-bit idiv, since slice_ptr_t is long long.
+        int slice_nnz       = (int)(slice_offsets[row_block_id + 1] -
+                                    slice_offsets[row_block_id]);
+        int max_row_len     = slice_nnz / slice_size;
+        auto           max_nnz       = max_row_len;
+        const local_int_t*   cols    = col_idx + row_start_index;
+        const double*  vals          = values + row_start_index;
+        int            unroll_nz     = (max_nnz + Unroll - 1) / Unroll;
+
+        local_int_t col[Unroll];
+        double  a_val[Unroll];
+
+        #pragma unroll Unroll
+        for (auto K = 0; K < Unroll; K++) {
+            if (K < max_nnz) {
+                col[K]   = __ldcs(cols);
+                a_val[K] = __ldcs(vals);
+            }
+            else {
+                col[K]   = -1;
+                a_val[K] = 0.0f;
+            }
+            cols += (slice_size);
+            vals += (slice_size);
+        }
+        max_nnz -= Unroll;
+
+        double b_val[Unroll];
+        #pragma unroll 1
+        for (auto q = 1; q < unroll_nz - 1; q++) {
+            #pragma unroll Unroll
+            for (auto K = 0; K < Unroll; K++) {
+                if (col[K] >= 0) {
+                    b_val[K] = x[col[K]];
+                    sell_sum = a_val[K] * b_val[K] + sell_sum;
+                }
+
+                col[K]    = __ldcs(cols);
+                a_val[K]  = __ldcs(vals);
+                cols     += (slice_size);
+                vals     += (slice_size);
+            }
+            max_nnz -= Unroll;
+        }
+        if (1 < unroll_nz) {
+            #pragma unroll Unroll
+            for (auto K = 0; K < Unroll; K++) {
+                if (col[K] >= 0) {
+                    b_val[K] = x[col[K]];
+                    sell_sum = a_val[K] * b_val[K] + sell_sum;
+                }
+                a_val[K] = 0.0f;
+                if (0 < max_nnz) {
+                    col[K]   = __ldcs(cols);
+                    a_val[K] = __ldcs(vals);
+                }
+                max_nnz -= 1;
+                cols    += (slice_size);
+                vals    += (slice_size);
+            }
+        }
+        #pragma unroll Unroll
+        for (auto K = 0; K < Unroll; K++) {
+            if (col[K] >= 0) {
+                b_val[K] = x[col[K]];
+                sell_sum = a_val[K] * b_val[K] + sell_sum;
+            }
+        }
+
+        auto diag          = __ldcs(&inv_d_values[row_original_id]);
+        auto b_store       = y[row_original_id];
+        b_store            = ((alpha * b_store) - sell_sum) / diag;
+        x[row_original_id] = b_store;
+    }
+}
+
+// Helper functions and macros for TMA kernels (always compiled since TMA is runtime-configurable)
+#define SWAP(x, y) do { \
+    typeof(x) temp = x; \
+    x = y; \
+    y = temp; \
+} while(0)
+
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
+// Separate warp0 detection logic
+__device__ __forceinline__ bool is_warp_zero()
+{
+    unsigned int tid = threadIdx.x;
+    unsigned int warp_id = tid / 32;
+    unsigned int uniform_warp_id = __shfl_sync(0xFFFFFFFF, warp_id, 0); // Broadcast from lane 0
+    return uniform_warp_id == 0;
+}
+
+__device__ __forceinline__ bool is_thread_zero()
+{
+    uint32_t elected;
+    asm("{"
+            ".reg .pred %p;"
+            "elect.sync _|%p, 0xFFFFFFFF;"
+            "selp.b32 %0, 1, 0, %p;"
+        "}"
+        : "=r"(elected)
+
+    );
+    return static_cast<bool>(elected);
+}
+
+
+inline __device__ void cp_async_bulk_prefetch_L2(const void *global_ptr, const uint32_t num_bytes) {
+    asm volatile(
+        "cp.async.bulk.prefetch.L2.global [%0], %1;"
+        :
+        : "l"(__cvta_generic_to_global(global_ptr)),
+          "r"(num_bytes)
+        :
+    );
+}
+
+//TMA version for ex_spsv_sell_single_color_v1_kernel (single color)
+template<int BlockSize, int Unroll>
+__global__ __launch_bounds__(BlockSize)
+void ex_spsv_sell_single_color_v1_tma_kernel(
+                const __grid_constant__ CUtensorMap             cols_tensor_map,
+                const __grid_constant__ CUtensorMap             vals_tensor_map,
+                int                                             slice_size,
+                int                                             color_str,
+                int                                             color_end,
+                double*                                         x,
+                const double*                                   y,
+                const slice_ptr_t*                              slice_offsets,
+                const local_int_t*                              col_idx,
+                const double*                                   values,
+                double*                                         inv_d_values,
+                double                                          alpha,
+                slice_ptr_t                                     base)
+{
+    auto row_original_id    = blockIdx.x * BlockSize + threadIdx.x + color_str;
+    
+    int row_inblock_id = row_original_id % slice_size;
+    int row_block_id   = row_original_id / slice_size;
+
+    // TMA infrastructure
+    __shared__ uint64_t bar[8];
+    uint64_t* bar_curr = &bar[0];
+    uint64_t* bar_next = &bar[1];
+
+    __shared__ char __attribute__((aligned(128))) a_vals_buf[Unroll * BlockSize * sizeof(double)];
+    __shared__ char __attribute__((aligned(128))) a_cols_buf[Unroll * BlockSize * sizeof(int)];
+    __shared__ char __attribute__((aligned(128))) b_val_buf[Unroll * BlockSize * sizeof(double)];
+    __shared__ char __attribute__((aligned(128))) b_cols_buf[Unroll * BlockSize * sizeof(int)];
+
+    double* curr_vals_buf_ptr = reinterpret_cast<double*>(a_vals_buf);
+    int* curr_cols_buf_ptr = reinterpret_cast<int*>(a_cols_buf);
+    double* next_vals_buf_ptr = reinterpret_cast<double*>(b_val_buf);
+    int* next_cols_buf_ptr = reinterpret_cast<int*>(b_cols_buf);
+
+    __shared__ slice_ptr_t row_start_index_shared, row_end_index_shared;
+    
+    //if (row_original_id >= color_end) return;
+    
+    if(is_warp_zero() && is_thread_zero()) {
+        ptx::mbarrier_init(bar_curr, 1);
+        ptx::mbarrier_init(bar_next, 1);
+        ptx::fence_proxy_async(ptx::space_shared);
+
+        row_start_index_shared = slice_offsets[row_block_id] - base;
+        row_end_index_shared   = slice_offsets[row_block_id + 1] - base;
+    }
+    __syncthreads();
+
+    int stage           = 0;
+    int x_offset        = blockIdx.x % (slice_size/BlockSize);
+    auto row_start_index = row_inblock_id % BlockSize;
+    // Cast to int BEFORE the divide to avoid an emulated 64-bit idiv, since
+    // slice_ptr_t is long long.
+    int slice_nnz        = (int)(row_end_index_shared - row_start_index_shared);
+    int max_row_len      = slice_nnz / slice_size;
+    auto sell_sum        = double{};
+    auto unroll_nz       = (max_row_len + Unroll - 1) / Unroll;
+
+    double b_val[Unroll];
+
+    //Prefetch: Assumes at least unroll_nz >= 1
+    if(is_warp_zero() && is_thread_zero()) {
+        int num_elements = BlockSize * Unroll;
+        int32_t coords[2] = {x_offset * BlockSize, (int32_t)(row_start_index_shared/slice_size)};
+        ptx::cp_async_bulk_tensor(ptx::space_shared, cuda::ptx::space_global, curr_vals_buf_ptr, &vals_tensor_map, coords, bar_curr);
+        ptx::cp_async_bulk_tensor(ptx::space_shared, cuda::ptx::space_global, curr_cols_buf_ptr, &cols_tensor_map, coords, bar_curr);
+        ptx::mbarrier_arrive_expect_tx(ptx::sem_release, ptx::scope_cta, ptx::space_shared, bar_curr, num_elements * (sizeof(double) + sizeof(int)));
+    }
+
+    stage ^= 1;
+    __syncthreads();
+    int parity = 0;
+
+    #pragma unroll 1
+    for (auto q = 1; q < unroll_nz - 1; q++) {
+
+        if (is_warp_zero() && is_thread_zero()) {
+            int num_elements = BlockSize * Unroll;
+            int32_t coords[2] = {x_offset * BlockSize, (int32_t)(row_start_index_shared/slice_size) + q * Unroll};
+            ptx::cp_async_bulk_tensor(ptx::space_shared, cuda::ptx::space_global, next_vals_buf_ptr, &vals_tensor_map, coords, bar_next);
+            ptx::cp_async_bulk_tensor(ptx::space_shared, cuda::ptx::space_global, next_cols_buf_ptr, &cols_tensor_map, coords, bar_next);
+            ptx::mbarrier_arrive_expect_tx(ptx::sem_release, ptx::scope_cta, ptx::space_shared, bar_next, num_elements * (sizeof(double) + sizeof(int)));
+        }
+
+        stage ^= 1;
+        while(!ptx::mbarrier_try_wait_parity(bar_curr, parity)) {}
+        parity ^= stage;
+        
+        #pragma unroll Unroll
+        for (auto K = 0; K < Unroll; K++) {
+            int col_id = row_start_index + K * BlockSize;
+            if(curr_cols_buf_ptr[col_id] >= 0) {
+                b_val[K] = x[curr_cols_buf_ptr[col_id]];
+                sell_sum += curr_vals_buf_ptr[col_id] * b_val[K];
+            }
+        }
+
+        __syncthreads();
+
+        SWAP(bar_curr, bar_next);
+        SWAP(curr_vals_buf_ptr, next_vals_buf_ptr);
+        SWAP(curr_cols_buf_ptr, next_cols_buf_ptr);
+    
+        max_row_len -= Unroll;
+    }
+    
+    if (1 < unroll_nz) {
+       max_row_len -= Unroll;
+       if (is_warp_zero() && is_thread_zero()) {
+            int32_t coords[2] = {x_offset * BlockSize, (int32_t)(row_start_index_shared/slice_size) + (unroll_nz - 1) * Unroll};
+            ptx::cp_async_bulk_tensor(ptx::space_shared, cuda::ptx::space_global, next_vals_buf_ptr, &vals_tensor_map, coords, bar_next);
+            ptx::cp_async_bulk_tensor(ptx::space_shared, cuda::ptx::space_global, next_cols_buf_ptr, &cols_tensor_map, coords, bar_next);
+            ptx::mbarrier_arrive_expect_tx(ptx::sem_release, ptx::scope_cta, ptx::space_shared, bar_next, BlockSize * Unroll * (sizeof(double) + sizeof(int)));
+        }
+
+        stage ^= 1;
+        while(!ptx::mbarrier_try_wait_parity(bar_curr, parity)) {}
+        parity ^= stage;
+
+        #pragma unroll Unroll
+        for (auto K = 0; K < Unroll; K++) {
+            int col_id = row_start_index + K * BlockSize;
+            if(curr_cols_buf_ptr[col_id] >= 0) {
+                b_val[K] = x[curr_cols_buf_ptr[col_id]];
+                sell_sum += curr_vals_buf_ptr[col_id] * b_val[K];
+            }
+        }
+
+        SWAP(bar_curr, bar_next);
+        SWAP(curr_vals_buf_ptr, next_vals_buf_ptr);
+        SWAP(curr_cols_buf_ptr, next_cols_buf_ptr);
+    }
+
+    stage ^= 1;
+    while(!ptx::mbarrier_try_wait_parity(bar_curr, parity)) {}
+    parity ^= stage;
+
+    #pragma unroll Unroll
+    for (auto K = 0; K < Unroll; K++) {
+        int col_id = row_start_index + K * BlockSize;
+        if(curr_cols_buf_ptr[col_id] >= 0 && K < max_row_len) {
+            b_val[K] = x[curr_cols_buf_ptr[col_id]];
+            sell_sum += curr_vals_buf_ptr[col_id] * b_val[K];
+        }
+    }
+
+    if(row_original_id < color_end) {       
+        auto diag          = __ldcs(&inv_d_values[row_original_id]);
+        auto b_store       = y[row_original_id];
+        b_store            = ((alpha * b_store) - sell_sum) / diag;
+        x[row_original_id] = b_store;
+    }
+}
+
+template<int BlockSize, int Unroll>
+__global__ __launch_bounds__(BlockSize)
+void sellmv_v1_2D_kernel(
+    int                         m,
+    double                      alpha,
+    double                      beta,
+    int                         slice_size,
+    const slice_ptr_t* __restrict__  d_sell_offsets,
+    const local_int_t* __restrict__  d_columns,
+    const double* __restrict__  d_values,
+    const double* __restrict__  d_X,
+    double* __restrict__        d_Y) {
+
+    auto tx                 = threadIdx.x;
+    auto ty                 = blockIdx.x;
+    local_int_t col[Unroll];
+    double a_val[Unroll];
+    double b_val[Unroll];
+
+    // Grid launch guarantees gridDim.y * BlockSize >= m/8, so each thread
+    // handles at most one row. Matches the cuSPARSE sellmv_v1_2D_kernel shape.
+    auto row_original_id    = tx + blockDim.x * blockIdx.y;
+    if (row_original_id < m / 8) {
+        row_original_id         += ty * (m / 8);
+        auto row_in_slice_id    = row_original_id % slice_size;
+        auto row_slice_id       = row_original_id / slice_size;
+        slice_ptr_t row_start_index = d_sell_offsets[row_slice_id] + row_in_slice_id;
+        // Per-slice nnz fits in int; cast BEFORE divide to avoid the emulated
+        // 64-bit idiv, since slice_ptr_t is long long.
+        int slice_nnz         = (int)(d_sell_offsets[row_slice_id + 1] - d_sell_offsets[row_slice_id]);
+        double sell_sum       = 0.0f;
+        int max_row_len       = slice_nnz / slice_size;
+        const local_int_t *cols = d_columns + row_start_index;
+        const double *vals       = d_values  + row_start_index;
+        int unroll_nz          = (max_row_len + Unroll - 1) / Unroll;
+
+        #pragma unroll Unroll
+        for (auto K = 0; K < Unroll; K++) {
+            if (K < max_row_len) {
+                col[K]   = __ldcs(cols);
+                a_val[K] = __ldcs(vals);
+            }
+            else {
+                col[K]   = -1;
+                a_val[K] = 0.0f;
+            }
+            cols+=(slice_size); vals+=(slice_size);
+        }
+        max_row_len -= Unroll;
+
+
+        #pragma unroll 1
+        for (auto q = 1; q < unroll_nz - 1; q++) {
+            #pragma unroll Unroll
+            for (auto K = 0; K < Unroll; K++) {
+                if(col[K] >= 0) {
+                    b_val[K] = d_X[col[K]];
+                    sell_sum = a_val[K] * b_val[K] + sell_sum;
+                }
+
+                col[K]   = __ldcs(cols);
+                a_val[K] = __ldcs(vals);
+                cols+=(slice_size); vals+=(slice_size);
+            }
+            max_row_len -= Unroll;
+        }
+        if (1 < unroll_nz) {
+            #pragma unroll Unroll
+            for (auto K = 0; K < Unroll; K++) {
+                if(col[K] >= 0) {
+                    b_val[K] = d_X[col[K]];
+                    sell_sum = a_val[K] * b_val[K] + sell_sum;
+                }
+                a_val[K] = 0.0f;
+                if (0 < max_row_len) {
+                    col[K] = __ldcs(cols);
+                    a_val[K] = __ldcs(vals);
+                }
+                max_row_len--;
+                cols+=(slice_size); vals+=(slice_size);
+            }
+        }
+
+        #pragma unroll Unroll
+        for (auto K = 0; K < Unroll; K++) {
+            if(col[K] >= 0) {
+                b_val[K] = d_X[col[K]];
+                sell_sum = a_val[K] * b_val[K] + sell_sum;
+            }
+        }
+
+        if (beta == 0.0) {
+            d_Y[row_original_id] = alpha * sell_sum;
+        }
+        else {
+            double result = beta * d_Y[row_original_id]
+                        + alpha * sell_sum;
+            d_Y[row_original_id] = result;
+        }
+    }
+}
+
+//Assumes a 2D Matrix (Slice size x Number of padded rows)
+template<int BlockSize, int Unroll>
+__global__ __launch_bounds__(BlockSize)
+void sellmv_v1_tma_2D_tensor_kernel_double_int32(
+                const __grid_constant__ CUtensorMap             cols_tensor_map,
+                const __grid_constant__ CUtensorMap             vals_tensor_map,
+                int                     m,
+                 double                  alpha,
+                 double                  beta,
+                 int                     slice_size,
+                 const slice_ptr_t*            d_sell_offsets,
+                 const local_int_t*            d_columns,
+                 const double*                 d_values,
+                 slice_ptr_t             base,
+                 const double*                 d_X,
+                 double*                       d_Y) 
+                
+{
+    auto is_beta_zero       = beta == 0.0;
+    auto tx                 = threadIdx.x;
+    auto ty                 = blockIdx.x;
+    auto row_original_id    = tx + blockDim.x*blockIdx.y;
+    row_original_id         += ty * m/8;
+
+    auto row_in_slice_id    = row_original_id % slice_size;
+    auto row_slice_id       = row_original_id / slice_size;
+   
+
+    // TMA infrastructure - Use static shared memory
+    __shared__ uint64_t bar[8];
+    uint64_t* bar_curr = &bar[0];
+    uint64_t* bar_next = &bar[1];
+
+    __shared__ char __attribute__((aligned(128))) a_vals_buf[Unroll * BlockSize * sizeof(double)];
+    __shared__ char __attribute__((aligned(128))) a_cols_buf[Unroll * BlockSize * sizeof(int)];
+    __shared__ char __attribute__((aligned(128))) b_val_buf[Unroll * BlockSize * sizeof(double)];
+    __shared__ char __attribute__((aligned(128))) b_cols_buf[Unroll * BlockSize * sizeof(int)];
+
+    double* curr_vals_buf_ptr = reinterpret_cast<double*>(a_vals_buf);
+    int* curr_cols_buf_ptr = reinterpret_cast<int*>(a_cols_buf);
+    double* next_vals_buf_ptr = reinterpret_cast<double*>(b_val_buf);
+    int* next_cols_buf_ptr = reinterpret_cast<int*>(b_cols_buf);
+
+    __shared__ slice_ptr_t row_start_index_shared, row_end_index_shared;
+    if(is_warp_zero() && is_thread_zero()) {
+        ptx::mbarrier_init(bar_curr, 1);
+        ptx::mbarrier_init(bar_next, 1);
+        ptx::fence_proxy_async(ptx::space_shared);
+
+        row_start_index_shared    = d_sell_offsets[row_slice_id] - base;
+        row_end_index_shared      = d_sell_offsets[row_slice_id + 1] - base;
+    }
+
+    __syncthreads();
+
+
+    int stage           = 0;
+    int x_offset            = blockIdx.y % (slice_size/BlockSize);
+    auto row_start_index    = row_in_slice_id % (BlockSize);
+    // Cast to int BEFORE the divide to avoid an emulated 64-bit idiv, since
+    // slice_ptr_t is long long.
+    int slice_nnz           = (int)(row_end_index_shared - row_start_index_shared);
+    int max_row_len         = slice_nnz / slice_size;
+    auto sell_sum           = double{};
+    auto unroll_nz          = (max_row_len + Unroll - 1) / Unroll;
+
+    //Prefetch: Assumes at least unroll_nz >= 1
+    if(is_warp_zero() && is_thread_zero()) {
+        int num_elements = BlockSize * Unroll;
+        int32_t coords[2] = {x_offset * BlockSize, (int32_t)(row_start_index_shared/slice_size)};
+        ptx::cp_async_bulk_tensor(ptx::space_shared, cuda::ptx::space_global, curr_vals_buf_ptr, &vals_tensor_map, coords, bar_curr);
+        ptx::cp_async_bulk_tensor(ptx::space_shared, cuda::ptx::space_global, curr_cols_buf_ptr, &cols_tensor_map, coords, bar_curr);
+        ptx::mbarrier_arrive_expect_tx(ptx::sem_release, ptx::scope_cta, ptx::space_shared, bar_curr, num_elements * (sizeof(double) + sizeof(int)));
+    }
+
+    //Stage and parity represent two step barrier
+    stage ^= 1;
+    __syncthreads();
+    int parity = 0;
+
+    #pragma unroll 1
+    for (auto q = 1; q < unroll_nz - 1; q++) {
+
+        if (is_warp_zero() && is_thread_zero()) {
+            int num_elements = BlockSize * Unroll;
+            int32_t coords[2] = {x_offset * BlockSize, (int32_t)(row_start_index_shared/slice_size) + q * (Unroll)};
+            ptx::cp_async_bulk_tensor(ptx::space_shared, cuda::ptx::space_global, next_vals_buf_ptr, &vals_tensor_map, coords, bar_next);
+            ptx::cp_async_bulk_tensor(ptx::space_shared, cuda::ptx::space_global, next_cols_buf_ptr, &cols_tensor_map, coords, bar_next);
+            ptx::mbarrier_arrive_expect_tx(ptx::sem_release, ptx::scope_cta, ptx::space_shared, bar_next, num_elements * (sizeof(double) + sizeof(int)));
+        }
+
+        stage ^= 1;
+        while(!ptx::mbarrier_try_wait_parity(bar_curr, parity)) {}
+        parity ^= stage;
+        
+        #pragma unroll Unroll
+        for (auto K = 0; K < Unroll; K++) {
+            int col_id = row_start_index + K * BlockSize;
+            //FMA
+            if(curr_cols_buf_ptr[col_id] >= 0) {
+                double b_val = d_X[curr_cols_buf_ptr[col_id]];
+                sell_sum += curr_vals_buf_ptr[col_id] * b_val;
+            }
+        }
+
+        //This one is critical to avoid race conditions
+        __syncthreads();
+
+        SWAP(bar_curr, bar_next);
+        SWAP(curr_vals_buf_ptr, next_vals_buf_ptr);
+        SWAP(curr_cols_buf_ptr, next_cols_buf_ptr);
+    
+        max_row_len -= Unroll;
+    }
+    if (1 < unroll_nz) {
+        max_row_len -= Unroll;
+        if (is_warp_zero() && is_thread_zero()) {
+            int32_t coords[2] = {x_offset * BlockSize, (int32_t)(row_start_index_shared/slice_size) + (unroll_nz - 1) * Unroll};
+            ptx::cp_async_bulk_tensor(ptx::space_shared, cuda::ptx::space_global, next_vals_buf_ptr, &vals_tensor_map, coords, bar_next);
+            ptx::cp_async_bulk_tensor(ptx::space_shared, cuda::ptx::space_global, next_cols_buf_ptr, &cols_tensor_map, coords, bar_next);
+            ptx::mbarrier_arrive_expect_tx(ptx::sem_release, ptx::scope_cta, ptx::space_shared, bar_next, BlockSize * Unroll * (sizeof(double) + sizeof(int)));
+            
+        }
+
+        stage ^= 1;
+        while(!ptx::mbarrier_try_wait_parity(bar_curr, parity)) {}
+        parity ^= stage;
+
+        #pragma unroll Unroll
+        for (auto K = 0; K < Unroll; K++) {
+            int col_id = row_start_index + K * BlockSize;
+            if(curr_cols_buf_ptr[col_id] >= 0) {
+                double b_val = d_X[curr_cols_buf_ptr[col_id]];
+                sell_sum += curr_vals_buf_ptr[col_id] * b_val;
+            }
+        }
+
+        SWAP(bar_curr, bar_next);
+        SWAP(curr_vals_buf_ptr, next_vals_buf_ptr);
+        SWAP(curr_cols_buf_ptr, next_cols_buf_ptr);
+    }
+
+    stage ^= 1;
+    while(!ptx::mbarrier_try_wait_parity(bar_curr, parity)) {}
+    parity ^= stage;
+
+    #pragma unroll Unroll
+    for (auto K = 0; K < Unroll; K++) {
+        int col_id = row_start_index + K * BlockSize;
+        if(curr_cols_buf_ptr[col_id] >= 0 && K < max_row_len) {
+            double b_val = d_X[curr_cols_buf_ptr[col_id]];
+            sell_sum += curr_vals_buf_ptr[col_id] * b_val;
+        }
+    }
+
+    if (is_beta_zero) {
+        d_Y[row_original_id] = alpha * sell_sum;
+    }
+    else {
+        double result = beta * d_Y[row_original_id] + alpha * sell_sum;
+        d_Y[row_original_id] = result;
+    }
+}
+
+enum DIR{Forward = 0, Backward = 1, General = 2};
+
+// Template dispatch helper for sv_sell with TMA (with device-side color loop when possible)
+template<int THREADS_PER_CTA, int SV_UNROLL>
+void sv_sell_tma_dispatch(DIR d, const SparseMatrix & A, double *rv, double *xv, 
+                           int color_size, local_int_t rows, local_int_t grid,
+                           slice_ptr_t *sell_block_offset, local_int_t *sell_columns, double *sell_values, slice_ptr_t last_nnz) {
+    CUtensorMap cols_tensor_map{};
+    CUtensorMap vals_tensor_map{};
+
+    constexpr uint32_t rank = 2;
+    int slice_size = A.slice_size;
+    uint64_t size[rank] = {(uint64_t)slice_size, (uint64_t)last_nnz/slice_size};
+    uint64_t stride1[rank - 1] = {slice_size * sizeof(int)};
+    uint64_t stride2[rank - 1] = {slice_size * sizeof(double)};
+    uint32_t box_size[rank] = {THREADS_PER_CTA, SV_UNROLL};
+    uint32_t elem_stride[rank] = {1, 1};
+
+    cuTensorMapEncodeTiled(&cols_tensor_map, CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_INT32,
+        rank, (void*)sell_columns, size, stride1, box_size, elem_stride,
+        CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE,
+        CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    
+    cuTensorMapEncodeTiled(&vals_tensor_map, CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_FLOAT64,
+        rank, (void*)sell_values, size, stride2, box_size, elem_stride,
+        CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE,
+        CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+
+    if(d == Forward) {
+        for (int color = 0; color < A.totalColors; color++) {
+            auto color_str = color * color_size;
+            auto color_end = std::min<local_int_t>((color + 1) * color_size, rows);
+            ex_spsv_sell_single_color_v1_tma_kernel<THREADS_PER_CTA, SV_UNROLL><<<grid, THREADS_PER_CTA, 0, stream>>>(
+                cols_tensor_map, vals_tensor_map,
+                A.slice_size, color_str, color_end, xv, rv, 
+                sell_block_offset, sell_columns, sell_values, A.diagonal, 1.0, 0);        
+        }
+    }
+    else {
+        for (int color = A.totalColors - 1; color >= 0; color--) {
+            auto color_str = color * color_size;
+            auto color_end = std::min<local_int_t>((color + 1) * color_size, rows);
+            ex_spsv_sell_single_color_v1_tma_kernel<THREADS_PER_CTA, SV_UNROLL><<<grid, THREADS_PER_CTA, 0, stream>>>(
+                cols_tensor_map, vals_tensor_map,
+                A.slice_size, color_str, color_end, xv, rv, 
+                sell_block_offset, sell_columns, sell_values, A.diagonal, 1.0, 0);  
+        }
+    }
+}
+
+// Template dispatch helper for sv_sell without TMA (host-side color loop for better performance)
+template<int THREADS_PER_CTA, int SV_UNROLL>
+void sv_sell_no_tma_dispatch(DIR d, const SparseMatrix & A, double *rv, double *xv, 
+                               int color_size, local_int_t rows, local_int_t grid,
+                               slice_ptr_t *sell_block_offset, local_int_t *sell_columns, double *sell_values) {
+    if(d == Forward) {
+        for (int color = 0; color < A.totalColors; color++) {
+            auto color_str = color * color_size;
+            auto color_end = std::min<local_int_t>((color + 1) * color_size, rows);
+            ex_spsv_sell_single_color_v1_kernel<THREADS_PER_CTA, SV_UNROLL><<<grid, THREADS_PER_CTA, 0, stream>>>(
+                A.slice_size, color_str, color_end,  xv, rv, 
+                sell_block_offset, sell_columns, sell_values, A.diagonal, 1.0);        
+        }
+    }
+    else {
+        for (int color = A.totalColors - 1; color >= 0; color--) {
+            auto color_str = color * color_size;
+            auto color_end = std::min<local_int_t>((color + 1) * color_size, rows);
+            ex_spsv_sell_single_color_v1_kernel<THREADS_PER_CTA, SV_UNROLL><<<grid, THREADS_PER_CTA, 0, stream>>>(
+                A.slice_size, color_str, color_end,  xv, rv, 
+                sell_block_offset, sell_columns, sell_values, A.diagonal, 1.0);  
+        }
+    }
+}
+
+// Runtime dispatch macro for sv_sell configurations
+#define SV_DISPATCH(BLOCK_SIZE, UNROLL, ...) \
+    if (g_config.SV_BLOCK_SIZE == BLOCK_SIZE && g_config.SV_UNROLL == UNROLL) { \
+        __VA_ARGS__(BLOCK_SIZE, UNROLL); \
+        return; \
+    }
+
+bool SpsvTmaSell(int forward, const SparseMatrix& A, double* rv, double* xv, slice_ptr_t* sell_block_offset,
+    local_int_t* sell_columns, double* sell_values, cudaStream_t stream);
+bool SpsvTmaSellCfg(int forward, const SparseMatrix& A, double* rv, double* xv, slice_ptr_t* sell_block_offset,
+    local_int_t* sell_columns, double* sell_values, cudaStream_t stream, int blk, int unroll, int rpt);
+bool SpsvLdgV2SellCfg(int forward, const SparseMatrix& A, double* rv, double* xv, slice_ptr_t* sell_block_offset,
+    local_int_t* sell_columns, double* sell_values, cudaStream_t stream, int blk, int unroll, int w);
+bool SpsvTma2dSellCfg(int forward, const SparseMatrix& A, double* rv, double* xv, slice_ptr_t* sell_block_offset,
+    local_int_t* sell_columns, double* sell_values, slice_ptr_t last_nnz, cudaStream_t stream, int blk, int unroll,
+    int rpt);
+bool SpsvLdgV3SellCfg(int forward, const SparseMatrix& A, double* rv, double* xv, slice_ptr_t* sell_block_offset,
+    local_int_t* sell_columns, double* sell_values, cudaStream_t stream, int blk, int unroll, int w, bool wide,
+    bool cached);
+bool SpsvTmaExSellCfg(int forward, const SparseMatrix& A, double* rv, double* xv, slice_ptr_t* sell_block_offset,
+    local_int_t* sell_columns, double* sell_values, slice_ptr_t last_nnz, cudaStream_t stream, int blk, int unroll,
+    int rpt);
+
+// Duplicated from SvKernelKind in CudaKernels.hpp, which is how the autotuner
+// sees these numbers. The header cannot simply be included here: this file also
+// defines KernelConfig, g_config and DIR independently of it. So a family added
+// in one place must be added in the other, or one number means two things in two
+// translation units and nothing warns. Keep kNumSvKernelKinds in step too.
+enum
+{
+    SV_KIND_LDG = 0,
+    SV_KIND_TMA = 1,
+    SV_KIND_LDGV2 = 2,
+    SV_KIND_TMA2D = 3,
+    SV_KIND_LDGV3 = 4,
+    SV_KIND_TMAEX = 5
+};
+
+// LDG3 packs four things into rpt: W, the widest-load request in the sign, the
+// cache policy in the hundreds digit, and the MV row-partition count in the
+// thousands. Mirrors SvRptWidth / SvRptWide / SvRptCached / SvRptPart in
+// CudaKernels.hpp, which carries the full description; this file does not
+// include that header, so the arithmetic is repeated here and the two must be
+// edited together.
+//
+// Cached tests one digit rather than ">= 100". The older form was equivalent
+// while the hundreds digit was the top of the field, but reads any partition
+// value as cached now that a digit sits above it.
+static inline int LdgV3Width(int rpt) { return (rpt < 0 ? -rpt : rpt) % 100; }
+static inline bool LdgV3Wide(int rpt) { return rpt < 0; }
+static inline bool LdgV3Cached(int rpt) { return ((rpt < 0 ? -rpt : rpt) / 100) % 10 != 0; }
+static inline int LdgV3Part(int rpt)
+{
+    const int f = ((rpt < 0 ? -rpt : rpt) / 1000) % 10;
+    return f == 0 ? 8 : (1 << (f - 1));
+}
+
+namespace {
+constexpr int kMaxSvLevels = 8;
+struct SvChoice { bool set; int kind; int blk; int unroll; int rpt; };
+SvChoice g_sv_choice[kMaxSvLevels] = {};
+
+// HPCG_PIN_MV / HPCG_PIN_SV name one configuration as "kind,blk,unroll,rpt" and
+// apply it to every level, taking precedence over the autotuner.
+//
+// This exists to answer a question the sweep cannot: when a kernel is edited,
+// the sweep may respond by picking a different configuration, so a before/after
+// comparison conflates the edit with the search. Pinning holds the
+// configuration fixed and isolates the edit.
+struct Pin { bool set; int kind; int blk; int unroll; int rpt; };
+
+Pin ParsePin(const char* name)
+{
+    Pin p{};
+    const char* v = std::getenv(name);
+    if (!v || !*v)
+        return p;
+    if (std::sscanf(v, "%d,%d,%d,%d", &p.kind, &p.blk, &p.unroll, &p.rpt) != 4)
+    {
+        std::fprintf(stderr, "ERROR: %s must be \"kind,blk,unroll,rpt\", got \"%s\"\n", name, v);
+        std::exit(1);
+    }
+    p.set = true;
+    return p;
+}
+
+// A launcher returns false for a configuration it cannot serve, and the caller
+// then falls through to a different kernel entirely. Under a pin that is the
+// worst kind of failure: the run still produces a plausible number, but for a
+// kernel nobody asked for. PinRefused turns it into an abort, and the pin is
+// announced so the log can be checked against the intent.
+bool g_mv_pinned = false;
+bool g_sv_pinned = false;
+
+void PinRefused(const char* what, int level, int kind, int blk, int unroll, int rpt)
+{
+    std::fprintf(stderr,
+        "ERROR: %s was pinned to kind=%d blk=%d unroll=%d rpt=%d, but no launcher\n"
+        "       accepts that configuration at level %d. Falling through would have\n"
+        "       measured a different kernel under the pinned name.\n",
+        what, kind, blk, unroll, rpt, level);
+    std::exit(1);
+}
+} // namespace
+
+// This section (pin/choice bookkeeping, the SV/MV autotune timers, and the
+// sv_sell/mv_sell dispatchers themselves) launches the explicit LDG/TMA kernel
+// families directly against the SparseMatrix's sliced-ELL device arrays. Those
+// arrays are typed pointers only under EXPLICIT_KERNELS; under the default
+// build (cuSPARSE/NVPL via IndexMode) they are void*, and ComputeSPMV.cpp /
+// ComputeSYMGS.cpp / autotune.cpp already only call into this section under
+// EXPLICIT_KERNELS.
+#ifdef EXPLICIT_KERNELS
+
+bool ApplyPin(const Pin& p, const char* what, bool& announced, int& kind, int& blk, int& unroll, int& rpt)
+{
+    if (!p.set)
+        return false;
+    if (!announced)
+    {
+        std::fprintf(stderr, "%s pinned to kind=%d blk=%d unroll=%d rpt=%d on all levels\n", what, p.kind, p.blk,
+            p.unroll, p.rpt);
+        announced = true;
+    }
+    kind = p.kind;
+    blk = p.blk;
+    unroll = p.unroll;
+    rpt = p.rpt;
+    return true;
+}
+
+void SetSvChoice(int level, int kind, int blk, int unroll, int rpt)
+{
+    if (level >= 0 && level < kMaxSvLevels)
+        g_sv_choice[level] = SvChoice{true, kind, blk, unroll, rpt};
+}
+
+static bool GetSvChoice(int level, int& kind, int& blk, int& unroll, int& rpt)
+{
+    static const Pin pin = ParsePin("HPCG_PIN_SV");
+    static bool announced = false;
+    if (ApplyPin(pin, "SV", announced, kind, blk, unroll, rpt))
+    {
+        g_sv_pinned = true;
+        return true;
+    }
+
+    if (level >= 0 && level < kMaxSvLevels && g_sv_choice[level].set)
+    {
+        kind = g_sv_choice[level].kind;
+        blk = g_sv_choice[level].blk;
+        unroll = g_sv_choice[level].unroll;
+        rpt = g_sv_choice[level].rpt;
+        return true;
+    }
+    return false;
+}
+
+static bool DispatchSvNoTma(int blk, int unroll, DIR d, const SparseMatrix& A, double* rv, double* xv, int color_size,
+    local_int_t rows, local_int_t grid, slice_ptr_t* off, local_int_t* cols, double* vals)
+{
+#define C(B, U)                                                                                                        \
+    if (blk == (B) && unroll == (U))                                                                                   \
+    {                                                                                                                  \
+        sv_sell_no_tma_dispatch<B, U>(d, A, rv, xv, color_size, rows, grid, off, cols, vals);                          \
+        return true;                                                                                                   \
+    }
+    C(64, 4) C(64, 6) C(64, 7) C(64, 8) C(64, 10) C(64, 12) C(64, 14) C(64, 16)
+    C(128, 4) C(128, 6) C(128, 7) C(128, 8) C(128, 10) C(128, 12) C(128, 14) C(128, 16)
+    C(256, 4) C(256, 6) C(256, 7) C(256, 8) C(256, 10) C(256, 12) C(256, 14) C(256, 16)
+#undef C
+    return false;
+}
+
+bool SvSellCfg(DIR d, const SparseMatrix& A, double* rv, double* xv, int kind, int blk, int unroll, int rpt)
+{
+    slice_ptr_t* off;
+    local_int_t* cols;
+    double* vals;
+    slice_ptr_t last_nnz;
+    if (d == Forward)
+    {
+        off = A.sellLSliceMrl;
+        cols = A.sellLPermColumns;
+        vals = A.sellLPermValues;
+        last_nnz = A.sellLLocalNumberOfNonzeros;
+    }
+    else
+    {
+        off = A.sellUSliceMrl;
+        cols = A.sellUPermColumns;
+        vals = A.sellUPermValues;
+        last_nnz = A.sellULocalNumberOfNonzeros;
+    }
+    const local_int_t rows = A.localNumberOfRows;
+    const int color_size = (rows + A.totalColors - 1) / A.totalColors;
+    if (kind == SV_KIND_TMA)
+        return SpsvTmaSellCfg(d == Forward, A, rv, xv, off, cols, vals, stream, blk, unroll, rpt);
+    if (kind == SV_KIND_LDGV2)
+        return SpsvLdgV2SellCfg(d == Forward, A, rv, xv, off, cols, vals, stream, blk, unroll, rpt);
+    if (kind == SV_KIND_TMA2D)
+        return SpsvTma2dSellCfg(d == Forward, A, rv, xv, off, cols, vals, last_nnz, stream, blk, unroll, rpt);
+    if (kind == SV_KIND_LDGV3)
+        return SpsvLdgV3SellCfg(
+            d == Forward, A, rv, xv, off, cols, vals, stream, blk, unroll, LdgV3Width(rpt), LdgV3Wide(rpt),
+            LdgV3Cached(rpt));
+    if (kind == SV_KIND_TMAEX)
+        return SpsvTmaExSellCfg(d == Forward, A, rv, xv, off, cols, vals, last_nnz, stream, blk, unroll, rpt);
+    const local_int_t grid = (color_size + blk - 1) / blk;
+    return DispatchSvNoTma(blk, unroll, d, A, rv, xv, color_size, rows, grid, off, cols, vals);
+}
+
+float TimeSvConfig(
+    const SparseMatrix& A, double* rv, double* xv, int kind, int blk, int unroll, int rpt, int iters, int sweep)
+{
+    const bool do_fwd = sweep != 2;
+    const bool do_bwd = sweep != 1;
+
+    // sweep==0 keeps the original probe exactly: check Forward's feasibility,
+    // run Backward once unchecked. Isolated modes (1, 2) check whichever
+    // direction they will actually time, since a backward-only call probing
+    // Forward would be checking a sweep it never runs.
+    if (sweep == 0)
+    {
+        if (!SvSellCfg(Forward, A, rv, xv, kind, blk, unroll, rpt))
+            return -1.0f;
+        SvSellCfg(Backward, A, rv, xv, kind, blk, unroll, rpt);
+    }
+    else if (do_fwd)
+    {
+        if (!SvSellCfg(Forward, A, rv, xv, kind, blk, unroll, rpt))
+            return -1.0f;
+    }
+    else if (!SvSellCfg(Backward, A, rv, xv, kind, blk, unroll, rpt))
+        return -1.0f;
+    const cudaError_t le = cudaGetLastError();
+    const cudaError_t se = cudaStreamSynchronize(stream);
+    if (le != cudaSuccess || se != cudaSuccess)
+    {
+        cudaGetLastError();
+        return -1.0f;
+    }
+
+    cudaEvent_t beg, end;
+    cudaEventCreate(&beg);
+    cudaEventCreate(&end);
+    cudaEventRecord(beg, stream);
+    for (int i = 0; i < iters; ++i)
+    {
+        if (do_fwd)
+            SvSellCfg(Forward, A, rv, xv, kind, blk, unroll, rpt);
+        if (do_bwd)
+            SvSellCfg(Backward, A, rv, xv, kind, blk, unroll, rpt);
+    }
+    cudaEventRecord(end, stream);
+    cudaEventSynchronize(end);
+    float ms = 0.0f;
+    cudaEventElapsedTime(&ms, beg, end);
+    cudaEventDestroy(beg);
+    cudaEventDestroy(end);
+    return ms / iters;
+}
+
+void sv_sell(DIR d, const SparseMatrix & A, double *rv, double *xv) {
+    local_int_t rows = A.localNumberOfRows;
+    int color_size = (rows + A.totalColors - 1) / A.totalColors;
+    const local_int_t grid = (color_size + g_config.SV_BLOCK_SIZE - 1) / g_config.SV_BLOCK_SIZE;
+
+    slice_ptr_t *sell_block_offset;
+    local_int_t *sell_columns;
+    double      *sell_values;
+    slice_ptr_t  last_nnz = 0;
+    
+    if(d == Forward) {
+        sell_block_offset = A.sellLSliceMrl;
+        sell_columns = A.sellLPermColumns;
+        sell_values  = A.sellLPermValues;
+        last_nnz = A.sellLLocalNumberOfNonzeros;
+    }
+    else {
+        sell_block_offset = A.sellUSliceMrl;
+        sell_columns = A.sellUPermColumns;
+        sell_values  = A.sellUPermValues;
+        last_nnz = A.sellULocalNumberOfNonzeros;
+    }
+
+    {
+        int a_kind, a_blk, a_unroll, a_rpt;
+        if (GetSvChoice(A.level, a_kind, a_blk, a_unroll, a_rpt)) {
+            if (SvSellCfg(d, A, rv, xv, a_kind, a_blk, a_unroll, a_rpt))
+                return;
+            if (g_sv_pinned)
+                PinRefused("SV", A.level, a_kind, a_blk, a_unroll, a_rpt);
+        }
+    }
+
+    static const bool use_spsv_tma = [] {
+        const char* e = std::getenv("USE_SPSV_TMA");
+        return e && std::atoi(e) != 0;
+    }();
+    if (use_spsv_tma) {
+        if (SpsvTmaSell(d == Forward, A, rv, xv, sell_block_offset, sell_columns, sell_values, stream))
+            return;
+    }
+
+    // Dispatch based on runtime configuration
+    // Try common configurations
+    if(g_config.USE_TMA_SV) {
+        int m = A.localNumberOfRows;
+        bool can_use_tma_2D = ((m/A.totalColors) % A.slice_size) == 0;
+        if(can_use_tma_2D) {
+            #define CALL_SV_TMA(BLOCK, UNROLL) sv_sell_tma_dispatch<BLOCK, UNROLL>(d, A, rv, xv, color_size, rows, grid, sell_block_offset, sell_columns, sell_values, last_nnz)
+            SV_DISPATCH(64, 4, CALL_SV_TMA);
+            SV_DISPATCH(64, 6, CALL_SV_TMA);
+            SV_DISPATCH(64, 7, CALL_SV_TMA);
+            SV_DISPATCH(64, 8, CALL_SV_TMA);
+            SV_DISPATCH(64, 10, CALL_SV_TMA);
+            SV_DISPATCH(64, 12, CALL_SV_TMA);
+            SV_DISPATCH(128, 4, CALL_SV_TMA);
+            SV_DISPATCH(128, 6, CALL_SV_TMA);
+            SV_DISPATCH(128, 8, CALL_SV_TMA);
+            SV_DISPATCH(256, 4, CALL_SV_TMA);
+            SV_DISPATCH(256, 6, CALL_SV_TMA);
+            SV_DISPATCH(256, 7, CALL_SV_TMA); //High shared memory usage
+            #undef CALL_SV_TMA
+        }
+        else { //Since matrix is divded into 8 colors, we cannot use TMA for small matrices that does not have slice_size as its width
+            //Fallback to no TMA
+            #define CALL_SV_NO_TMA(BLOCK, UNROLL) sv_sell_no_tma_dispatch<BLOCK, UNROLL>(d, A, rv, xv, color_size, rows, grid, sell_block_offset, sell_columns, sell_values)
+            SV_DISPATCH(64, 4, CALL_SV_NO_TMA);
+            #undef CALL_SV_NO_TMA
+        }
+    }
+    
+    #define CALL_SV_NO_TMA(BLOCK, UNROLL) sv_sell_no_tma_dispatch<BLOCK, UNROLL>(d, A, rv, xv, color_size, rows, grid, sell_block_offset, sell_columns, sell_values)
+    SV_DISPATCH(64, 4, CALL_SV_NO_TMA);
+    SV_DISPATCH(64, 6, CALL_SV_NO_TMA);
+    SV_DISPATCH(64, 7, CALL_SV_NO_TMA);
+    SV_DISPATCH(64, 8, CALL_SV_NO_TMA);
+    SV_DISPATCH(64, 10, CALL_SV_NO_TMA);
+    SV_DISPATCH(64, 12, CALL_SV_NO_TMA);
+    SV_DISPATCH(64, 14, CALL_SV_NO_TMA);
+    SV_DISPATCH(64, 16, CALL_SV_NO_TMA);
+    SV_DISPATCH(128, 4, CALL_SV_NO_TMA);
+    SV_DISPATCH(128, 6, CALL_SV_NO_TMA);
+    SV_DISPATCH(128, 8, CALL_SV_NO_TMA);
+    SV_DISPATCH(128, 10, CALL_SV_NO_TMA);
+    SV_DISPATCH(128, 12, CALL_SV_NO_TMA);
+    SV_DISPATCH(128, 14, CALL_SV_NO_TMA);
+    SV_DISPATCH(128, 16, CALL_SV_NO_TMA);
+    SV_DISPATCH(256, 4, CALL_SV_NO_TMA);
+    SV_DISPATCH(256, 6, CALL_SV_NO_TMA);
+    SV_DISPATCH(256, 8, CALL_SV_NO_TMA);
+    SV_DISPATCH(256, 10, CALL_SV_NO_TMA);
+    SV_DISPATCH(256, 12, CALL_SV_NO_TMA);
+    SV_DISPATCH(256, 14, CALL_SV_NO_TMA);
+    SV_DISPATCH(256, 16, CALL_SV_NO_TMA);
+    #undef CALL_SV_NO_TMA
+    
+    // If we reach here, configuration is not supported
+    fprintf(stderr, "ERROR: Unsupported SV configuration: BLOCK_SIZE=%d, UNROLL=%d\n", 
+            g_config.SV_BLOCK_SIZE, g_config.SV_UNROLL);
+}
+
+// Template dispatch helper for mv_sell with TMA
+template<int BLOCK_SIZE, int UNROLL>
+void mv_sell_tma_dispatch(DIR d, const SparseMatrix & A, double alpha, double beta, double *x, double *y,
+                           local_int_t m, dim3 grid2D,
+                           slice_ptr_t *sell_block_offset, local_int_t *sell_columns, double *sell_values, slice_ptr_t last_nnz) {
+    CUtensorMap cols_tensor_map{};
+    CUtensorMap vals_tensor_map{};
+
+    constexpr uint32_t rank = 2;
+    int slice_size = A.slice_size;
+    uint64_t size[rank] = {(uint64_t)slice_size, (uint64_t)last_nnz/slice_size};
+    uint64_t stride1[rank - 1] = {slice_size * sizeof(int)};
+    uint64_t stride2[rank - 1] = {slice_size * sizeof(double)};
+    uint32_t box_size[rank] = {BLOCK_SIZE, UNROLL};
+    uint32_t elem_stride[rank] = {1, 1};
+
+    cuTensorMapEncodeTiled(&cols_tensor_map, CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_INT32,
+        rank, (void*)sell_columns, size, stride1, box_size, elem_stride,
+        CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE,
+        CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    
+    cuTensorMapEncodeTiled(&vals_tensor_map, CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_FLOAT64,
+        rank, (void*)sell_values, size, stride2, box_size, elem_stride,
+        CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE,
+        CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+
+    // Calculate dynamic shared memory size with 128-byte alignment
+    // constexpr size_t alignment = 128;
+    // size_t shared_mem_size = 0;
+    
+    // Row indices (2 x int)
+    // size_t row_indices_size = 2 * sizeof(int);
+    // shared_mem_size += row_indices_size;
+    
+    // Align to 8 bytes for uint64_t barriers
+    // shared_mem_size = ((shared_mem_size + 7) / 8) * 8;
+    // size_t bar_array_size = 8 * sizeof(uint64_t);
+    // shared_mem_size += bar_array_size;
+    
+    // Align to 128 bytes for TMA buffers
+    // size_t before_tma_alignment = shared_mem_size;
+    // shared_mem_size = ((shared_mem_size + alignment - 1) / alignment) * alignment;
+    
+    // Calculate TMA buffer sizes with 128-byte alignment
+    // constexpr size_t a_vals_size = UNROLL * BLOCK_SIZE * sizeof(double);
+    // constexpr size_t a_cols_size = UNROLL * BLOCK_SIZE * sizeof(int);
+    // constexpr size_t b_val_size = UNROLL * BLOCK_SIZE * sizeof(double);
+    // constexpr size_t b_cols_size = UNROLL * BLOCK_SIZE * sizeof(int);
+    
+    // constexpr size_t a_vals_aligned = ((a_vals_size + alignment - 1) / alignment) * alignment;
+    // constexpr size_t a_cols_aligned = ((a_cols_size + alignment - 1) / alignment) * alignment;
+    // constexpr size_t b_val_aligned = ((b_val_size + alignment - 1) / alignment) * alignment;
+    // constexpr size_t b_cols_aligned = ((b_cols_size + alignment - 1) / alignment) * alignment;
+    
+    // size_t tma_buffers_size = a_vals_aligned + a_cols_aligned + b_val_aligned + b_cols_aligned;
+    // shared_mem_size += tma_buffers_size;
+    
+   
+    sellmv_v1_tma_2D_tensor_kernel_double_int32<BLOCK_SIZE, UNROLL>
+        <<< grid2D, BLOCK_SIZE, 0, stream >>>
+        (cols_tensor_map, vals_tensor_map, m, alpha, beta, A.slice_size, sell_block_offset, sell_columns, sell_values, 0, x, y);
+}
+
+// Template dispatch helper for mv_sell without TMA
+template<int BLOCK_SIZE, int UNROLL>
+void mv_sell_no_tma_dispatch(DIR d, const SparseMatrix & A, double alpha, double beta, double *x, double *y,
+                               local_int_t m, dim3 grid2D,
+                               slice_ptr_t *sell_block_offset, local_int_t *sell_columns, double *sell_values) {
+
+        //Find number of blocks per SM
+        int num_blocks_per_sm = 0;
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, sellmv_v1_2D_kernel<BLOCK_SIZE, UNROLL>, BLOCK_SIZE, 0);
+        // number of SMs    
+        int num_sms = 0;
+        cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, 0);
+        //printf("Number of blocks per SM: %d\n", num_blocks_per_sm);
+
+        auto active_blocks = num_blocks_per_sm * num_sms;
+
+        dim3 grid(8, (active_blocks + 8 - 1)/8, 1); 
+
+    sellmv_v1_2D_kernel<BLOCK_SIZE, UNROLL>
+        <<< grid2D, BLOCK_SIZE, 0, stream >>>
+        (m, alpha, beta, A.slice_size, sell_block_offset, sell_columns, sell_values, x, y);
+}
+
+// Runtime dispatch macro for mv_sell configurations
+#define MV_DISPATCH(BLOCK_SIZE, UNROLL, ...) \
+    if (mv_block_size == BLOCK_SIZE && mv_unroll == UNROLL) { \
+        __VA_ARGS__(BLOCK_SIZE, UNROLL); \
+        return; \
+    }
+
+bool MvTmaSellCfg(const SparseMatrix& A, double alpha, double beta, const double* x, double* y, slice_ptr_t* off,
+    local_int_t* cols, double* vals, cudaStream_t stream, int blk, int unroll, int rpt);
+bool MvLdgV2SellCfg(const SparseMatrix& A, double alpha, double beta, const double* x, double* y, slice_ptr_t* off,
+    local_int_t* cols, double* vals, cudaStream_t stream, int blk, int unroll, int w, int parts);
+bool MvTma2dSellCfg(const SparseMatrix& A, double alpha, double beta, const double* x, double* y, slice_ptr_t* off,
+    local_int_t* cols, double* vals, slice_ptr_t last_nnz, cudaStream_t stream, int blk, int unroll, int rpt);
+bool MvLdgV3SellCfg(const SparseMatrix& A, double alpha, double beta, const double* x, double* y, slice_ptr_t* off,
+    local_int_t* cols, double* vals, cudaStream_t stream, int blk, int unroll, int w, bool wide, bool cached, int part);
+bool MvTmaExSellCfg(const SparseMatrix& A, double alpha, double beta, const double* x, double* y, slice_ptr_t* off,
+    local_int_t* cols, double* vals, slice_ptr_t last_nnz, cudaStream_t stream, int blk, int unroll, int rpt);
+
+namespace {
+struct MvChoice { bool set; int kind; int blk; int unroll; int rpt; int parts; };
+MvChoice g_mv_choice[kMaxSvLevels] = {};
+}
+
+void SetMvChoice(int level, int kind, int blk, int unroll, int rpt, int parts)
+{
+    if (level >= 0 && level < kMaxSvLevels)
+        g_mv_choice[level] = MvChoice{true, kind, blk, unroll, rpt, parts};
+}
+
+static bool GetMvChoice(int level, int& kind, int& blk, int& unroll, int& rpt, int& parts)
+{
+    static const Pin pin = ParsePin("HPCG_PIN_MV");
+    static bool announced = false;
+    if (ApplyPin(pin, "MV", announced, kind, blk, unroll, rpt))
+    {
+        g_mv_pinned = true;
+        return true;
+    }
+
+    if (level >= 0 && level < kMaxSvLevels && g_mv_choice[level].set)
+    {
+        kind = g_mv_choice[level].kind;
+        blk = g_mv_choice[level].blk;
+        unroll = g_mv_choice[level].unroll;
+        rpt = g_mv_choice[level].rpt;
+        parts = g_mv_choice[level].parts;
+        return true;
+    }
+    return false;
+}
+
+static bool DispatchMvNoTma(int blk, int unroll, DIR d, const SparseMatrix& A, double alpha, double beta, double* x,
+    double* y, local_int_t m, dim3 grid2D, slice_ptr_t* off, local_int_t* cols, double* vals)
+{
+#define C(B, U)                                                                                                        \
+    if (blk == (B) && unroll == (U))                                                                                   \
+    {                                                                                                                  \
+        mv_sell_no_tma_dispatch<B, U>(d, A, alpha, beta, x, y, m, grid2D, off, cols, vals);                            \
+        return true;                                                                                                   \
+    }
+    C(64, 1) C(64, 4) C(64, 6) C(64, 7) C(64, 8) C(64, 10) C(64, 12) C(64, 14) C(64, 16)
+    C(128, 1) C(128, 4) C(128, 6) C(128, 7) C(128, 8) C(128, 10) C(128, 12) C(128, 14) C(128, 16)
+    C(256, 1) C(256, 4) C(256, 6) C(256, 7) C(256, 8) C(256, 10) C(256, 12) C(256, 14) C(256, 16)
+#undef C
+    return false;
+}
+
+bool MvSellCfg(DIR d, const SparseMatrix& A, double alpha, double beta, double* x, double* y, int kind, int blk,
+    int unroll, int rpt, int parts)
+{
+    slice_ptr_t* off = A.sellASliceMrl;
+    local_int_t* cols = A.sellAPermColumns;
+    double* vals = A.sellAPermValues;
+    slice_ptr_t last_nnz = A.sellALocalNumberOfNonzeros;
+    if (d == Forward)
+    {
+        off = A.sellLSliceMrl;
+        cols = A.sellLPermColumns;
+        vals = A.sellLPermValues;
+        last_nnz = A.sellLLocalNumberOfNonzeros;
+    }
+    else if (d == Backward)
+    {
+        off = A.sellUSliceMrl;
+        cols = A.sellUPermColumns;
+        vals = A.sellUPermValues;
+        last_nnz = A.sellULocalNumberOfNonzeros;
+    }
+    const local_int_t m = A.localNumberOfRows;
+    if (kind == SV_KIND_TMA)
+        return MvTmaSellCfg(A, alpha, beta, x, y, off, cols, vals, stream, blk, unroll, rpt);
+    if (kind == SV_KIND_LDGV2)
+        return MvLdgV2SellCfg(A, alpha, beta, x, y, off, cols, vals, stream, blk, unroll, rpt, parts);
+    if (kind == SV_KIND_TMA2D)
+        return MvTma2dSellCfg(A, alpha, beta, x, y, off, cols, vals, last_nnz, stream, blk, unroll, rpt);
+    if (kind == SV_KIND_LDGV3)
+        return MvLdgV3SellCfg(A, alpha, beta, x, y, off, cols, vals, stream, blk, unroll, LdgV3Width(rpt),
+            LdgV3Wide(rpt), LdgV3Cached(rpt), LdgV3Part(rpt));
+    if (kind == SV_KIND_TMAEX)
+        return MvTmaExSellCfg(A, alpha, beta, x, y, off, cols, vals, last_nnz, stream, blk, unroll, rpt);
+    dim3 grid2D(8, (unsigned int) ((m / 8 + blk - 1) / blk), 1);
+    if (grid2D.y > 65535u)
+        return false;
+    return DispatchMvNoTma(blk, unroll, d, A, alpha, beta, x, y, m, grid2D, off, cols, vals);
+}
+
+static float TimeMvDir(const SparseMatrix& A, double* x, double* y, int kind, int blk, int unroll, int rpt,
+    int parts, int iters, DIR d, double alpha, double beta)
+{
+    if (!MvSellCfg(d, A, alpha, beta, x, y, kind, blk, unroll, rpt, parts))
+        return -1.0f;
+    const cudaError_t le = cudaGetLastError();
+    const cudaError_t se = cudaStreamSynchronize(stream);
+    if (le != cudaSuccess || se != cudaSuccess)
+    {
+        cudaGetLastError();
+        return -1.0f;
+    }
+    cudaEvent_t beg, end;
+    cudaEventCreate(&beg);
+    cudaEventCreate(&end);
+    cudaEventRecord(beg, stream);
+    for (int i = 0; i < iters; ++i)
+        MvSellCfg(d, A, alpha, beta, x, y, kind, blk, unroll, rpt, parts);
+    cudaEventRecord(end, stream);
+    cudaEventSynchronize(end);
+    float ms = 0.0f;
+    cudaEventElapsedTime(&ms, beg, end);
+    cudaEventDestroy(beg);
+    cudaEventDestroy(end);
+    return ms / iters;
+}
+
+float TimeMvConfig(
+    const SparseMatrix& A, double* x, double* y, int kind, int blk, int unroll, int rpt, int parts, int iters)
+{
+    return TimeMvDir(A, x, y, kind, blk, unroll, rpt, parts, iters, General, 1.0, 0.0);
+}
+
+// The same MV choice serves three different multiplies: A for ComputeSPMV, and
+// L and U inside ComputeSYMGS. Only A is used to select it, so the two that run
+// in the MG hot path are never measured. This times them as they are actually
+// called -- L accumulates (beta=1), U overwrites (beta=0) -- so the tuning gap
+// can be seen rather than assumed.
+float TimeMvConfigDir(const SparseMatrix& A, double* x, double* y, int kind, int blk, int unroll, int rpt, int parts,
+    int iters, int dir)
+{
+    if (dir == 1)
+        return TimeMvDir(A, x, y, kind, blk, unroll, rpt, parts, iters, Forward, 1.0, 1.0);
+    if (dir == 2)
+        return TimeMvDir(A, x, y, kind, blk, unroll, rpt, parts, iters, Backward, 1.0, 0.0);
+    return TimeMvDir(A, x, y, kind, blk, unroll, rpt, parts, iters, General, 1.0, 0.0);
+}
+
+void mv_sell(DIR d, const SparseMatrix & A, double alpha, double beta, double *x, double *y) {
+    local_int_t m = A.localNumberOfRows;
+    int mv_block_size = g_config.MV_BLOCK_SIZE;
+    int mv_unroll     = g_config.MV_UNROLL;
+
+    // CUDA hardware limit for gridDim.y is 65535. This check is unconditional:
+    // it used to be compiled only under a wide-index build flag, on the theory
+    // that a 32-bit-index build could not reach a problem size large enough to
+    // exceed the cap. That is no longer true -- nonzero counters/offsets are
+    // unconditionally 64-bit (slice_ptr_t, see Geometry.hpp), so nnz no longer
+    // overflows first, and local_int_t alone permits ~2^31 rows. 512^3 already
+    // needs m/8/128 = 131k > 65535, so compiling this out silently launched an
+    // invalid grid. The cost is a couple of host-side integer ops per call.
+    constexpr unsigned int MAX_GRID_Y = 65535u;
+    auto compute_needed_y = [&](int bs) -> slice_ptr_t {
+        return ((slice_ptr_t) m / 8 + bs - 1) / bs;
+    };
+    slice_ptr_t needed_y = compute_needed_y(mv_block_size);
+    if (needed_y > (slice_ptr_t) MAX_GRID_Y) {
+        int orig_block = mv_block_size;
+        int new_block  = mv_block_size < 512 ? 512 : 1024;
+        while (new_block <= 1024) {
+            slice_ptr_t ny = compute_needed_y(new_block);
+            if (ny <= (slice_ptr_t) MAX_GRID_Y) {
+                // fprintf(stderr,
+                //     "WARNING: mv_sell needs gridDim.y=%lld (> %u) for m=%d with "
+                //     "MV_BLOCK_SIZE=%d; falling back to MV_BLOCK_SIZE=%d.\n",
+                //     (long long) needed_y, MAX_GRID_Y, (int) m, orig_block, new_block);
+                mv_block_size = new_block;
+                needed_y = ny;
+                break;
+            }
+            new_block *= 2;
+        }
+        if (needed_y > (slice_ptr_t) MAX_GRID_Y) {
+            fprintf(stderr,
+                "ERROR: mv_sell launch exceeds gridDim.y limit (needed %lld > %u) "
+                "for m=%d even with MV_BLOCK_SIZE=1024. Reduce problem size.\n",
+                (long long) needed_y, MAX_GRID_Y, (int) m);
+            return;
+        }
+    }
+    dim3 grid2D(8, (unsigned int) needed_y, 1);
+
+    slice_ptr_t *sell_block_offset = A.sellASliceMrl;
+    local_int_t *sell_columns = A.sellAPermColumns;
+    double      *sell_values  = A.sellAPermValues;
+    slice_ptr_t  last_nnz = A.sellALocalNumberOfNonzeros;
+
+    if(d == Forward) {
+        sell_block_offset = A.sellLSliceMrl;
+        sell_columns = A.sellLPermColumns;
+        sell_values  = A.sellLPermValues;
+        last_nnz = A.sellLLocalNumberOfNonzeros;
+    }
+    else if(d == Backward) {
+        sell_block_offset = A.sellUSliceMrl;
+        sell_columns = A.sellUPermColumns;
+        sell_values  = A.sellUPermValues;
+        last_nnz = A.sellULocalNumberOfNonzeros;
+    }
+
+    {
+        int a_kind, a_blk, a_unroll, a_rpt, a_parts;
+        if (GetMvChoice(A.level, a_kind, a_blk, a_unroll, a_rpt, a_parts)) {
+            if (MvSellCfg(d, A, alpha, beta, x, y, a_kind, a_blk, a_unroll, a_rpt, a_parts))
+                return;
+            if (g_mv_pinned)
+                PinRefused("MV", A.level, a_kind, a_blk, a_unroll, a_rpt);
+        }
+    }
+
+    // Dispatch based on runtime configuration
+    if(g_config.USE_TMA_MV) {
+        #define CALL_MV_TMA(BLOCK, UNROLL) mv_sell_tma_dispatch<BLOCK, UNROLL>(d, A, alpha, beta, x, y, m, grid2D, sell_block_offset, sell_columns, sell_values, last_nnz)
+        MV_DISPATCH(64, 1, CALL_MV_TMA);
+        MV_DISPATCH(64, 4, CALL_MV_TMA);
+        MV_DISPATCH(64, 6, CALL_MV_TMA);
+        MV_DISPATCH(64, 7, CALL_MV_TMA);
+        MV_DISPATCH(64, 8, CALL_MV_TMA);
+        MV_DISPATCH(128, 1, CALL_MV_TMA);
+        MV_DISPATCH(128, 4, CALL_MV_TMA);
+        MV_DISPATCH(128, 6, CALL_MV_TMA);
+        MV_DISPATCH(128, 7, CALL_MV_TMA);
+        MV_DISPATCH(128, 8, CALL_MV_TMA);
+        MV_DISPATCH(256, 1, CALL_MV_TMA);
+        MV_DISPATCH(256, 4, CALL_MV_TMA);
+        MV_DISPATCH(256, 6, CALL_MV_TMA);
+        MV_DISPATCH(256, 7, CALL_MV_TMA);
+        // MV_DISPATCH(256, 8, CALL_MV_TMA);
+        // MV_DISPATCH(256, 9, CALL_MV_TMA);
+        // MV_DISPATCH(256, 12, CALL_MV_TMA);
+        #undef CALL_MV_TMA
+        fprintf(stderr, "ERROR: Unsupported MV TMA configuration: BLOCK_SIZE=%d, UNROLL=%d, m=%d\n", 
+            mv_block_size, mv_unroll, m);
+        return; //No fallback for TMA
+    }
+    
+  
+    #define CALL_MV_NO_TMA(BLOCK, UNROLL) mv_sell_no_tma_dispatch<BLOCK, UNROLL>(d, A, alpha, beta, x, y, m, grid2D, sell_block_offset, sell_columns, sell_values)
+    MV_DISPATCH(64, 1, CALL_MV_NO_TMA);
+    MV_DISPATCH(64, 4, CALL_MV_NO_TMA);
+    MV_DISPATCH(64, 6, CALL_MV_NO_TMA);
+    MV_DISPATCH(64, 7, CALL_MV_NO_TMA);
+    MV_DISPATCH(64, 8, CALL_MV_NO_TMA);
+    MV_DISPATCH(64, 10, CALL_MV_NO_TMA);
+    MV_DISPATCH(64, 12, CALL_MV_NO_TMA);
+    MV_DISPATCH(64, 14, CALL_MV_NO_TMA);
+    MV_DISPATCH(64, 16, CALL_MV_NO_TMA);
+    MV_DISPATCH(128, 1, CALL_MV_NO_TMA);
+    MV_DISPATCH(128, 4, CALL_MV_NO_TMA);
+    MV_DISPATCH(128, 6, CALL_MV_NO_TMA);
+    MV_DISPATCH(128, 7, CALL_MV_NO_TMA);
+    MV_DISPATCH(128, 8, CALL_MV_NO_TMA);
+    MV_DISPATCH(128, 10, CALL_MV_NO_TMA);
+    MV_DISPATCH(128, 12, CALL_MV_NO_TMA);
+    MV_DISPATCH(128, 14, CALL_MV_NO_TMA);
+    MV_DISPATCH(128, 16, CALL_MV_NO_TMA);
+    MV_DISPATCH(256, 1, CALL_MV_NO_TMA);
+    MV_DISPATCH(256, 4, CALL_MV_NO_TMA);
+    MV_DISPATCH(256, 6, CALL_MV_NO_TMA);
+    MV_DISPATCH(256, 7, CALL_MV_NO_TMA);
+    MV_DISPATCH(256, 8, CALL_MV_NO_TMA);
+    MV_DISPATCH(256, 10, CALL_MV_NO_TMA);
+    MV_DISPATCH(256, 12, CALL_MV_NO_TMA);
+    MV_DISPATCH(256, 14, CALL_MV_NO_TMA);
+    MV_DISPATCH(256, 16, CALL_MV_NO_TMA);
+    MV_DISPATCH(512, 1, CALL_MV_NO_TMA);
+    MV_DISPATCH(512, 4, CALL_MV_NO_TMA);
+    MV_DISPATCH(512, 6, CALL_MV_NO_TMA);
+    MV_DISPATCH(512, 7, CALL_MV_NO_TMA);
+    MV_DISPATCH(512, 8, CALL_MV_NO_TMA);
+    MV_DISPATCH(1024, 1, CALL_MV_NO_TMA);
+    MV_DISPATCH(1024, 4, CALL_MV_NO_TMA);
+    MV_DISPATCH(1024, 6, CALL_MV_NO_TMA);
+    MV_DISPATCH(1024, 7, CALL_MV_NO_TMA);
+    MV_DISPATCH(1024, 8, CALL_MV_NO_TMA);
+    #undef CALL_MV_NO_TMA
+    
+    // If we reach here, configuration is not supported
+    fprintf(stderr, "ERROR: Unsupported MV configuration: BLOCK_SIZE=%d, UNROLL=%d\n", 
+            mv_block_size, mv_unroll);
+}
+
+#endif // EXPLICIT_KERNELS
+//////// SV and MV ///////
+
+
 #endif

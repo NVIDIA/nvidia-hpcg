@@ -18,9 +18,12 @@
 
 #pragma once
 #ifdef USE_CUDA
+#include <cstdio>
 #include "cublas_v2.h"
 #include "cuda_runtime_api.h"
+#ifndef EXPLICIT_KERNELS
 #include "cusparse.h"
+#endif
 #include <cuda.h>
 #ifdef USE_NCCL
 #include "nccl.h"
@@ -41,7 +44,9 @@
 #endif
 #include <unistd.h>
 
+#ifndef EXPLICIT_KERNELS
 extern cusparseHandle_t cusparsehandle;
+#endif
 extern cublasHandle_t cublashandle;
 extern cudaStream_t stream;
 extern cudaEvent_t copy_done;
@@ -79,6 +84,7 @@ extern bool Use_Hpcg_Mem_Reduction; /*USE HPCG aggresive memory reduction*/
         }                                                                                                              \
     } while (0)
 
+#ifndef EXPLICIT_KERNELS
 #define CHECK_CUSPARSE(x)                                                                                              \
     do                                                                                                                 \
     {                                                                                                                  \
@@ -90,6 +96,9 @@ extern bool Use_Hpcg_Mem_Reduction; /*USE HPCG aggresive memory reduction*/
             exit(1);                                                                                                   \
         }                                                                                                              \
     } while (0)
+#else
+#define CHECK_CUSPARSE(x) ((void)0)
+#endif
 
 // IF NVTX is needed for profiling, please define USE_NVTX
 // Then, add PUSH_RANGE and POP_RANGE around the target code block

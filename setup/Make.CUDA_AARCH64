@@ -115,7 +115,11 @@ HPCG_LIBS     = -L${MPlib} -lmpi
 
 ifeq ($(USE_CUDA), 1)
     HPCG_INCLUDES += -I$(CUDA_HOME)/include -I$(Mathdir)/include
-    HPCG_LIBS += -L$(Mathdir)/lib  -lcuda -lcusparse -lcublas -lcublasLt  -L$(CUDA_HOME)/lib64
+    HPCG_LIBS += -L$(Mathdir)/lib  -lcuda
+ifneq ($(EXPLICIT_KERNELS), 1)
+    HPCG_LIBS += -lcusparse
+endif
+    HPCG_LIBS += -lcublas -lcublasLt  -L$(CUDA_HOME)/lib64
 endif
 
 ifeq ($(USE_GRACE), 1)
@@ -167,6 +171,10 @@ ifeq ($(USE_INT64), 1)
     HPCG_OPTS += -DINDEX_64
 endif
 
+ifeq ($(EXPLICIT_KERNELS), 1)
+    HPCG_OPTS += -DEXPLICIT_KERNELS
+endif
+
 #If not set, the defualt values in src/hpcg.hpp will be used
 HPCG_OPTS += -Dmake_HPCG_VER_MAJOR=$(HPCG_VER_MAJOR)
 HPCG_OPTS += -Dmake_HPCG_VER_MINOR=$(HPCG_VER_MINOR)
@@ -181,10 +189,8 @@ HPCG_DEFS     = $(HPCG_OPTS) $(HPCG_INCLUDES)
 # ----------------------------------------------------------------------
 #
 ifeq ($(USE_CUDA), 1)
-    CUDA_ARCH = -gencode=arch=compute_80,code=sm_80 -gencode=arch=compute_90,code=sm_90
-endif
-ifeq ($(BUILD_B100), 1)
-CUDA_ARCH += --generate-code arch=compute_100,code=sm_100
+    CUDA_ARCH = -gencode=arch=compute_90,code=sm_90
+    CUDA_ARCH += -lineinfo --generate-code arch=compute_100,code=sm_100 --generate-code arch=compute_103,code=sm_103 --generate-code arch=compute_107,code=sm_107
 endif
 CPU_ARCH ?= native
 

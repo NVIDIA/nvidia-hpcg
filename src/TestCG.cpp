@@ -119,10 +119,12 @@ int TestCG(SparseMatrix& A, CGData& data, Vector& b, Vector& x, TestCGData& test
         PermVectorCuda(A.opt2ref, b, A.localNumberOfRows);
         PermVectorCuda(A.opt2ref, exaggeratedDiagA, A.localNumberOfRows);
         ReplaceMatrixDiagonalCuda(A, exaggeratedDiagA);
+#ifndef EXPLICIT_KERNELS
         CHECK_CUSPARSE(cusparseSpSV_updateMatrix(
             cusparsehandle, A.cusparseOpt.spsvDescrL, exaggeratedDiagA.values_d, CUSPARSE_SPSV_UPDATE_DIAGONAL));
         CHECK_CUSPARSE(cusparseSpSV_updateMatrix(
             cusparsehandle, A.cusparseOpt.spsvDescrU, exaggeratedDiagA.values_d, CUSPARSE_SPSV_UPDATE_DIAGONAL));
+#endif
 #endif
     }
     else
@@ -215,10 +217,12 @@ int TestCG(SparseMatrix& A, CGData& data, Vector& b, Vector& x, TestCGData& test
     {
 #ifdef USE_CUDA
         ReplaceMatrixDiagonalCuda(A, origDiagA);
+#ifndef EXPLICIT_KERNELS
         CHECK_CUSPARSE(cusparseSpSV_updateMatrix(
             cusparsehandle, A.cusparseOpt.spsvDescrL, origDiagA.values_d, CUSPARSE_SPSV_UPDATE_DIAGONAL));
         CHECK_CUSPARSE(cusparseSpSV_updateMatrix(
             cusparsehandle, A.cusparseOpt.spsvDescrU, origDiagA.values_d, CUSPARSE_SPSV_UPDATE_DIAGONAL));
+#endif
 #endif
     }
     else

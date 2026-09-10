@@ -69,6 +69,17 @@ HPCG_DEPS = src/CG.o \
 	    src/init.o \
 	    src/finalize.o \
 	    src/CudaKernels.o \
+	    src/spsv-tma.o \
+	    src/spsv-ldg-v2.o \
+	    src/spsv-tma-2d.o \
+	    src/mv-tma.o \
+	    src/mv-ldg-v2.o \
+	    src/mv-tma-2d.o \
+	    src/spsv-ldg-v3.o \
+	    src/mv-ldg-v3.o \
+	    src/spsv-tma-ex.o \
+	    src/mv-tma-ex.o \
+	    src/autotune.o \
 		src/CpuKernels.o
 
 # These header files are included in many source files, so we recompile every file if one or more of these header is modified.
@@ -219,3 +230,36 @@ src/CpuKernels.o: HPCG_SRC_PATH/src/CpuKernels.cpp HPCG_SRC_PATH/src/CpuKernels.
 
 src/CudaKernels.o: HPCG_SRC_PATH/src/CudaKernels.cu
 	nvcc -c -O3 $(CUDA_ARCH) $(HPCG_DEFS) -IHPCG_SRC_PATH/src -I$(CUDA_HOME)/include -I$(CUBLASROOT)/include -I$(MPdir)/include $< -o $@
+
+src/spsv-tma.o: HPCG_SRC_PATH/src/spsv-tma.cu
+	nvcc -c -O3 $(CUDA_ARCH) $(HPCG_DEFS) -IHPCG_SRC_PATH/src -I$(CUDA_HOME)/include -I$(CUBLASROOT)/include -I$(MPdir)/include $< -o $@
+
+src/spsv-ldg-v2.o: HPCG_SRC_PATH/src/spsv-ldg-v2.cu HPCG_SRC_PATH/src/ldg-loads.cuh
+	nvcc -c -O3 $(CUDA_ARCH) $(HPCG_DEFS) -IHPCG_SRC_PATH/src -I$(CUDA_HOME)/include -I$(CUBLASROOT)/include -I$(MPdir)/include $< -o $@
+
+src/mv-tma.o: HPCG_SRC_PATH/src/mv-tma.cu
+	nvcc -c -O3 $(CUDA_ARCH) $(HPCG_DEFS) -IHPCG_SRC_PATH/src -I$(CUDA_HOME)/include -I$(CUBLASROOT)/include -I$(MPdir)/include $< -o $@
+
+src/mv-ldg-v2.o: HPCG_SRC_PATH/src/mv-ldg-v2.cu HPCG_SRC_PATH/src/ldg-loads.cuh
+	nvcc -c -O3 $(CUDA_ARCH) $(HPCG_DEFS) -IHPCG_SRC_PATH/src -I$(CUDA_HOME)/include -I$(CUBLASROOT)/include -I$(MPdir)/include $< -o $@
+
+src/spsv-tma-2d.o: HPCG_SRC_PATH/src/spsv-tma-2d.cu
+	nvcc -c -O3 $(CUDA_ARCH) $(HPCG_DEFS) -IHPCG_SRC_PATH/src -I$(CUDA_HOME)/include -I$(CUBLASROOT)/include -I$(MPdir)/include $< -o $@
+
+src/mv-tma-2d.o: HPCG_SRC_PATH/src/mv-tma-2d.cu
+	nvcc -c -O3 $(CUDA_ARCH) $(HPCG_DEFS) -IHPCG_SRC_PATH/src -I$(CUDA_HOME)/include -I$(CUBLASROOT)/include -I$(MPdir)/include $< -o $@
+
+src/spsv-ldg-v3.o: HPCG_SRC_PATH/src/spsv-ldg-v3.cu
+	nvcc -c -O3 $(CUDA_ARCH) $(HPCG_DEFS) -IHPCG_SRC_PATH/src -I$(CUDA_HOME)/include -I$(CUBLASROOT)/include -I$(MPdir)/include $< -o $@
+
+src/mv-ldg-v3.o: HPCG_SRC_PATH/src/mv-ldg-v3.cu
+	nvcc -c -O3 $(CUDA_ARCH) $(HPCG_DEFS) -IHPCG_SRC_PATH/src -I$(CUDA_HOME)/include -I$(CUBLASROOT)/include -I$(MPdir)/include $< -o $@
+
+src/spsv-tma-ex.o: HPCG_SRC_PATH/src/spsv-tma-ex.cu
+	nvcc -c -O3 $(CUDA_ARCH) $(HPCG_DEFS) -IHPCG_SRC_PATH/src -I$(CUDA_HOME)/include -I$(CUBLASROOT)/include -I$(MPdir)/include $< -o $@
+
+src/mv-tma-ex.o: HPCG_SRC_PATH/src/mv-tma-ex.cu
+	nvcc -c -O3 $(CUDA_ARCH) $(HPCG_DEFS) -IHPCG_SRC_PATH/src -I$(CUDA_HOME)/include -I$(CUBLASROOT)/include -I$(MPdir)/include $< -o $@
+
+src/autotune.o: HPCG_SRC_PATH/src/autotune.cpp $(PRIMARY_HEADERS)
+	$(CXX) -c $(CXXFLAGS) -IHPCG_SRC_PATH/src $< -o $@

@@ -114,7 +114,11 @@ HPCG_INCLUDES = -I$(INCdir) -I$(INCdir)/$(arch) -I$(MPdir)/include  $(CRAY_CUDAT
 HPCG_LIBS     = -L${MPlib} -lmpi
 
 HPCG_INCLUDES += -I$(CUDA_HOME)/include -I$(Mathdir)/include
-HPCG_LIBS += -L$(Mathdir)/lib  -lcuda -lcusparse -lcublas -lcublasLt  -L$(CUDA_HOME)/lib64
+HPCG_LIBS += -L$(Mathdir)/lib  -lcuda
+ifneq ($(EXPLICIT_KERNELS), 1)
+HPCG_LIBS += -lcusparse
+endif
+HPCG_LIBS += -lcublas -lcublasLt  -L$(CUDA_HOME)/lib64
 
 ifeq ($(USE_NCCL), 1)
     HPCG_INCLUDES += -I$(NCCLdir)/include
@@ -153,6 +157,10 @@ ifeq ($(USE_INT64), 1)
     HPCG_OPTS += -DINDEX_64
 endif
 
+ifeq ($(EXPLICIT_KERNELS), 1)
+    HPCG_OPTS += -DEXPLICIT_KERNELS
+endif
+
 #If not set, the defualt values in src/hpcg.hpp will be used
 HPCG_OPTS += -Dmake_HPCG_VER_MAJOR=$(HPCG_VER_MAJOR)
 HPCG_OPTS += -Dmake_HPCG_VER_MINOR=$(HPCG_VER_MINOR)
@@ -166,10 +174,9 @@ HPCG_DEFS     = $(HPCG_OPTS) $(HPCG_INCLUDES)
 # - Compilers / linkers - Optimization flags ---------------------------
 # ----------------------------------------------------------------------
 #
-CUDA_ARCH = -gencode=arch=compute_80,code=sm_80 -gencode=arch=compute_90,code=sm_90
-ifeq ($(BUILD_B100), 1)
-CUDA_ARCH += --generate-code arch=compute_100,code=sm_100
-endif
+CUDA_ARCH = -gencode=arch=compute_90,code=sm_90
+CUDA_ARCH += --generate-code arch=compute_100,code=sm_100 --generate-code arch=compute_103,code=sm_103 #--generate-code arch=compute_107,code=sm_107
+
 CPU_ARCH ?= native
 
 # STRIP_SYMBOLS=1 : reduce symbols visible to nm/strings (-g0, -fvisibility=hidden, -s, strip --strip-all)
