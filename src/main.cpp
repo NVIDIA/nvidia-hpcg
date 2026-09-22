@@ -109,6 +109,9 @@ nvpl_sparse_handle_t nvpl_sparse_handle;
 // The communication mode used to send point-to-point messages
 #ifndef HPCG_NO_MPI
 p2p_comm_mode_t P2P_Mode;
+// Resolved DDOT global-reduce backend (never AUTO): set once in main() from
+// params.dot_allreduce_mode and read by ComputeDotProduct on the hot path.
+dot_allreduce_mode_t Dot_Allreduce_Mode = DOT_AR_MPI;
 #endif
 
 // USE CUDA L2 compression
@@ -266,6 +269,40 @@ int main(int argc, char* argv[])
     }
 #endif // USE_NCCL
 
+    // ---- Resolve the DDOT allreduce backend (decoupled from --p2p) ----
+    // NCCL is a candidate only where its communicator exists: a GPUONLY run
+    // using the NCCL halo (--p2p=nccl), built with USE_CUDA + USE_NCCL. On any
+    // other configuration the DDOT reduction uses MPI_Allreduce.
+#ifndef HPCG_NO_MPI
+    {
+        bool nccl_ddot_feasible = false;
+#if defined(USE_CUDA) && defined(USE_NCCL)
+        nccl_ddot_feasible = (params.exec_mode == GPUONLY) && (P2P_Mode == NCCL);
+#endif
+        if (params.dot_allreduce_mode == DOT_AR_NCCL && !nccl_ddot_feasible)
+        {
+            if (rank == 0)
+                printf("Error: --ar=2 (NCCL DDOT allreduce) requires a NCCL communicator, which exists only for a "
+                       "GPU-only run (--exm=0) using the NCCL halo (--p2p=4) in a USE_NCCL build. "
+                       "Use --ar=0 (auto) or --ar=1 (MPI). Exiting ...\n");
+            MPI_Finalize();
+            return 1;
+        }
+
+        if (params.dot_allreduce_mode == DOT_AR_NCCL)
+            Dot_Allreduce_Mode = DOT_AR_NCCL;
+        else if (params.dot_allreduce_mode == DOT_AR_AUTO)
+            // Back-compatible default: NCCL DDOT iff the NCCL halo is in use.
+            Dot_Allreduce_Mode = nccl_ddot_feasible ? DOT_AR_NCCL : DOT_AR_MPI;
+        else
+            Dot_Allreduce_Mode = DOT_AR_MPI;
+
+        if (rank == 0 && params.exec_mode == GPUONLY)
+            printf(" | DDOT allreduce (--ar %d): %s\n", (int) params.dot_allreduce_mode,
+                Dot_Allreduce_Mode == DOT_AR_NCCL ? "NCCL" : "MPI");
+    }
+#endif // HPCG_NO_MPI
+
     // Check whether total number of ranks == npx*npy*npz
     auto rank_grid_size = params.npx * params.npy * params.npz;
     if (rank_grid_size > 0 && size != rank_grid_size)
@@ -405,7 +442,9 @@ int main(int argc, char* argv[])
         CHECK_CUSPARSE(cusparseSetPointerMode(cusparsehandle, CUSPARSE_POINTER_MODE_HOST));
         CHECK_CUDART(cudaEventCreate(&copy_done));
 #ifdef USE_NCCL
-        if (params.p2_mode == NCCL)
+        // Must match the DDOT allreduce backend: the NCCL path has cublasDdot
+        // write the local dot into a device buffer, the MPI path into host memory.
+        if (Dot_Allreduce_Mode == DOT_AR_NCCL)
             cublasSetPointerMode(cublashandle, CUBLAS_POINTER_MODE_DEVICE);
         else
 #endif

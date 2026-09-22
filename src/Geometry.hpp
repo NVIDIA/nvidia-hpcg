@@ -90,6 +90,16 @@ typedef enum
     MPI_CPU_All2allv,
     NCCL /*GPUONLY*/
 } p2p_comm_mode_t;
+// Backend for the DDOT global reduction (ComputeDotProduct), chosen at runtime
+// via --ar and independent of the point-to-point halo transport (--p2p). NCCL
+// is only a candidate where its communicator exists (GPUONLY + --p2p=NCCL);
+// on any other configuration the reduction falls back to MPI_Allreduce.
+typedef enum
+{
+    DOT_AR_AUTO = 0, // follow --p2p: use NCCL iff the NCCL halo is in use (default, back-compatible)
+    DOT_AR_MPI = 1,  // force MPI_Allreduce
+    DOT_AR_NCCL = 2  // force ncclAllReduce (requires the NCCL communicator)
+} dot_allreduce_mode_t;
 typedef enum
 {
     CPU,

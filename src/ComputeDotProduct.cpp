@@ -39,7 +39,7 @@
 #include "mytimer.hpp"
 #include <mpi.h>
 #include "Geometry.hpp"
-extern p2p_comm_mode_t P2P_Mode;
+extern dot_allreduce_mode_t Dot_Allreduce_Mode;
 #endif
 #include "ComputeDotProduct.hpp"
 #include "ComputeDotProduct_ref.hpp"
@@ -85,7 +85,7 @@ int ComputeDotProduct(const local_int_t n, const Vector& x, const Vector& y, dou
     {
 #ifdef USE_CUDA
 #ifdef USE_NCCL
-        if (P2P_Mode == NCCL)
+        if (Dot_Allreduce_Mode == DOT_AR_NCCL)
         {
             CHECK_CUBLAS(cublasDdot(cublashandle, n, x.values_d, 1, y.values_d, 1, d_dot_nccl_allreduce_local));
         }
@@ -108,7 +108,7 @@ int ComputeDotProduct(const local_int_t n, const Vector& x, const Vector& y, dou
 #ifndef HPCG_NO_MPI
     double t0 = mytimer();
 #ifdef USE_NCCL
-    if (rt == GPU && P2P_Mode == NCCL)
+    if (rt == GPU && Dot_Allreduce_Mode == DOT_AR_NCCL)
     {
         CHECK_NCCL(ncclAllReduce(d_dot_nccl_allreduce_local, d_dot_nccl_allreduce_global, 1, ncclDouble, ncclSum, Nccl_Comm, stream));
         CHECK_CUDART(cudaMemcpyAsync(&result, d_dot_nccl_allreduce_global, sizeof(double), cudaMemcpyDeviceToHost, stream));

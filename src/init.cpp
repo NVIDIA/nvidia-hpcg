@@ -254,7 +254,8 @@ int HPCG_Init(int* argc_p, char*** argv_p, HPCG_Params& params)
     char fname[80];
     int i, j, *iparams;
     char cparams[][9] = {"--nx=", "--ny=", "--nz=", "--rt=", "--npx=", "--npy=", "--npz=", "--b=", "--l2cmp=", "--mr=",
-        "--exm=", "--g2c=", "--ddm=", "--lpm=", "--p2p=", "--of=", "--gss=", "--css=", "--wt=", "--bi=", "--mi="};
+        "--exm=", "--g2c=", "--ddm=", "--lpm=", "--p2p=", "--of=", "--gss=", "--css=", "--wt=", "--bi=", "--mi=",
+        "--ar="};
     time_t rawtime;
     tm* ptm;
     const int nparams = (sizeof cparams) / (sizeof cparams[0]);
@@ -386,6 +387,29 @@ int HPCG_Init(int* argc_p, char*** argv_p, HPCG_Params& params)
         params.p2_mode = NCCL;
     else
         params.p2_mode = MPI_CPU;
+
+    // DDOT global-reduce backend (--ar), independent of the halo transport (--p2p):
+    //   0 auto (follow --p2p, default) | 1 force MPI_Allreduce | 2 force ncclAllReduce
+    // Like every other flag this comes from argv (identical on all ranks) or, when
+    // read from hpcg.dat, is broadcast from rank 0, so it is consistent by construction.
+    // Only 0/1/2 are valid --ar values; reject anything else with a hard error rather
+    // than silently falling back to auto (a typo like --ar=3 would otherwise pick the
+    // MPI/NCCL backend via --p2p instead of the one the user asked for).
+    if (iparams[21] < 0 || iparams[21] > 2)
+    {
+        if (params.comm_rank == 0)
+            fprintf(stderr, "Error: invalid --ar=%d (valid values are 0=auto, 1=mpi, 2=nccl). Exiting ...\n", iparams[21]);
+#ifndef HPCG_NO_MPI
+        MPI_Finalize();
+#endif
+        exit(1);
+    }
+    if (iparams[21] == 1)
+        params.dot_allreduce_mode = DOT_AR_MPI;
+    else if (iparams[21] == 2)
+        params.dot_allreduce_mode = DOT_AR_NCCL;
+    else
+        params.dot_allreduce_mode = DOT_AR_AUTO;
 
     if (iparams[15] == 1)
     {

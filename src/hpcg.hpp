@@ -130,6 +130,7 @@ struct HPCG_Params_STRUCT
                                      // reduction optimizations
     rank_type_t rank_type;           // !< Not passed as parameter. GPU or CPU
     p2p_comm_mode_t p2_mode;         // !< We have 4 methods to do p2p comm in MV and MG, refer to Geometry.hpp
+    dot_allreduce_mode_t dot_allreduce_mode = DOT_AR_AUTO; // !< DDOT global-reduce backend (--ar), independent of p2_mode
     exec_mode_t exec_mode = GPUONLY; // !< Three modes supported: GPUONLY, CPUONLY, GPUCPU.
     int g2c;                         // !< Related to GPU/CPU local problem definition
     dim_3d_t diff_dim;               // !< Specifies the dim that is different for the CPU and GPU ranks
