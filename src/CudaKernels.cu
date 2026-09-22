@@ -2321,44 +2321,92 @@ void ComputeProlongationCuda(const SparseMatrix& A, Vector& x)
     computeProlongation_kernel<THREADS_PER_CTA, ROUNDS><<<grid, THREADS_PER_CTA, 0, stream>>>(nc, xcv, xfv, A.f2cPerm);
 }
 
+// ---------------------------------------------------------------------------
+// Vectorized CG support kernels (WAXPBY / SpmvDiag / axpby / spFma)
+//
+// Each thread processes V contiguous doubles with one wide load/store. V is
+// chosen at run time: double4 (V=4, 256-bit) on Rubin (sm_107), which has half
+// the warps/SM of Blackwell and therefore needs more bytes in flight per warp
+// to saturate memory; double2 (V=2, 128-bit) everywhere else. Device buffers
+// come from cudaMalloc (>= 256-byte aligned) and the base index is a multiple
+// of V, so the wide reinterpret_cast accesses stay naturally aligned.
+// ---------------------------------------------------------------------------
+
+// Cached per-process vector width: sm_107 (cc major 10, minor >= 7) -> 4, else 2.
+static int CgVectorWidth()
+{
+    static int width = []() -> int {
+        int dev = 0;
+        cudaDeviceProp props;
+        if (cudaGetDevice(&dev) != cudaSuccess) return 2;
+        if (cudaGetDeviceProperties(&props, dev) != cudaSuccess) return 2;
+        return (props.major == 10 && props.minor >= 7) ? 4 : 2;
+    }();
+    return width;
+}
+
+// Host helper: CTA count to cover n doubles at V doubles/thread.
+static inline int CgGrid(local_int_t n, int V, int threads, int rounds)
+{
+    const int elems = threads * rounds * V;
+    return (n + elems - 1) / elems;
+}
+
+// 32-byte-aligned quad-double, so V=4 issues a single 256-bit access on sm_107+.
+// The explicitly-aligned vector types arrived in CTK 13.4; fall back to plain
+// double4 (two 128-bit accesses) on older toolkits so the V=4 path still builds.
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 13040
+typedef double4_32a DVec4;
+#else
+typedef double4 DVec4;
+#endif
+
+template<int V> __device__ __forceinline__ void LoadVecD(const double* p, double (&o)[V]);
+template<> __device__ __forceinline__ void LoadVecD<2>(const double* p, double (&o)[2])
+{ double2 v = *reinterpret_cast<const double2*>(p); o[0] = v.x; o[1] = v.y; }
+template<> __device__ __forceinline__ void LoadVecD<4>(const double* p, double (&o)[4])
+{ DVec4 v = *reinterpret_cast<const DVec4*>(p); o[0] = v.x; o[1] = v.y; o[2] = v.z; o[3] = v.w; }
+
+template<int V> __device__ __forceinline__ void StoreVecD(double* p, const double (&o)[V]);
+template<> __device__ __forceinline__ void StoreVecD<2>(double* p, const double (&o)[2])
+{ double2 v; v.x = o[0]; v.y = o[1]; *reinterpret_cast<double2*>(p) = v; }
+template<> __device__ __forceinline__ void StoreVecD<4>(double* p, const double (&o)[4])
+{ DVec4 v; v.x = o[0]; v.y = o[1]; v.z = o[2]; v.w = o[3]; *reinterpret_cast<DVec4*>(p) = v; }
+
 //////////////////////// CG Support Kernels: WAXPBY ///////////////////////////
 /*
     GPU Kernel
-    Computes WAXPBY
+    Computes WAXPBY: w = alpha*x + beta*y
 */
-template<int THREADS_PER_CTA, int ROUNDS>
- __global__ void __launch_bounds__(THREADS_PER_CTA)
-    computeWAXPBY_kernel(const local_int_t n, double alpha, double* __restrict__ x, double beta, double* __restrict__ y, double* w)
- {
+template<int THREADS_PER_CTA, int ROUNDS, int V>
+__global__ void __launch_bounds__(THREADS_PER_CTA)
+    computeWAXPBY_kernel(const local_int_t n, double alpha, const double* __restrict__ x,
+                         double beta, const double* __restrict__ y, double* __restrict__ w)
+{
     const local_int_t gid = blockIdx.x * blockDim.x + threadIdx.x;
     const local_int_t stride = blockDim.x * gridDim.x;
-    
-    // Process 2 rounds of double2 elements per thread
+
     #pragma unroll
     for (int round = 0; round < ROUNDS; ++round)
     {
-        local_int_t base_idx = gid + round * stride;
-
-         // Use double2 for vectorized loads/stores when possible
-         if ( (base_idx * 2 + 1) < n)
-         {
-             double2 x_vec = *reinterpret_cast<double2*>(&x[base_idx * 2]);
-             double2 y_vec = *reinterpret_cast<double2*>(&y[base_idx * 2]);
-             
-             double2 w_vec;
-             w_vec.x = alpha * x_vec.x + beta * y_vec.x;
-             w_vec.y = alpha * x_vec.y + beta * y_vec.y;
-             
-             *reinterpret_cast<double2*>(&w[base_idx * 2]) = w_vec;
-         }
-         else if ( (base_idx * 2) < n)
-         {
-             // Handle remaining element individually
-             w[base_idx * 2] = alpha * x[base_idx * 2] + beta * y[base_idx * 2];
-         }
-     }
- }
- 
+        const local_int_t base = (gid + round * stride) * V;
+        if (base + (V - 1) < n)
+        {
+            double xv[V], yv[V], wv[V];
+            LoadVecD<V>(&x[base], xv);
+            LoadVecD<V>(&y[base], yv);
+            #pragma unroll
+            for (int i = 0; i < V; ++i) wv[i] = alpha * xv[i] + beta * yv[i];
+            StoreVecD<V>(&w[base], wv);
+        }
+        else
+        {
+            #pragma unroll
+            for (int i = 0; i < V; ++i)
+                if (base + i < n) w[base + i] = alpha * x[base + i] + beta * y[base + i];
+        }
+    }
+}
 
 /*
     Computes WAXPBY followed by stream synchronization
@@ -2368,82 +2416,80 @@ void ComputeWAXPBYCuda(
 {
     const int ROUNDS = 1;
     const int THREADS_PER_CTA = 256;
-    const int ELELEMENTS_PER_CTA = THREADS_PER_CTA * ROUNDS * 2; // 2 doubles per thread, # rounds per thread
-    const int grid = (n + ELELEMENTS_PER_CTA - 1) / ELELEMENTS_PER_CTA;
-    computeWAXPBY_kernel<THREADS_PER_CTA, ROUNDS><<<grid, THREADS_PER_CTA, 0, stream>>>(n, alpha, x.values_d, beta, y.values_d, w.values_d);
+    if (CgVectorWidth() == 4)
+        computeWAXPBY_kernel<THREADS_PER_CTA, ROUNDS, 4>
+            <<<CgGrid(n, 4, THREADS_PER_CTA, ROUNDS), THREADS_PER_CTA, 0, stream>>>(
+                n, alpha, x.values_d, beta, y.values_d, w.values_d);
+    else
+        computeWAXPBY_kernel<THREADS_PER_CTA, ROUNDS, 2>
+            <<<CgGrid(n, 2, THREADS_PER_CTA, ROUNDS), THREADS_PER_CTA, 0, stream>>>(
+                n, alpha, x.values_d, beta, y.values_d, w.values_d);
     CHECK_CUDART(cudaStreamSynchronize(stream));
 }
 
 //////////////////////// CG Support Kernels: SYMG /////////////////////////////
 /*
     GPU Kernel
-    Multiplies x values with d and accumultaes back to x
+    Multiplies x values with d and accumulates back to x
 */
-template<int THREADS_PER_CTA, int ROUNDS>
- __global__ void __launch_bounds__(THREADS_PER_CTA)
-    spmvDiag_kernel(const local_int_t n, double* x, double* d)
- {
-     const local_int_t gid = blockIdx.x * blockDim.x + threadIdx.x;
-     const local_int_t stride = blockDim.x * gridDim.x;
-     
-     // Process 2 rounds of double2 elements per thread
-     #pragma unroll
-     for (int round = 0; round < ROUNDS; ++round)
-     {
-         local_int_t base_idx = gid + round * stride;
-         
-         // Use double2 for vectorized loads/stores when possible
-         if (base_idx * 2 + 1 < n)
-         {
-             double2 x_vec = *reinterpret_cast<double2*>(&x[base_idx * 2]);
-             double2 d_vec = *reinterpret_cast<double2*>(&d[base_idx * 2]);
-             
-             x_vec.x *= d_vec.x;
-             x_vec.y *= d_vec.y;
-             
-             *reinterpret_cast<double2*>(&x[base_idx * 2]) = x_vec;
-         }
-         else if (base_idx * 2 < n)
-         {
-             // Handle remaining element individually
-             x[base_idx * 2] *= d[base_idx * 2];
-         }
-     }
- }
-
-/*
-    GPU Kernel
-    Computes z = x - r
-*/
-template<int THREADS_PER_CTA, int ROUNDS>
+template<int THREADS_PER_CTA, int ROUNDS, int V>
 __global__ void __launch_bounds__(THREADS_PER_CTA)
-    axpby_kernel(const local_int_t n, double* x, double* y, double* z)
+    spmvDiag_kernel(const local_int_t n, double* __restrict__ x, const double* __restrict__ d)
 {
     const local_int_t gid = blockIdx.x * blockDim.x + threadIdx.x;
     const local_int_t stride = blockDim.x * gridDim.x;
-    
-    // Process 2 rounds of double2 elements per thread
+
     #pragma unroll
     for (int round = 0; round < ROUNDS; ++round)
     {
-        local_int_t base_idx = gid + round * stride;
-        
-        // Use double2 for vectorized loads/stores when possible
-        if (base_idx * 2 + 1 < n)
+        const local_int_t base = (gid + round * stride) * V;
+        if (base + (V - 1) < n)
         {
-            double2 x_vec = *reinterpret_cast<double2*>(&x[base_idx * 2]);
-            double2 y_vec = *reinterpret_cast<double2*>(&y[base_idx * 2]);
-            
-            double2 z_vec;
-            z_vec.x = x_vec.x - y_vec.x;
-            z_vec.y = x_vec.y - y_vec.y;
-            
-            *reinterpret_cast<double2*>(&z[base_idx * 2]) = z_vec;
+            double xv[V], dv[V];
+            LoadVecD<V>(&x[base], xv);
+            LoadVecD<V>(&d[base], dv);
+            #pragma unroll
+            for (int i = 0; i < V; ++i) xv[i] *= dv[i];
+            StoreVecD<V>(&x[base], xv);
         }
-        else if (base_idx * 2 < n)
+        else
         {
-            // Handle remaining element individually
-            z[base_idx * 2] = x[base_idx * 2] - y[base_idx * 2];
+            #pragma unroll
+            for (int i = 0; i < V; ++i)
+                if (base + i < n) x[base + i] *= d[base + i];
+        }
+    }
+}
+
+/*
+    GPU Kernel
+    Computes z = x - y
+*/
+template<int THREADS_PER_CTA, int ROUNDS, int V>
+__global__ void __launch_bounds__(THREADS_PER_CTA)
+    axpby_kernel(const local_int_t n, const double* __restrict__ x, const double* __restrict__ y, double* __restrict__ z)
+{
+    const local_int_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+    const local_int_t stride = blockDim.x * gridDim.x;
+
+    #pragma unroll
+    for (int round = 0; round < ROUNDS; ++round)
+    {
+        const local_int_t base = (gid + round * stride) * V;
+        if (base + (V - 1) < n)
+        {
+            double xv[V], yv[V], zv[V];
+            LoadVecD<V>(&x[base], xv);
+            LoadVecD<V>(&y[base], yv);
+            #pragma unroll
+            for (int i = 0; i < V; ++i) zv[i] = xv[i] - yv[i];
+            StoreVecD<V>(&z[base], zv);
+        }
+        else
+        {
+            #pragma unroll
+            for (int i = 0; i < V; ++i)
+                if (base + i < n) z[base + i] = x[base + i] - y[base + i];
         }
     }
 }
@@ -2452,63 +2498,66 @@ __global__ void __launch_bounds__(THREADS_PER_CTA)
     GPU Kernel
     Computes z += x * y
 */
-template<int THREADS_PER_CTA, int ROUNDS>
+template<int THREADS_PER_CTA, int ROUNDS, int V>
 __global__ void __launch_bounds__(THREADS_PER_CTA)
-    spFma_kernel(const local_int_t n, double* x, double* y, double* z)
+    spFma_kernel(const local_int_t n, const double* __restrict__ x, const double* __restrict__ y, double* __restrict__ z)
 {
     const local_int_t gid = blockIdx.x * blockDim.x + threadIdx.x;
     const local_int_t stride = blockDim.x * gridDim.x;
-    
-    // Process 2 rounds of double2 elements per thread
+
     #pragma unroll
     for (int round = 0; round < ROUNDS; ++round)
     {
-        local_int_t base_idx = gid + round * stride;
-        
-        // Use double2 for vectorized loads/stores when possible
-        if (base_idx * 2 + 1 < n)
+        const local_int_t base = (gid + round * stride) * V;
+        if (base + (V - 1) < n)
         {
-            double2 x_vec = *reinterpret_cast<double2*>(&x[base_idx * 2]);
-            double2 y_vec = *reinterpret_cast<double2*>(&y[base_idx * 2]);
-            double2 z_vec = *reinterpret_cast<double2*>(&z[base_idx * 2]);
-            
-            z_vec.x += x_vec.x * y_vec.x;
-            z_vec.y += x_vec.y * y_vec.y;
-            
-            *reinterpret_cast<double2*>(&z[base_idx * 2]) = z_vec;
+            double xv[V], yv[V], zv[V];
+            LoadVecD<V>(&x[base], xv);
+            LoadVecD<V>(&y[base], yv);
+            LoadVecD<V>(&z[base], zv);
+            #pragma unroll
+            for (int i = 0; i < V; ++i) zv[i] += xv[i] * yv[i];
+            StoreVecD<V>(&z[base], zv);
         }
-        else if (base_idx * 2 < n)
+        else
         {
-            // Handle remaining element individually
-            z[base_idx * 2] += x[base_idx * 2] * y[base_idx * 2];
+            #pragma unroll
+            for (int i = 0; i < V; ++i)
+                if (base + i < n) z[base + i] += x[base + i] * y[base + i];
         }
     }
 }
 
 /*
-    Multiplies x values with d and accumultaes back to x
+    Multiplies x values with d and accumulates back to x
     Calls spmvDiag_kernel
 */
 void SpmvDiagCuda(local_int_t n, double* x, double* d)
 {
     const int ROUNDS = 1;
     const int THREADS_PER_CTA = 256;
-    const int ELELEMENTS_PER_CTA = THREADS_PER_CTA * ROUNDS * 2; // 2 doubles per thread, # rounds per thread
-    const int grid = (n + ELELEMENTS_PER_CTA - 1) / ELELEMENTS_PER_CTA;
-    spmvDiag_kernel<THREADS_PER_CTA, ROUNDS><<<grid, THREADS_PER_CTA, 0, stream>>>(n, x, d);
+    if (CgVectorWidth() == 4)
+        spmvDiag_kernel<THREADS_PER_CTA, ROUNDS, 4>
+            <<<CgGrid(n, 4, THREADS_PER_CTA, ROUNDS), THREADS_PER_CTA, 0, stream>>>(n, x, d);
+    else
+        spmvDiag_kernel<THREADS_PER_CTA, ROUNDS, 2>
+            <<<CgGrid(n, 2, THREADS_PER_CTA, ROUNDS), THREADS_PER_CTA, 0, stream>>>(n, x, d);
 }
 
 /*
-     Computes z = x - r
-     Calls axpby_kernel
+    Computes z = x - y
+    Calls axpby_kernel
 */
 void AxpbyCuda(local_int_t n, double* x, double* y, double* z)
 {
     const int ROUNDS = 1;
     const int THREADS_PER_CTA = 256;
-    const int ELELEMENTS_PER_CTA = THREADS_PER_CTA * ROUNDS * 2; // 2 doubles per thread, # rounds per thread
-    const int grid = (n + ELELEMENTS_PER_CTA - 1) / ELELEMENTS_PER_CTA;
-    axpby_kernel<THREADS_PER_CTA, ROUNDS><<<grid, THREADS_PER_CTA, 0, stream>>>(n, x, y, z);
+    if (CgVectorWidth() == 4)
+        axpby_kernel<THREADS_PER_CTA, ROUNDS, 4>
+            <<<CgGrid(n, 4, THREADS_PER_CTA, ROUNDS), THREADS_PER_CTA, 0, stream>>>(n, x, y, z);
+    else
+        axpby_kernel<THREADS_PER_CTA, ROUNDS, 2>
+            <<<CgGrid(n, 2, THREADS_PER_CTA, ROUNDS), THREADS_PER_CTA, 0, stream>>>(n, x, y, z);
 }
 
 /*
@@ -2519,9 +2568,12 @@ void SpFmaCuda(local_int_t n, double* x, double* y, double* z)
 {
     const int ROUNDS = 1;
     const int THREADS_PER_CTA = 256;
-    const int ELELEMENTS_PER_CTA = THREADS_PER_CTA * ROUNDS * 2; // 2 doubles per thread, # rounds per thread
-    const int grid = (n + ELELEMENTS_PER_CTA - 1) / ELELEMENTS_PER_CTA;
-    spFma_kernel<THREADS_PER_CTA, ROUNDS><<<grid, THREADS_PER_CTA, 0, stream>>>(n, x, y, z);
+    if (CgVectorWidth() == 4)
+        spFma_kernel<THREADS_PER_CTA, ROUNDS, 4>
+            <<<CgGrid(n, 4, THREADS_PER_CTA, ROUNDS), THREADS_PER_CTA, 0, stream>>>(n, x, y, z);
+    else
+        spFma_kernel<THREADS_PER_CTA, ROUNDS, 2>
+            <<<CgGrid(n, 2, THREADS_PER_CTA, ROUNDS), THREADS_PER_CTA, 0, stream>>>(n, x, y, z);
 }
 
 ///////// CG Support Kernels: External Matrix SpMV + Scatter //////////////////
