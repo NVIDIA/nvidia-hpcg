@@ -17,6 +17,7 @@
 
 #ifdef USE_AARCH64
 #include "CpuKernels.hpp"
+#include <nvpl_blas.h>
 
 extern bool Use_Hpcg_Mem_Reduction; /*USE HPCG aggresive memory reduction*/
 
@@ -1121,130 +1122,17 @@ void ReplaceMatrixDiagonalCpu(SparseMatrix& A, Vector diagonal)
 //////////////////////// CG Support Kernels ///////////////////////////////////
 /*
     CPU Kernel
-    Computes dot product using SVE if available
+    Local dot product via NVPL BLAS (cblas_ddot). NVPL self-dispatches the
+    Grace/Vera microarchitecture and threads the reduction over OpenMP, so it
+    replaces the hand-written SVE path. n is a per-rank vector length (< 2^31),
+    so casting to the LP64 nvpl_int_t is safe even in INDEX_64 builds, and
+    cblas_ddot handles the x == y case directly.
 */
 void ComputeDotProductCpu(
     const local_int_t n, const Vector& x, const Vector& y, double& local_result, bool& isOptimized)
 {
-
-    local_result = 0.0;
-    double* xv = x.values;
-    double* yv = y.values;
-#if defined(__ARM_FEATURE_SVE) && !defined(INDEX_64)
-    local_int_t offset0 = 0 * svcntd();
-    local_int_t offset1 = 1 * svcntd();
-    local_int_t offset2 = 2 * svcntd();
-    local_int_t offset3 = 3 * svcntd();
-    if (yv == xv)
-    {
-#ifndef HPCG_NO_OPENMP
-#pragma omp parallel
-        {
-            int threadId = omp_get_thread_num();
-            int nthreads = omp_get_num_threads();
-            local_int_t rowsperthread = (n + nthreads - 1) / nthreads;
-            local_int_t first = threadId * rowsperthread;
-            local_int_t last = std::min(first + rowsperthread, n);
-            svfloat64_t lres0 = svdup_f64(0.0);
-            svfloat64_t lres1 = svdup_f64(0.0);
-            svfloat64_t lres2 = svdup_f64(0.0);
-            svfloat64_t lres3 = svdup_f64(0.0);
-
-            local_int_t stride = 4 * svcntd();
-            local_int_t len = last - first;
-            local_int_t limit = ((len + stride - 1) / stride) * stride;
-
-            for (local_int_t i = first; i < first + limit; i += stride)
-            {
-                svbool_t pg0 = svwhilelt_b64(i + offset0, last);
-                svbool_t pg1 = svwhilelt_b64(i + offset1, last);
-                svbool_t pg2 = svwhilelt_b64(i + offset2, last);
-                svbool_t pg3 = svwhilelt_b64(i + offset3, last);
-                svfloat64_t sv_xv0 = svld1_f64(pg0, &xv[i + offset0]);
-                svfloat64_t sv_xv1 = svld1_f64(pg1, &xv[i + offset1]);
-                svfloat64_t sv_xv2 = svld1_f64(pg2, &xv[i + offset2]);
-                svfloat64_t sv_xv3 = svld1_f64(pg3, &xv[i + offset3]);
-                lres0 = svmla_f64_m(pg0, lres0, sv_xv0, sv_xv0);
-                lres1 = svmla_f64_m(pg1, lres1, sv_xv1, sv_xv1);
-                lres2 = svmla_f64_m(pg2, lres2, sv_xv2, sv_xv2);
-                lres3 = svmla_f64_m(pg3, lres3, sv_xv3, sv_xv3);
-            }
-#pragma omp critical
-            {
-                local_result += svaddv_f64(svptrue_b64(), lres0);
-                local_result += svaddv_f64(svptrue_b64(), lres1);
-                local_result += svaddv_f64(svptrue_b64(), lres2);
-                local_result += svaddv_f64(svptrue_b64(), lres3);
-            }
-        }
-#endif // HPCG_NO_OPENMP
-    }
-    else
-    {
-#ifndef HPCG_NO_OPENMP
-#pragma omp parallel
-        {
-            int threadId = omp_get_thread_num();
-            int nthreads = omp_get_num_threads();
-            local_int_t rowsperthread = (n + nthreads - 1) / nthreads;
-            local_int_t first = threadId * rowsperthread;
-            local_int_t last = std::min(first + rowsperthread, n);
-            svfloat64_t lres0 = svdup_f64(0.0);
-            svfloat64_t lres1 = svdup_f64(0.0);
-            svfloat64_t lres2 = svdup_f64(0.0);
-            svfloat64_t lres3 = svdup_f64(0.0);
-
-            local_int_t stride = 4 * svcntd();
-            local_int_t len = last - first;
-            local_int_t limit = ((len + stride - 1) / stride) * stride;
-
-            for (local_int_t i = first; i < first + limit; i += stride)
-            {
-                svbool_t pg0 = svwhilelt_b64(i + offset0, last);
-                svbool_t pg1 = svwhilelt_b64(i + offset1, last);
-                svbool_t pg2 = svwhilelt_b64(i + offset2, last);
-                svbool_t pg3 = svwhilelt_b64(i + offset3, last);
-                svfloat64_t sv_xv0 = svld1_f64(pg0, &xv[i + offset0]);
-                svfloat64_t sv_xv1 = svld1_f64(pg1, &xv[i + offset1]);
-                svfloat64_t sv_xv2 = svld1_f64(pg2, &xv[i + offset2]);
-                svfloat64_t sv_xv3 = svld1_f64(pg3, &xv[i + offset3]);
-                svfloat64_t sv_yv0 = svld1_f64(pg0, &yv[i + offset0]);
-                svfloat64_t sv_yv1 = svld1_f64(pg1, &yv[i + offset1]);
-                svfloat64_t sv_yv2 = svld1_f64(pg2, &yv[i + offset2]);
-                svfloat64_t sv_yv3 = svld1_f64(pg3, &yv[i + offset3]);
-                lres0 = svmla_f64_m(pg0, lres0, sv_xv0, sv_yv0);
-                lres1 = svmla_f64_m(pg1, lres1, sv_xv1, sv_yv1);
-                lres2 = svmla_f64_m(pg2, lres2, sv_xv2, sv_yv2);
-                lres3 = svmla_f64_m(pg3, lres3, sv_xv3, sv_yv3);
-            }
-#pragma omp critical
-            {
-                local_result += svaddv_f64(svptrue_b64(), lres0);
-                local_result += svaddv_f64(svptrue_b64(), lres1);
-                local_result += svaddv_f64(svptrue_b64(), lres2);
-                local_result += svaddv_f64(svptrue_b64(), lres3);
-            }
-#endif // HPCG_NO_OPENMP
-        }
-    }
-#else
-    if (yv == xv)
-    {
-#ifndef HPCG_NO_OPENMP
-#pragma omp parallel for reduction(+ : local_result)
-#endif
-        for (local_int_t i = 0; i < n; i++)
-            local_result += xv[i] * xv[i];
-    }
-    else
-    {
-#ifndef HPCG_NO_OPENMP
-#pragma omp parallel for reduction(+ : local_result)
-#endif
-        for (local_int_t i = 0; i < n; i++)
-            local_result += xv[i] * yv[i];
-    }
-#endif
+    (void) isOptimized;
+    local_result = cblas_ddot((nvpl_int_t) n, x.values, 1, y.values, 1);
 }
 
 /*

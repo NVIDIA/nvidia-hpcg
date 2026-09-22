@@ -109,6 +109,10 @@ BINdir       = $(TOPdir)/bin
 
 NVPL_SPARSE_INC=$(NVPL_PATH)/include
 NVPL_SPARSE_LIB=$(NVPL_PATH)/lib
+# NVPL BLAS may live under its own prefix (e.g. separate NVPL packages). Default
+# it to the Sparse prefix so a single unified NVPL install needs no override.
+NVPL_BLAS_INC ?= $(NVPL_SPARSE_INC)
+NVPL_BLAS_LIB ?= $(NVPL_SPARSE_LIB)
 
 HPCG_INCLUDES = -I$(INCdir) -I$(INCdir)/$(arch) -I$(MPdir)/include  $(CRAY_CUDATOOLKIT_INCLUDE_OPTS)
 HPCG_LIBS     = -L${MPlib} -lmpi
@@ -119,8 +123,12 @@ ifeq ($(USE_CUDA), 1)
 endif
 
 ifeq ($(USE_AARCH64), 1)
-    HPCG_INCLUDES += -I$(NVPL_SPARSE_INC)
-    HPCG_LIBS += -L$(NVPL_SPARSE_LIB) -lnvpl_sparse
+    # NVPL Sparse serves SpMV/SpSV; NVPL BLAS (cblas_ddot) serves the CG dot
+    # products. A unified NVPL install keeps both under $(NVPL_PATH); when BLAS
+    # ships in its own prefix, override NVPL_BLAS_INC / NVPL_BLAS_LIB. The
+    # lp64_gomp BLAS interface matches HPCG's LP64 indices and GNU OpenMP.
+    HPCG_INCLUDES += -I$(NVPL_SPARSE_INC) -I$(NVPL_BLAS_INC)
+    HPCG_LIBS += -L$(NVPL_SPARSE_LIB) -lnvpl_sparse -L$(NVPL_BLAS_LIB) -lnvpl_blas_lp64_gomp
 endif
 
 ifeq ($(USE_NCCL), 1)

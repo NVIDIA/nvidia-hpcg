@@ -44,14 +44,18 @@ OBJ_ROOT := $(TOPDIR)/obj
 
 SOURCES := $(wildcard $(SRC_DIR)/*.cpp)
 
-# NVPL Sparse provides the optimized CPU SpMV/SpSV kernels the
-# USE_AARCH64 path calls. NVPL self-dispatches Grace vs Vera at run
-# time, so the same library serves both per-uarch builds and -mcpu only tunes
-# HPCG's own (VLA-SVE + integer) code around it. Point NVPL_PATH at the install
-# (a directory with include/ and lib/libnvpl_sparse.*).
+# NVPL Sparse provides the optimized CPU SpMV/SpSV kernels the USE_AARCH64
+# path calls; NVPL BLAS (cblas_ddot) serves the CG dot products. They
+# self-dispatch Grace vs Vera at run time, so the same libraries serve both
+# per-uarch builds and -mcpu only tunes HPCG's own (VLA-SVE + integer) code
+# around them. Point NVPL_PATH at the install (include/ and lib/libnvpl_sparse.*
+# + lib/libnvpl_blas_*). When BLAS ships in its own prefix, override
+# NVPL_BLAS_INC / NVPL_BLAS_LIB; they default to the Sparse prefix.
 NVPL_PATH ?= /path/to/nvpl
 NVPL_SPARSE_INC ?= $(NVPL_PATH)/include
 NVPL_SPARSE_LIB ?= $(NVPL_PATH)/lib
+NVPL_BLAS_INC ?= $(NVPL_SPARSE_INC)
+NVPL_BLAS_LIB ?= $(NVPL_SPARSE_LIB)
 
 # HPCG build-time options. Match the main makefile's optimized aarch64 build
 # (setup/Make.CUDA_AARCH64) so the dispatched libraries are the real CPU
@@ -61,7 +65,7 @@ HPCG_OPTS ?= -DHPCG_CUBIC_RADICAL_SEARCH -DHPCG_CONTIGUOUS_ARRAYS -DUSE_AARCH64
 
 HPCG_COMMON_CXXFLAGS = -O3 -ffast-math -ftree-vectorize -fopenmp \
 	-fPIC -ffunction-sections \
-	$(HPCG_OPTS) -I$(SRC_DIR) -I$(NVPL_SPARSE_INC)
+	$(HPCG_OPTS) -I$(SRC_DIR) -I$(NVPL_SPARSE_INC) -I$(NVPL_BLAS_INC)
 
 # Static C++/GCC runtime so a library built with the GCC 16 toolchain (needed
 # for Olympus) does not require that toolchain's libstdc++ on LD_LIBRARY_PATH at
@@ -142,7 +146,7 @@ $(OBJ_DIR)/%.o: $(SRC_DIR)/%.cpp | $(OBJ_DIR)
 $(DSO): $(OBJS) | $(LIB_DIR)
 	$(CXX) $(VARIANT_FLAGS) $(OBJS) -o $@ \
 		$(HPCG_RUNTIME_LDFLAGS) $(HPCG_STRIP_LDFLAGS) \
-		-L$(NVPL_SPARSE_LIB) -lnvpl_sparse \
+		-L$(NVPL_SPARSE_LIB) -lnvpl_sparse -L$(NVPL_BLAS_LIB) -lnvpl_blas_lp64_gomp \
 		-Wl,-soname,libhpcg_$(VARIANT).so
 	@[ "$(STRIP_SYMBOLS)" != "1" ] || $(STRIP) --strip-all $(DSO)
 
