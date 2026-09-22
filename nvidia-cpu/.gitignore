@@ -1,0 +1,8 @@
+# Build artifacts
+obj/
+bin/
+run/
+
+# HPCG run outputs
+HPCG-Benchmark_*.txt
+hpcg*.txt
