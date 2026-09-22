@@ -91,7 +91,7 @@ int ComputeSPMV(const SparseMatrix& A, Vector& x, Vector& y)
     }
     else
     {
-#ifdef USE_GRACE
+#ifdef USE_AARCH64
         nvpl_sparse_dn_vec_set_values(A.nvplSparseOpt.vecX, x.values);
         nvpl_sparse_dn_vec_set_values(A.nvplSparseOpt.vecY, y.values);
         nvpl_sparse_spmv(nvpl_sparse_handle, NVPL_SPARSE_OPERATION_NON_TRANSPOSE, &one, A.nvplSparseOpt.matA,
@@ -105,7 +105,7 @@ int ComputeSPMV(const SparseMatrix& A, Vector& x, Vector& y)
             ExtSpMVCpu(A, A.localNumberOfRows, 1.0, x.values, y.values);
         }
 #endif
-#endif // USE_GRACE
+#endif // USE_AARCH64
     }
     return 0;
 }

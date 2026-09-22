@@ -257,7 +257,7 @@ int TestSymmetry(SparseMatrix& A, Vector& b, Vector& xexact, TestSymmetryData& t
         }
         else
         {
-#ifdef USE_GRACE
+#ifdef USE_AARCH64
             PermVectorCpu(A.ref2opt, z_ncol, nrow);
 #endif
         }

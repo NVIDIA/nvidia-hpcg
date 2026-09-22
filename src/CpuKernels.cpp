@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-#ifdef USE_GRACE
+#ifdef USE_AARCH64
 #include "CpuKernels.hpp"
 
 extern bool Use_Hpcg_Mem_Reduction; /*USE HPCG aggresive memory reduction*/
@@ -1526,4 +1526,4 @@ void ExtSpMVCpu(const SparseMatrix& A, const local_int_t n, const double alpha, 
         y[i] += alpha * sum;
     }
 }
-#endif // USE_GRACE
+#endif // USE_AARCH64

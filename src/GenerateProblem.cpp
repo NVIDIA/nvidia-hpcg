@@ -52,7 +52,7 @@
 #include "CudaKernels.hpp"
 #endif
 
-#ifdef USE_GRACE
+#ifdef USE_AARCH64
 #include "CpuKernels.hpp"
 #endif
 
@@ -111,7 +111,7 @@ void GenerateProblem_Gpu(SparseMatrix& A, Vector* b, Vector* x, Vector* xexact)
 }
 #endif
 
-#ifdef USE_GRACE
+#ifdef USE_AARCH64
 // Neighbor rank to sequential ID and vice versa
 extern int *rankToId_h, *idToRank_h;
 // GenerateProblem_Cpu is called 4 times for each level
@@ -357,7 +357,7 @@ void GenerateProblem_Cpu(SparseMatrix& A, Vector* b, Vector* x, Vector* xexact)
 
     return;
 }
-#endif // USE_GRACE
+#endif // USE_AARCH64
 
 void GenerateProblem(SparseMatrix& A, Vector* b, Vector* x, Vector* xexact)
 {
@@ -369,7 +369,7 @@ void GenerateProblem(SparseMatrix& A, Vector* b, Vector* x, Vector* xexact)
     }
     else
     {
-#ifdef USE_GRACE
+#ifdef USE_AARCH64
         GenerateProblem_Cpu(A, b, x, xexact);
 #endif
     }

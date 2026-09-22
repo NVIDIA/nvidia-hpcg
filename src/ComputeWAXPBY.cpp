@@ -81,7 +81,7 @@ int ComputeWAXPBY(const local_int_t n, const double alpha, const Vector& x, cons
     }
     else
     {
-#ifdef USE_GRACE
+#ifdef USE_AARCH64
         ComputeWAXPBYCpu(n, alpha, x, beta, y, w, isOptimized);
 #endif
     }

@@ -52,7 +52,7 @@ extern double* d_dot_nccl_allreduce_global;
 #endif
 #endif
 
-#ifdef USE_GRACE
+#ifdef USE_AARCH64
 #include "CpuKernels.hpp"
 #endif
 
@@ -98,7 +98,7 @@ int ComputeDotProduct(const local_int_t n, const Vector& x, const Vector& y, dou
     }
     else
     {
-#ifdef USE_GRACE
+#ifdef USE_AARCH64
         // Consider replacing with NVPL BLAS dot product
         ComputeDotProductCpu(n, x, y, local_result, isOptimized);
 #endif

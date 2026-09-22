@@ -55,12 +55,12 @@ if [[ $5 == "0" ]]; then
 fi
 ################################################
 
-######## USE Grace CPU? ############
+######## USE optimized aarch64 CPU (Grace/Vera)? ############
 # 1:         Yes
 # O:         No 
-export USE_GRACE=1
+export USE_AARCH64=1
 if [[ $6 == "0" ]]; then
-    export USE_GRACE=0
+    export USE_AARCH64=0
 fi
 ################################################
 
@@ -73,7 +73,7 @@ if [[ $7 == "0" ]]; then
 fi
 ################################################
 
-if [[ $USE_GRACE == 1 ]]; then
+if [[ $USE_AARCH64 == 1 ]]; then
     ../configure CUDA_AARCH64
 else
     ../configure CUDA_X86
@@ -86,7 +86,7 @@ fi
 
 make -j 16 \
     USE_CUDA=${USE_CUDA} \
-    USE_GRACE=${USE_GRACE} \
+    USE_AARCH64=${USE_AARCH64} \
     USE_NCCL=${USE_NCCL} \
     MPdir=${MPI_PATH} \
     MPlib=${MPI_PATH}/lib \

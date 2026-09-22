@@ -58,7 +58,7 @@ extern ncclComm_t Nccl_Comm;
 #endif
 #endif
 
-#ifdef USE_GRACE
+#ifdef USE_AARCH64
 #include "CpuKernels.hpp"
 #endif
 
@@ -292,7 +292,7 @@ void SetupHalo_Gpu(SparseMatrix& A)
 }
 #endif
 
-#ifdef USE_GRACE
+#ifdef USE_AARCH64
 void SetupHalo_Cpu(SparseMatrix& A)
 {
     // Extract Matrix pieces. Neighbor classification (owner rank, global/local column
@@ -613,7 +613,7 @@ void SetupHalo_Cpu(SparseMatrix& A)
 
     return;
 }
-#endif // USE_GRACE
+#endif // USE_AARCH64
 
 void SetupHalo(SparseMatrix& A)
 {
@@ -625,7 +625,7 @@ void SetupHalo(SparseMatrix& A)
     }
     else
     {
-#ifdef USE_GRACE
+#ifdef USE_AARCH64
         SetupHalo_Cpu(A);
 #endif
     }

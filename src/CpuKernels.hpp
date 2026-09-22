@@ -18,7 +18,7 @@
 #ifndef CPUKERNELS_HPP
 #define CPUKERNELS_HPP
 
-#ifdef USE_GRACE
+#ifdef USE_AARCH64
 
 #include <nvpl_sparse.h>
 extern nvpl_sparse_handle_t nvpl_sparse_handle;
@@ -183,5 +183,5 @@ void SpFmaCpu(local_int_t n, const double* x, double* y, double* z);
 // External Matrix SpMV + Scatter
 void ExtSpMVCpu(const SparseMatrix& A, const local_int_t n, const double alpha, const double* x, double* y);
 
-#endif // USE_GRACE
+#endif // USE_AARCH64
 #endif // CPUKERNELS_HPP

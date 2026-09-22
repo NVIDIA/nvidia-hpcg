@@ -43,7 +43,7 @@
 #include <cusparse.h>
 #endif
 
-#ifdef USE_GRACE
+#ifdef USE_AARCH64
 #include <nvpl_sparse.h>
 #endif
 
@@ -136,7 +136,7 @@ struct GPU_AUX_STRUCT
 };
 #endif
 
-#ifdef USE_GRACE
+#ifdef USE_AARCH64
 struct NVPL_SPARSE_STRUCT
 {
     nvpl_sparse_dn_vec_descr_t vecX;
@@ -249,7 +249,7 @@ struct SparseMatrix_STRUCT
     SellDeviceArrays sellDev; // Width-agnostic SELL offset/column device arrays
 #endif
 
-#ifdef USE_GRACE
+#ifdef USE_AARCH64
     NVPL_SPARSE_STRUCT nvplSparseOpt;
     CPU_AUX_STRUCT cpuAux;
 #endif

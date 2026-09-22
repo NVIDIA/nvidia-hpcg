@@ -66,7 +66,7 @@ int ComputeMG(const SparseMatrix& A, const Vector& r, Vector& x)
         }
         else
         {
-#ifdef USE_GRACE
+#ifdef USE_AARCH64
             ComputeRestriction(A, r);
 #endif
         }
@@ -81,7 +81,7 @@ int ComputeMG(const SparseMatrix& A, const Vector& r, Vector& x)
         }
         else
         {
-#ifdef USE_GRACE
+#ifdef USE_AARCH64
             ComputeProlongation(A, x);
 #endif
         }

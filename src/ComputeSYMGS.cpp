@@ -186,7 +186,7 @@ int ComputeSYMGS_Gpu(const SparseMatrix& A, const Vector& r, Vector& x, bool ste
 }
 #endif
 
-#ifdef USE_GRACE
+#ifdef USE_AARCH64
 int ComputeSYMGS_Cpu(const SparseMatrix& A, const Vector& r, Vector& x, bool step)
 {
     local_int_t nrow = A.localNumberOfRows;
@@ -292,7 +292,7 @@ int ComputeSYMGS_Cpu(const SparseMatrix& A, const Vector& r, Vector& x, bool ste
 
     return 0;
 }
-#endif // USE_GRACE
+#endif // USE_AARCH64
 
 int ComputeSYMGS(const SparseMatrix& A, const Vector& r, Vector& x, bool step)
 {
@@ -304,7 +304,7 @@ int ComputeSYMGS(const SparseMatrix& A, const Vector& r, Vector& x, bool step)
     }
     else
     {
-#ifdef USE_GRACE
+#ifdef USE_AARCH64
         ComputeSYMGS_Cpu(A, r, x, step);
 #endif
     }

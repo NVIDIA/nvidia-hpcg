@@ -24,7 +24,7 @@ include $(setup_file)
 bin_name='bin/xhpcg'
 
 ifeq ($(USE_CUDA), 0)
-     ifneq ($(USE_GRACE), 0)
+     ifneq ($(USE_AARCH64), 0)
           bin_name='bin/xhpcg-cpu'
      endif
 endif

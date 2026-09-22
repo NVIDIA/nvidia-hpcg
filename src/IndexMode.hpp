@@ -189,7 +189,7 @@ inline void checkCusparseIndexModeStatus(
 #define CHECK_CUSPARSE_MODE(x, mode, op) checkCusparseIndexModeStatus((x), (mode), (op), __FILE__, __LINE__)
 #endif
 
-#ifdef USE_GRACE
+#ifdef USE_AARCH64
 #include <nvpl_sparse.h>
 
 //! NVPL Sparse index type for the slice-offset arrays.

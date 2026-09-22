@@ -253,7 +253,7 @@ size_t OptimizeProblemGpu(SparseMatrix& A_in, CGData& data, Vector& b, Vector& x
 }
 #endif
 
-#ifdef USE_GRACE
+#ifdef USE_AARCH64
 size_t OptimizeProblemCpu(SparseMatrix& A_in, CGData& data, Vector& b, Vector& x, Vector& xexact)
 {
     // Start with AllocateMemCpu-retained host memory; add NVPL SpSV buffers
@@ -452,7 +452,7 @@ size_t OptimizeProblemCpu(SparseMatrix& A_in, CGData& data, Vector& b, Vector& x
 
     return mem;
 }
-#endif // USE_GRACE
+#endif // USE_AARCH64
 
 size_t OptimizeProblem(SparseMatrix& A_in, CGData& data, Vector& b, Vector& x, Vector& xexact)
 {
@@ -465,7 +465,7 @@ size_t OptimizeProblem(SparseMatrix& A_in, CGData& data, Vector& b, Vector& x, V
     }
     else
     {
-#ifdef USE_GRACE
+#ifdef USE_AARCH64
         result = OptimizeProblemCpu(A_in, data, b, x, xexact);
 #endif
     }
@@ -485,7 +485,7 @@ double OptimizeProblemMemoryUse(const SparseMatrix& A)
     if (A.rankType == GPU)
         return (double) EstimateGpuOptMem(A);
 #endif
-#ifdef USE_GRACE
+#ifdef USE_AARCH64
     if (A.rankType == CPU)
         return (double) EstimateCpuOptMem(A);
 #endif

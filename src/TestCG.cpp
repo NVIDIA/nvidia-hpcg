@@ -127,7 +127,7 @@ int TestCG(SparseMatrix& A, CGData& data, Vector& b, Vector& x, TestCGData& test
     }
     else
     {
-#ifdef USE_GRACE
+#ifdef USE_AARCH64
         PermVectorCpu(A.opt2ref, b, A.localNumberOfRows);
         PermVectorCpu(A.opt2ref, exaggeratedDiagA, A.localNumberOfRows);
         ReplaceMatrixDiagonalCpu(A, exaggeratedDiagA);
@@ -223,7 +223,7 @@ int TestCG(SparseMatrix& A, CGData& data, Vector& b, Vector& x, TestCGData& test
     }
     else
     {
-#ifdef USE_GRACE
+#ifdef USE_AARCH64
         ReplaceMatrixDiagonalCpu(A, origDiagA);
         nvpl_sparse_spsv_update_matrix(
             nvpl_sparse_handle, A.nvplSparseOpt.spsvDescrL, origDiagA.values, NVPL_SPARSE_SPSV_UPDATE_DIAGONAL);

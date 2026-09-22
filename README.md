@@ -52,17 +52,17 @@ gh repo clone NVIDIA/nvidia-hpcg
 The `build_sample.sh` script can be used to compile and build the NVIDIA HPCG benchmark. The paths to MPI, CUDA toolkit, CUDA Mathlibs, NCCL, and NVPL Sparse must be exported into `MPI_PATH`, `CUDA_PATH`, `MATHLIBS_PATH`, `NCCL_PATH`, and `NVPL_SPARSE_PATH` before running the `make` command. 
 The following options can used to decide the target platform:
 * `USE_CUDA`, set to 1 to build for NVIDIA GPUs and 0 otherwise.
-* `USE_GRACE`, set to 1 to build for NVIDIA Grace CPUs and 0 otherwise. When set to 0, the code builds for x86 platforms.
+* `USE_AARCH64`, set to 1 to build the optimized NVIDIA aarch64 CPU path (Grace or Vera) and 0 otherwise. When set to 0, the code builds for x86 platforms.
 * `USE_NCCL`, set to 1 to build for NCCL and 0 otherwise.
 
-The `USE_CUDA` and `USE_GRACE` options are used to create binaries that support one of three execution modes as follows:
-* For GPU-only, set `USE_CUDA` to 1. When `USE_GRACE=1`, build for `aarch64`. When `USE_GRACE=0`, build for `x86`.
-* For Grace-only, set `USE_CUDA` to 0 and `USE_GRACE` to 1.
-* For GPU-Grace, set `USE_CUDA` to 1 and `USE_GRACE` to 1.
+The `USE_CUDA` and `USE_AARCH64` options are used to create binaries that support one of three execution modes as follows:
+* For GPU-only, set `USE_CUDA` to 1. When `USE_AARCH64=1`, build for `aarch64`. When `USE_AARCH64=0`, build for `x86`.
+* For CPU-only (aarch64), set `USE_CUDA` to 0 and `USE_AARCH64` to 1.
+* For GPU+CPU, set `USE_CUDA` to 1 and `USE_AARCH64` to 1.
 
 The `build_sample.sh` script uses `setup/MAKE.CUDA_AARCH64` and `setup/MAKE.CUDA_X86` to compose the include and link lines for the `make` command. These two scripts define compile-time options that are used in the source code. These options are explained in the two `setup/MAKE.CUDA_*` script files. The build script creates `build` directory and stores the NVIDIA HPCG binary in `build/bin` and `bin` directories (the binary is copied from `build/bin` to `bin`). The build script can create one of the following binaries:
 * xhpcg, when `USE_CUDA=1`.
-* xhpcg-cpu, when `USE_CUDA=0` and `USE_GRACE=1`.
+* xhpcg-cpu, when `USE_CUDA=0` and `USE_AARCH64=1`.
 
 
 ## Running the NVIDIA HPCG benchmark

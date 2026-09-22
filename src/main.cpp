@@ -33,7 +33,7 @@
  @file main.cpp
 
  - All emums are in Geomerty.hpp
- - Supports GPU-only, Grace-only, and GPU-Grace. GPU and Grace are different MPI ranks.
+ - Supports GPU-only, CPU-only, and GPU+CPU. GPU and CPU are different MPI ranks.
  - The dimensions of GPU rank and CPU rank can only differ in one dimension (nx, ny, or nz).
  - Parameters are explained in bin/RUNNING-*
  */
@@ -50,7 +50,7 @@
 #include <iostream>
 #include <vector>
 
-#ifdef USE_GRACE
+#ifdef USE_AARCH64
 #include <nvpl_sparse.h>
 #endif
 
@@ -102,7 +102,7 @@ double* d_dot_nccl_allreduce_global;
 #endif
 #endif
 
-#ifdef USE_GRACE
+#ifdef USE_AARCH64
 nvpl_sparse_handle_t nvpl_sparse_handle;
 #endif
 
@@ -203,16 +203,16 @@ int main(int argc, char* argv[])
     // Check P2P comm mode
     if (params.exec_mode == CPUONLY || params.exec_mode == GPUCPU)
     {
-#ifndef USE_GRACE
+#ifndef USE_AARCH64
         if (rank == 0)
             printf(
-                "Error: HPCG was not compiled for Grace execution. USE --exm=0 for GPU-only execution or add "
-                "-DUSE_GRACE. Exiting ...\n");
+                "Error: HPCG was not compiled for Optimized AARCH64 CPU execution. USE --exm=0 for GPU-only execution or add "
+                "-DUSE_AARCH64. Exiting ...\n");
 #ifndef HPCG_NO_MPI
         MPI_Finalize();
 #endif
         return 0;
-#endif // USE_GRACE
+#endif // USE_AARCH64
 
         bool invalid = false;
         // P2P=NCCL is only valid with --exm=0 (GPUONLY). CPU-only and GPU+CPU runs exit here; Nccl_Comm is never built for them.
@@ -257,7 +257,7 @@ int main(int argc, char* argv[])
     {
         if (rank == 0)
             printf(
-                "Error: HPCG was not compiled with NCCL. USE --exm=1 for Grace-only execution or add -DUSE_NCCL. "
+                "Error: HPCG was not compiled with NCCL. USE --exm=1 for Optimized AARCH64 CPU execution or add -DUSE_NCCL. "
                 "Exiting ...\n");
 #ifndef HPCG_NO_MPI
         MPI_Finalize();
@@ -283,7 +283,7 @@ int main(int argc, char* argv[])
     {
         if (rank == 0)
             printf(
-                "Error: HPCG was not compiled for GPU execution. USE --exm=1 for Grace-only execution or add "
+                "Error: HPCG was not compiled for GPU execution. USE --exm=1 for Optimized AARCH64 CPU execution or add "
                 "-DUSE_CUDA. Exiting ...\n");
 #ifndef HPCG_NO_MPI
         MPI_Finalize();
@@ -362,7 +362,7 @@ int main(int argc, char* argv[])
     int nvspMajor = 0, nvspMinor = 0, nvspPatch = 0, nvspVersion = 0;
     if (params.exec_mode == CPUONLY || params.exec_mode == GPUCPU)
     {
-#ifdef USE_GRACE
+#ifdef USE_AARCH64
         // NVPL Sparse Version
         nvpl_sparse_create(&(nvpl_sparse_handle));
         nvpl_sparse_get_version(nvpl_sparse_handle, &nvspVersion);
@@ -378,7 +378,7 @@ int main(int argc, char* argv[])
 #endif
             return 0;
         }
-#endif // USE_GRACE
+#endif // USE_AARCH64
     }
 
     SparseMatrix A;
@@ -441,7 +441,7 @@ int main(int argc, char* argv[])
     }
     else
     {
-#ifdef USE_GRACE
+#ifdef USE_AARCH64
         A.rankType = CPU;
         A.slice_size = params.cpu_slice_size;
         A.index_mode = Index_Mode; // Propagated to coarse levels in AllocateMemCpu.
@@ -463,7 +463,7 @@ int main(int argc, char* argv[])
 
         setup_time = mytimer() - setup_time; // Capture total time of setup
         times[9] = setup_time;               // Save it for reporting
-#endif                                       // USE_GRACE
+#endif                                       // USE_AARCH64
     }
 
     curLevelMatrix = &A;
@@ -648,7 +648,7 @@ int main(int argc, char* argv[])
     }
     else
     {
-#ifdef USE_GRACE
+#ifdef USE_AARCH64
         cpuRefMemory = EstimateCpuRefMem(A);
         if (rank == 0 || (params.exec_mode == GPUCPU && params.cpu_allowed_to_print))
             printf(
@@ -662,7 +662,7 @@ int main(int argc, char* argv[])
                 " | Slice Size: %d\n",
                 nvspMajor, nvspMinor, nvspPatch, cpuRefMemory / 1024.0 / 1024.0, opt_mem / 1024.0 / 1024.0, A.geom->npx,
                 A.geom->npy, A.geom->npz, A.geom->nx, A.geom->ny, A.geom->nz, params.numThreads, A.slice_size);
-#endif // USE_GRACE
+#endif // USE_AARCH64
     }
 
 #ifdef HPCG_DETAILED_DEBUG
@@ -704,7 +704,7 @@ int main(int argc, char* argv[])
     }
     else
     {
-#ifdef USE_GRACE
+#ifdef USE_AARCH64
         PermVectorCpu(A.opt2ref, b, A.localNumberOfRows);
 #endif
     }
@@ -901,7 +901,7 @@ int main(int argc, char* argv[])
     }
     else
     {
-#ifdef USE_GRACE
+#ifdef USE_AARCH64
         // Reorder vector
         Vector xOrdered;
         InitializeVector(xOrdered, x.localLength, A.rankType);
@@ -941,7 +941,7 @@ int main(int argc, char* argv[])
     }
     else
     {
-#ifdef USE_GRACE
+#ifdef USE_AARCH64
      DeleteMatrixCpu(A); // This delete will recursively delete all coarse grid data
 #endif
     }
@@ -973,7 +973,7 @@ int main(int argc, char* argv[])
     // We create the handle even in GPU ranks tp find library version
     if (params.exec_mode == CPUONLY || params.exec_mode == GPUCPU)
     {
-#ifdef USE_GRACE
+#ifdef USE_AARCH64
         nvpl_sparse_destroy(nvpl_sparse_handle);
 #endif
     }
