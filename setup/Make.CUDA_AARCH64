@@ -182,10 +182,35 @@ HPCG_DEFS     = $(HPCG_OPTS) $(HPCG_INCLUDES)
 # ----------------------------------------------------------------------
 #
 ifeq ($(USE_CUDA), 1)
-    CUDA_ARCH = -gencode=arch=compute_80,code=sm_80 -gencode=arch=compute_90,code=sm_90
-endif
-ifeq ($(BUILD_B100), 1)
-CUDA_ARCH += --generate-code arch=compute_100,code=sm_100
+    # Detect the CUDA Toolkit version so each newer GPU arch is only emitted
+    # where the compiler knows it, otherwise nvcc fails with "Unsupported gpu
+    # architecture". First appearance by target: compute_100/compute_120 in CTK
+    # 12.8, compute_103 (B300) in CTK 12.9, compute_107 (Rubin) in CTK 13.4. The
+    # documented floor is CTK 12.3, so 12.3-12.7 must not receive newer gencodes.
+    NVCC := $(CUDA_HOME)/bin/nvcc
+    CTK_VERSION := $(shell $(NVCC) --version | sed -n 's/.*release \([0-9][0-9]*\)\.\([0-9][0-9]*\).*/\1 \2/p')
+    CTK_12_8_OR_NEWER := $(shell echo "$(CTK_VERSION)" | awk 'NF == 2 && ($$1 > 12 || ($$1 == 12 && $$2 >= 8)) { print 1 }')
+    CTK_12_9_OR_NEWER := $(shell echo "$(CTK_VERSION)" | awk 'NF == 2 && ($$1 > 12 || ($$1 == 12 && $$2 >= 9)) { print 1 }')
+    CTK_13_4_OR_NEWER := $(shell echo "$(CTK_VERSION)" | awk 'NF == 2 && ($$1 > 13 || ($$1 == 13 && $$2 >= 4)) { print 1 }')
+
+    # sm_80  Ampere
+    # sm_90  Hopper / Grace-Hopper
+    # sm_100 Blackwell (B200)             -- needs CTK >= 12.8
+    # sm_103 Blackwell Ultra (B300)       -- needs CTK >= 12.9
+    # sm_120 Blackwell (consumer)         -- needs CTK >= 12.8
+    # sm_107 Rubin (Vera-Rubin)           -- needs CTK >= 13.4
+    CUDA_ARCH  = -gencode=arch=compute_80,code=sm_80
+    CUDA_ARCH += -gencode=arch=compute_90,code=sm_90
+    ifeq ($(CTK_12_8_OR_NEWER), 1)
+        CUDA_ARCH += -gencode=arch=compute_100,code=sm_100
+        CUDA_ARCH += -gencode=arch=compute_120,code=sm_120
+    endif
+    ifeq ($(CTK_12_9_OR_NEWER), 1)
+        CUDA_ARCH += -gencode=arch=compute_103,code=sm_103
+    endif
+    ifeq ($(CTK_13_4_OR_NEWER), 1)
+        CUDA_ARCH += -gencode=arch=compute_107,code=sm_107
+    endif
 endif
 # GPU+CPU builds target Grace (neoverse-v2) by default. That single binary also
 # runs on Vera: neoverse-v2 is forward-compatible, HPCG's VLA-SVE kernels adapt
@@ -195,7 +220,13 @@ endif
 CPU_ARCH ?= neoverse-v2
 
 # STRIP_SYMBOLS=1 : reduce symbols visible to nm/strings (-g0, -fvisibility=hidden, -s, strip --strip-all)
+# Compile with the same nvcc used for the version gate above, so the emitted
+# arches always match the compiler ($(CUDA_HOME) is the single toolkit source).
+ifeq ($(USE_CUDA), 1)
+CXX          = $(NVCC)
+else
 CXX          = nvcc
+endif
 CXXFLAGS     = $(HPCG_DEFS) -O3 -Xcompiler --std=c++17 -Xcompiler -Ofast,-fopenmp,-mcpu=$(CPU_ARCH),-mtune=$(CPU_ARCH),-ftree-vectorize,-funroll-loops $(CUDA_ARCH)
 ifeq ($(STRIP_SYMBOLS), 1)
     CXXFLAGS     += -Xcompiler=-g0 -Xcompiler=-fvisibility=hidden
