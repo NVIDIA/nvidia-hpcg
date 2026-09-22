@@ -39,7 +39,9 @@
 #define VECTOR_HPP
 #include <cassert>
 #include <cstdlib>
+#ifdef USE_CUDA
 #include <cuda_runtime.h>
+#endif
 #include <omp.h>
 #include <vector>
 
@@ -223,9 +225,11 @@ inline void CopyAndReorderVector(const Vector& v, Vector& w, local_int_t* perm)
  */
 inline void DeleteVector(Vector& v)
 {
+#ifdef USE_CUDA
     if (v.isCudaHost)
         cudaFreeHost(v.values);
     else
+#endif
     {
         delete[] v.values;
     }
