@@ -51,6 +51,7 @@ usage() {
   echo "    --b            <int>          activates benchmarking mode to bypass CPU reference execution when set to one (--b 1)"
   echo "    --bi           <int>          benchmarking-mode overhead iterations added on top of refMaxIters (50); optimized CG runs 50 + value iterations (default 0)"
   echo "    --mi           <int>          GPU Sliced-ELL index width: 0 int32/int32 (default), 1 int64 offsets/int32 columns, 2 int64/int64"
+  echo "    --ar           <int>          DDOT allreduce backend, independent of --p2p: 0 auto (NCCL iff --p2p 4, default), 1 MPI_Allreduce, 2 ncclAllReduce (requires --p2p 4)"
   echo "    --l2cmp        <int>          activates compression in GPU L2 cache when set to one (--l2cmp 1)"
   echo "    --of           <int>          activates generating the log into textfiles, instead of stdout (--of 1)"
   echo "    --gss          <int>          GPU slice size for sliced-ELLPACK format"
@@ -253,6 +254,15 @@ while [ "$1" != "" ]; do
         fi
         shift
         ;;
+     --ar )
+       if [ -n "$2" ]; then
+         AR="--ar=$2"
+        else
+          usage
+          exit 1
+        fi
+        shift
+        ;;
      --l2cmp )
        if [ -n "$2" ]; then
          L2CMP="--l2cmp=$2"
@@ -400,7 +410,7 @@ fi
 # fi
 # export CUDA_VISIBLE_DEVICES=${GPU}
 
-HPCG_CONTROL="${B} ${BI} ${MI} ${L2CMP} ${P2P} ${OF} ${NPX} ${NPY} ${NPZ} ${WT}"
+HPCG_CONTROL="${B} ${BI} ${MI} ${AR} ${L2CMP} ${P2P} ${OF} ${NPX} ${NPY} ${NPZ} ${WT}"
 
 if [[ -z "${NX}" || -z "${NY}" || -z "${NZ}" || -z "${RT}" ]]; then
     if [ -z "${DAT}" ]; then
