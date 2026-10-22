@@ -968,11 +968,8 @@ void CreateSellPermCpu(SparseMatrix& A)
             }
 
             // Next Prefix-Sum
-            for (auto slice = 0; slice < num_slices; slice++)
-            {
-                sellLSliceMrl[slice + 1] += sellLSliceMrl[slice];
-                sellUSliceMrl[slice + 1] += sellUSliceMrl[slice];
-            }
+            PrefixsumCpuImpl(sellLSliceMrl + 1, num_slices);
+            PrefixsumCpuImpl(sellUSliceMrl + 1, num_slices);
 
             // Exact L/U SELL lengths are known now. Grow past the initial estimate if needed
             // (64-bit offsets make large-local problems exceed the old int32-era tables).
