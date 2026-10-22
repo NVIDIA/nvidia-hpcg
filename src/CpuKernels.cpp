@@ -113,6 +113,7 @@ static void AccumulateCpuOptMemAllocateCpuLevel(
     opt_mem += (nrow + 1) * sizeof(slice_ptr_t); // csrExtOffsets
     opt_mem += extNnz * sizeof(local_int_t); // csrExtColumns
     opt_mem += extNnz * sizeof(double); // csrExtValues
+    opt_mem += std::min(nrow, extNnz) * sizeof(local_int_t); // cpuAux.extRows, at most one per halo entry
 
     size_t num_slices = (nrow + slice_size - 1) / slice_size;
     size_t padded_nrow = num_slices * slice_size;
@@ -303,6 +304,8 @@ void DeleteMatrixCpu(SparseMatrix& A)
             delete[] AA->cpuAux.firstRowOfColor;
         if (AA->cpuAux.nRowsWithColor)
             delete[] AA->cpuAux.nRowsWithColor;
+        if (AA->cpuAux.extRows)
+            delete[] AA->cpuAux.extRows;
 
         if (AA->bufferSvL)
             delete[] AA->bufferSvL;
@@ -832,6 +835,39 @@ void CreateSellPermCpu(SparseMatrix& A)
     }
     delete[] A.cpuAux.tempIndex;
     PrefixsumCpu(A.csrExtOffsets + 1, nrow);
+
+    // List the rows with halo entries so ExtSpMVCpu touches only the subdomain boundary
+    {
+        std::vector<local_int_t> counts(omp_get_max_threads() + 1, 0);
+#pragma omp parallel
+        {
+            const int t = omp_get_thread_num();
+            local_int_t count = 0;
+#pragma omp for schedule(static)
+            for (local_int_t i = 0; i < nrow; i++)
+            {
+                if (A.csrExtOffsets[i + 1] > A.csrExtOffsets[i])
+                    count++;
+            }
+            counts[t + 1] = count;
+#pragma omp barrier
+#pragma omp single
+            {
+                for (int k = 0; k < omp_get_num_threads(); k++)
+                    counts[k + 1] += counts[k];
+                A.cpuAux.numExtRows = counts[omp_get_num_threads()];
+                A.cpuAux.extRows = new local_int_t[A.cpuAux.numExtRows];
+            }
+            // Same static schedule as the count, so each thread fills its own range in order
+            local_int_t pos = counts[t];
+#pragma omp for schedule(static)
+            for (local_int_t i = 0; i < nrow; i++)
+            {
+                if (A.csrExtOffsets[i + 1] > A.csrExtOffsets[i])
+                    A.cpuAux.extRows[pos++] = i;
+            }
+        }
+    }
 
 // Don't translate external rows
 #pragma omp parallel for
@@ -1506,11 +1542,12 @@ void SpFmaCpu(local_int_t n, const double* x, double* y, double* z)
 /*
     SpMV for external matrix
 */
-void ExtSpMVCpu(const SparseMatrix& A, const local_int_t n, const double alpha, const double* x, double* y)
+void ExtSpMVCpu(const SparseMatrix& A, const double alpha, const double* x, double* y)
 {
 #pragma omp parallel for
-    for (local_int_t i = 0; i < n; i++)
+    for (local_int_t k = 0; k < A.cpuAux.numExtRows; k++)
     {
+        const local_int_t i = A.cpuAux.extRows[k];
         double sum = 0.0;
         slice_ptr_t first = A.csrExtOffsets[i];
         slice_ptr_t last = A.csrExtOffsets[i + 1];

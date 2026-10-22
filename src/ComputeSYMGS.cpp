@@ -241,7 +241,7 @@ int ComputeSYMGS_Cpu(const SparseMatrix& A, const Vector& r, Vector& x, bool ste
             ExchangeHaloCpu(A, x);
             if (A.totalToBeSent > 0)
             {
-                ExtSpMVCpu(A, nrow, 1.0, xv, temp);
+                ExtSpMVCpu(A, 1.0, xv, temp);
             }
 #endif
         }
@@ -264,7 +264,7 @@ int ComputeSYMGS_Cpu(const SparseMatrix& A, const Vector& r, Vector& x, bool ste
         ExchangeHaloCpu(A, x, A.level == 0 ? 1 /*call MPI_Ibarrier*/ : 0);
         if (A.totalToBeSent > 0)
         {
-            ExtSpMVCpu(A, nrow, -1.0, xv, temp);
+            ExtSpMVCpu(A, -1.0, xv, temp);
         }
 #endif
 

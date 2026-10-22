@@ -160,6 +160,9 @@ struct CPU_AUX_STRUCT
     local_int_t* firstRowOfColor;
     local_int_t* nRowsWithColor;
     local_int_t* tempIndex;
+    // Rows with halo (external) entries, ascending
+    local_int_t numExtRows = 0;
+    local_int_t* extRows = nullptr;
 };
 #endif
 

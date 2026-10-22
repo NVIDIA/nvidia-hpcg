@@ -181,7 +181,7 @@ void AxpbyCpu(local_int_t n, double* x, double* y, double* z);
 void SpFmaCpu(local_int_t n, const double* x, double* y, double* z);
 
 // External Matrix SpMV + Scatter
-void ExtSpMVCpu(const SparseMatrix& A, const local_int_t n, const double alpha, const double* x, double* y);
+void ExtSpMVCpu(const SparseMatrix& A, const double alpha, const double* x, double* y);
 
 #endif // USE_AARCH64
 #endif // CPUKERNELS_HPP

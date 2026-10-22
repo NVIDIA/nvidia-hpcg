@@ -102,7 +102,7 @@ int ComputeSPMV(const SparseMatrix& A, Vector& x, Vector& y)
         if (A.totalToBeSent > 0)
         {
             ExchangeHaloCpu(A, x);
-            ExtSpMVCpu(A, A.localNumberOfRows, 1.0, x.values, y.values);
+            ExtSpMVCpu(A, 1.0, x.values, y.values);
         }
 #endif
 #endif // USE_AARCH64
