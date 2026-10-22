@@ -364,10 +364,6 @@ size_t OptimizeProblemCpu(SparseMatrix& A_in, CGData& data, Vector& b, Vector& x
         nvpl_sparse_sp_mat_set_attribute(
             A->nvplSparseOpt.matL, NVPL_SPARSE_SPMAT_FILL_MODE, &(fillmode_l), sizeof(fillmode_l));
 
-        Vector origDiagA;
-        InitializeVector(origDiagA, A->localNumberOfRows, CPU);
-        CopyMatrixDiagonal(*A, origDiagA);
-
         // The HPCG mem-reduction SpSV workspace heuristic is sized for int32
         // index layouts. With --mi 1/2 (64-bit slice offsets) always query and
         // allocate the real NVPL analysis buffer to avoid heap corruption.
@@ -406,7 +402,7 @@ size_t OptimizeProblemCpu(SparseMatrix& A_in, CGData& data, Vector& b, Vector& x
                 A->nvplSparseOpt.matL, A->nvplSparseOpt.vecX, A->nvplSparseOpt.vecY, NVPL_SPARSE_R_64F,
                 NVPL_SPARSE_SPSV_ALG_DEFAULT, A->nvplSparseOpt.spsvDescrL, A->bufferSvL);
             nvpl_sparse_spsv_update_matrix(
-                nvpl_sparse_handle, A->nvplSparseOpt.spsvDescrL, origDiagA.values, NVPL_SPARSE_SPSV_UPDATE_DIAGONAL);
+                nvpl_sparse_handle, A->nvplSparseOpt.spsvDescrL, A->diagonal, NVPL_SPARSE_SPSV_UPDATE_DIAGONAL);
         }
 
         // Pass strctly U, and then update diagonal
@@ -431,10 +427,9 @@ size_t OptimizeProblemCpu(SparseMatrix& A_in, CGData& data, Vector& b, Vector& x
                 A->nvplSparseOpt.matU, A->nvplSparseOpt.vecX, A->nvplSparseOpt.vecY, NVPL_SPARSE_R_64F,
                 NVPL_SPARSE_SPSV_ALG_DEFAULT, A->nvplSparseOpt.spsvDescrU, A->bufferSvU);
             nvpl_sparse_spsv_update_matrix(
-                nvpl_sparse_handle, A->nvplSparseOpt.spsvDescrU, origDiagA.values, NVPL_SPARSE_SPSV_UPDATE_DIAGONAL);
+                nvpl_sparse_handle, A->nvplSparseOpt.spsvDescrU, A->diagonal, NVPL_SPARSE_SPSV_UPDATE_DIAGONAL);
         }
 
-        DeleteVector(origDiagA);
         //////////////////////////////////////////////////////////////////////////////////////////////////////////
 
         A = A->Ac;
