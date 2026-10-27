@@ -2345,6 +2345,10 @@ static int CgVectorWidth()
     return width;
 }
 
+// Rounds per thread on the V=4 (Rubin) path: one double4 per input still leaves
+// a Rubin SM short of the bytes in flight it needs, two rounds saturate it.
+static constexpr int CG_ROUNDS_V4 = 2;
+
 // Host helper: CTA count to cover n doubles at V doubles/thread.
 static inline int CgGrid(local_int_t n, int V, int threads, int rounds)
 {
@@ -2386,6 +2390,30 @@ __global__ void __launch_bounds__(THREADS_PER_CTA)
     const local_int_t gid = blockIdx.x * blockDim.x + threadIdx.x;
     const local_int_t stride = blockDim.x * gridDim.x;
 
+    // Every round's loads are issued before any store, so a thread keeps
+    // ROUNDS * 2 * V doubles in flight. w may alias x or y (CG updates p and r
+    // in place), but only element for element, and no round stores an element
+    // another round reads.
+    if ((gid + (ROUNDS - 1) * stride) * V + (V - 1) < n)
+    {
+        double xv[ROUNDS][V], yv[ROUNDS][V];
+        #pragma unroll
+        for (int round = 0; round < ROUNDS; ++round)
+        {
+            LoadVecD<V>(&x[(gid + round * stride) * V], xv[round]);
+            LoadVecD<V>(&y[(gid + round * stride) * V], yv[round]);
+        }
+        #pragma unroll
+        for (int round = 0; round < ROUNDS; ++round)
+        {
+            double wv[V];
+            #pragma unroll
+            for (int i = 0; i < V; ++i) wv[i] = alpha * xv[round][i] + beta * yv[round][i];
+            StoreVecD<V>(&w[(gid + round * stride) * V], wv);
+        }
+        return;
+    }
+
     #pragma unroll
     for (int round = 0; round < ROUNDS; ++round)
     {
@@ -2417,8 +2445,8 @@ void ComputeWAXPBYCuda(
     const int ROUNDS = 1;
     const int THREADS_PER_CTA = 256;
     if (CgVectorWidth() == 4)
-        computeWAXPBY_kernel<THREADS_PER_CTA, ROUNDS, 4>
-            <<<CgGrid(n, 4, THREADS_PER_CTA, ROUNDS), THREADS_PER_CTA, 0, stream>>>(
+        computeWAXPBY_kernel<THREADS_PER_CTA, CG_ROUNDS_V4, 4>
+            <<<CgGrid(n, 4, THREADS_PER_CTA, CG_ROUNDS_V4), THREADS_PER_CTA, 0, stream>>>(
                 n, alpha, x.values_d, beta, y.values_d, w.values_d);
     else
         computeWAXPBY_kernel<THREADS_PER_CTA, ROUNDS, 2>
@@ -2438,6 +2466,25 @@ __global__ void __launch_bounds__(THREADS_PER_CTA)
 {
     const local_int_t gid = blockIdx.x * blockDim.x + threadIdx.x;
     const local_int_t stride = blockDim.x * gridDim.x;
+
+    if ((gid + (ROUNDS - 1) * stride) * V + (V - 1) < n)
+    {
+        double xv[ROUNDS][V], dv[ROUNDS][V];
+        #pragma unroll
+        for (int round = 0; round < ROUNDS; ++round)
+        {
+            LoadVecD<V>(&x[(gid + round * stride) * V], xv[round]);
+            LoadVecD<V>(&d[(gid + round * stride) * V], dv[round]);
+        }
+        #pragma unroll
+        for (int round = 0; round < ROUNDS; ++round)
+        {
+            #pragma unroll
+            for (int i = 0; i < V; ++i) xv[round][i] *= dv[round][i];
+            StoreVecD<V>(&x[(gid + round * stride) * V], xv[round]);
+        }
+        return;
+    }
 
     #pragma unroll
     for (int round = 0; round < ROUNDS; ++round)
@@ -2472,6 +2519,26 @@ __global__ void __launch_bounds__(THREADS_PER_CTA)
     const local_int_t gid = blockIdx.x * blockDim.x + threadIdx.x;
     const local_int_t stride = blockDim.x * gridDim.x;
 
+    if ((gid + (ROUNDS - 1) * stride) * V + (V - 1) < n)
+    {
+        double xv[ROUNDS][V], yv[ROUNDS][V];
+        #pragma unroll
+        for (int round = 0; round < ROUNDS; ++round)
+        {
+            LoadVecD<V>(&x[(gid + round * stride) * V], xv[round]);
+            LoadVecD<V>(&y[(gid + round * stride) * V], yv[round]);
+        }
+        #pragma unroll
+        for (int round = 0; round < ROUNDS; ++round)
+        {
+            double zv[V];
+            #pragma unroll
+            for (int i = 0; i < V; ++i) zv[i] = xv[round][i] - yv[round][i];
+            StoreVecD<V>(&z[(gid + round * stride) * V], zv);
+        }
+        return;
+    }
+
     #pragma unroll
     for (int round = 0; round < ROUNDS; ++round)
     {
@@ -2505,6 +2572,26 @@ __global__ void __launch_bounds__(THREADS_PER_CTA)
     const local_int_t gid = blockIdx.x * blockDim.x + threadIdx.x;
     const local_int_t stride = blockDim.x * gridDim.x;
 
+    if ((gid + (ROUNDS - 1) * stride) * V + (V - 1) < n)
+    {
+        double xv[ROUNDS][V], yv[ROUNDS][V], zv[ROUNDS][V];
+        #pragma unroll
+        for (int round = 0; round < ROUNDS; ++round)
+        {
+            LoadVecD<V>(&x[(gid + round * stride) * V], xv[round]);
+            LoadVecD<V>(&y[(gid + round * stride) * V], yv[round]);
+            LoadVecD<V>(&z[(gid + round * stride) * V], zv[round]);
+        }
+        #pragma unroll
+        for (int round = 0; round < ROUNDS; ++round)
+        {
+            #pragma unroll
+            for (int i = 0; i < V; ++i) zv[round][i] += xv[round][i] * yv[round][i];
+            StoreVecD<V>(&z[(gid + round * stride) * V], zv[round]);
+        }
+        return;
+    }
+
     #pragma unroll
     for (int round = 0; round < ROUNDS; ++round)
     {
@@ -2537,8 +2624,8 @@ void SpmvDiagCuda(local_int_t n, double* x, double* d)
     const int ROUNDS = 1;
     const int THREADS_PER_CTA = 256;
     if (CgVectorWidth() == 4)
-        spmvDiag_kernel<THREADS_PER_CTA, ROUNDS, 4>
-            <<<CgGrid(n, 4, THREADS_PER_CTA, ROUNDS), THREADS_PER_CTA, 0, stream>>>(n, x, d);
+        spmvDiag_kernel<THREADS_PER_CTA, CG_ROUNDS_V4, 4>
+            <<<CgGrid(n, 4, THREADS_PER_CTA, CG_ROUNDS_V4), THREADS_PER_CTA, 0, stream>>>(n, x, d);
     else
         spmvDiag_kernel<THREADS_PER_CTA, ROUNDS, 2>
             <<<CgGrid(n, 2, THREADS_PER_CTA, ROUNDS), THREADS_PER_CTA, 0, stream>>>(n, x, d);
@@ -2553,8 +2640,8 @@ void AxpbyCuda(local_int_t n, double* x, double* y, double* z)
     const int ROUNDS = 1;
     const int THREADS_PER_CTA = 256;
     if (CgVectorWidth() == 4)
-        axpby_kernel<THREADS_PER_CTA, ROUNDS, 4>
-            <<<CgGrid(n, 4, THREADS_PER_CTA, ROUNDS), THREADS_PER_CTA, 0, stream>>>(n, x, y, z);
+        axpby_kernel<THREADS_PER_CTA, CG_ROUNDS_V4, 4>
+            <<<CgGrid(n, 4, THREADS_PER_CTA, CG_ROUNDS_V4), THREADS_PER_CTA, 0, stream>>>(n, x, y, z);
     else
         axpby_kernel<THREADS_PER_CTA, ROUNDS, 2>
             <<<CgGrid(n, 2, THREADS_PER_CTA, ROUNDS), THREADS_PER_CTA, 0, stream>>>(n, x, y, z);
@@ -2569,8 +2656,8 @@ void SpFmaCuda(local_int_t n, double* x, double* y, double* z)
     const int ROUNDS = 1;
     const int THREADS_PER_CTA = 256;
     if (CgVectorWidth() == 4)
-        spFma_kernel<THREADS_PER_CTA, ROUNDS, 4>
-            <<<CgGrid(n, 4, THREADS_PER_CTA, ROUNDS), THREADS_PER_CTA, 0, stream>>>(n, x, y, z);
+        spFma_kernel<THREADS_PER_CTA, CG_ROUNDS_V4, 4>
+            <<<CgGrid(n, 4, THREADS_PER_CTA, CG_ROUNDS_V4), THREADS_PER_CTA, 0, stream>>>(n, x, y, z);
     else
         spFma_kernel<THREADS_PER_CTA, ROUNDS, 2>
             <<<CgGrid(n, 2, THREADS_PER_CTA, ROUNDS), THREADS_PER_CTA, 0, stream>>>(n, x, y, z);
