@@ -301,7 +301,10 @@ int HPCG_Init(int* argc_p, char*** argv_p, HPCG_Params& params)
         {
             strcpy(HPCG_DAT_FILE, "./hpcg.dat");
         }
-        if (ReadHpcgDat(iparams, rt, iparams + 7, HPCG_DAT_FILE) == -1)
+        // Line 5 contains npx, npy, and npz. Keep them separate from the
+        // options that follow --npz in iparams.
+        int datProcDims[3];
+        if (ReadHpcgDat(iparams, rt, datProcDims, HPCG_DAT_FILE) == -1)
         {
             printf("No input data. Possible options:\n");
             fflush(0);
@@ -310,6 +313,10 @@ int HPCG_Init(int* argc_p, char*** argv_p, HPCG_Params& params)
             printf("\t3) Use command line parameters: ./xhpcg --nx <x> --ny <y> --nz <z> --rt <t>\n");
             exit(-1);
         }
+        // Explicit process-grid options take precedence over hpcg.dat.
+        for (i = 0; i < 3; ++i)
+            if (iparams[4 + i] == 0)
+                iparams[4 + i] = datProcDims[i];
         broadcastParams = true;
     }
 
