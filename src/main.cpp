@@ -457,6 +457,10 @@ int main(int argc, char* argv[])
         // Allocate GPU related data
         AllocateMemCuda(A);
 
+        // Make sure every rank is ready before timing the setup.
+#ifndef HPCG_NO_MPI
+        MPI_Barrier(MPI_COMM_WORLD);
+#endif
         double setup_time = mytimer();
         GenerateProblem(A, &b, &x, &xexact);
         SetupHalo(A);
@@ -484,6 +488,10 @@ int main(int argc, char* argv[])
         A.rankType = CPU;
         A.slice_size = params.cpu_slice_size;
         A.index_mode = Index_Mode; // Propagated to coarse levels in AllocateMemCpu.
+        // Make sure every rank is ready before timing the setup.
+#ifndef HPCG_NO_MPI
+        MPI_Barrier(MPI_COMM_WORLD);
+#endif
         // Use this array for collecting timing information
         double setup_time = mytimer();
         GenerateProblem(A, &b, &x, &xexact);
